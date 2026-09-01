@@ -1,4 +1,4 @@
-import { requestCompletion, requestViaMainApi } from '@/api/client';
+import { requestCompletion, requestViaMainApi, type ChatMsg } from '@/api/client';
 import { naiSupportsCharacterPrompts } from '@/backends/nai';
 import { readBookMemory } from '@/autoTag/bookMemory';
 import {
@@ -25,11 +25,12 @@ import {
   type CharTagField,
 } from '@/state/charTags';
 import { injectImageTags, parseImagePlan, type ImagePlan } from '@/autoTag/protocol';
+import { beginTagNotice, clearTagNotices, type TagNoticeHandle } from '@/autoTag/notice';
 import { clearAutoGenerateForFloor, markForAutoGenerate } from '@/floor/autoGenerate';
 import { applyMessageText, type ApplyMessageResult } from '@/st/messageEdit';
 import { getContext, isAiStoryMessage, type STMessage } from '@/st/context';
 import { hasImageTagTrace, stripImageTags } from '@/st/imageTagRegex';
-import { getTagGenChannel, isCurrentChatExcluded, settings } from '@/state/settings';
+import { getTagGenChain, isCurrentChatExcluded, settings, type TagGenTarget } from '@/state/settings';
 
 const processed = new Set<string>();
 const running = new Map<string, AbortController>();
@@ -158,6 +159,135 @@ function planChangeOps(plan: ImagePlan): PositionedCharOp[] {
   return ops.sort((left, right) => left.sourceLine - right.sourceLine);
 }
 
+/* ============ 请求策略:渠道链 × 每渠道重试 ============ */
+
+/** 一次待发请求。 */
+interface PlanAttempt {
+  target: TagGenTarget;
+  /** 目标在渠道链里的序号,0 = 主渠道;> 0 即已切到备用。 */
+  index: number;
+  /** 本渠道内的第几轮(1-based)。 */
+  round: number;
+  /** 本渠道总轮数(= retryCount + 1)。 */
+  rounds: number;
+}
+
+/**
+ * 把「渠道链 × 每渠道 retries+1 轮」摊平成一串请求计划。
+ *
+ * 摊平而不写嵌套双循环:执行侧只剩单层循环,中止判断与提示更新各写一次;
+ * 「备用渠道拿几次机会」这条策略也就集中在这一个纯函数里,而不是散在循环条件上。
+ * 未配备用渠道时产出与旧版逐次一致(retries+1 条),存量行为不变。
+ */
+function planAttempts(chain: TagGenTarget[], retries: number): PlanAttempt[] {
+  const rounds = retries + 1;
+  const plans: PlanAttempt[] = [];
+  for (const [index, target] of chain.entries()) {
+    for (let round = 1; round <= rounds; round += 1) plans.push({ target, index, round, rounds });
+  }
+  return plans;
+}
+
+/** 进度提示与 console 共用的一行说明。 */
+function describeAttempt(attempt: PlanAttempt): string {
+  const name = `「${attempt.target.label}」`;
+  if (attempt.round === 1) return attempt.index > 0 ? `已切备用${name}` : `正在请求${name}`;
+  const retry = `重试 ${attempt.round - 1}/${attempt.rounds - 1}`;
+  return `${attempt.index > 0 ? '备用' : ''}${retry}${name}`;
+}
+
+/**
+ * 请求历史页的用途标签。
+ * 无重试无备用时与旧版**逐字一致**——历史页不会因本次改动凭空变样。
+ */
+function describeSource(floor: number, attempt: PlanAttempt): string {
+  const parts: string[] = [];
+  if (attempt.index > 0) parts.push(`备用「${attempt.target.label}」`);
+  if (attempt.rounds > 1) parts.push(`第 ${attempt.round} 次`);
+  return parts.length ? `自动 tag(第 ${floor} 楼 · ${parts.join(' ')})` : `自动 tag(第 ${floor} 楼)`;
+}
+
+/** 跑一次请求。返回非空 = 验收通过;抛错交给调用方计入 lastError。 */
+async function requestPlanOnce(
+  target: TagGenTarget,
+  messages: ChatMsg[],
+  parse: (raw: string) => ImagePlan,
+  signal: AbortSignal,
+  source: string,
+): Promise<ImagePlan | null> {
+  // parsed 用对象壳装着:validate 闭包写入,await 之后读取——请求成功 + 验收通过才非空。
+  // (直接 let 会被 TS 收窄成 null:闭包内的赋值控制流分析看不见。)
+  const parsed: { plan: ImagePlan | null } = { plan: null };
+  const opts = { signal, source, validate: (raw: string) => void (parsed.plan = parse(raw)) };
+  if (target.channel) await requestCompletion(target.channel, messages, opts);
+  else await requestViaMainApi(messages, opts);
+  return parsed.plan;
+}
+
+interface PlanRequestResult {
+  plan: ImagePlan | null;
+  /** 最后一次失败的错误文本。 */
+  lastError: string;
+  /** 中止信号已触发:调用方按「取消」处理(删 processed、静默返回)。 */
+  aborted: boolean;
+  /** 实际用过的渠道数(> 1 = 切过备用),用于失败文案。 */
+  targetsTried: number;
+  /** 每个渠道的总轮数(= retryCount + 1)。 */
+  rounds: number;
+}
+
+/**
+ * 按渠道链依次请求,直到拿到通过验收的 plan。
+ *
+ * 可重试的异常有两类,都在这里吞掉并继续:请求本身失败(网络/HTTP/超时),
+ * 以及「返回了但协议解析/校验不通过」——后者常见于模型没遵守协议。
+ * 中止信号立即收手,不消耗剩余轮次。
+ */
+async function requestImagePlan(
+  floor: number,
+  messages: ChatMsg[],
+  parse: (raw: string) => ImagePlan,
+  signal: AbortSignal,
+  notice: TagNoticeHandle,
+): Promise<PlanRequestResult> {
+  const retries = Math.max(0, Math.floor(Number(settings.autoTag.retryCount) || 0));
+  const result: PlanRequestResult = {
+    plan: null,
+    lastError: '',
+    aborted: false,
+    targetsTried: 1,
+    rounds: retries + 1,
+  };
+  for (const attempt of planAttempts(getTagGenChain(), retries)) {
+    if (signal.aborted) return { ...result, aborted: true };
+    result.targetsTried = attempt.index + 1;
+    const detail = describeAttempt(attempt);
+    notice.update(detail);
+    try {
+      const source = describeSource(floor, attempt);
+      const plan = await requestPlanOnce(attempt.target, messages, parse, signal, source);
+      if (signal.aborted) return { ...result, aborted: true };
+      if (plan) return { ...result, plan };
+    } catch (error) {
+      if (signal.aborted) return { ...result, aborted: true };
+      result.lastError = error instanceof Error ? error.message : String(error);
+      console.warn(`[柏宝绘] 第 ${floor} 楼 ${detail} 生成 tag 失败`, error);
+    }
+  }
+  return result;
+}
+
+/** 全部打光后失败 toast 的括号后缀。无重试无备用时为空串(与旧版逐字一致)。 */
+function describeExhausted(result: PlanRequestResult): string {
+  const retries = result.rounds - 1;
+  if (result.targetsTried > 1) {
+    return retries > 0
+      ? `(主渠道与备用渠道各试 ${result.rounds} 次均失败)`
+      : '(主渠道与备用渠道都失败了)';
+  }
+  return retries > 0 ? `(已自动重试 ${retries} 次)` : '';
+}
+
 async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> {
   const context = getContext();
   diagnostic('runForFloor:enter', {
@@ -261,6 +391,10 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
   const controller = new AbortController();
   running.set(slot, controller);
 
+  // 提示开在闸门全过之后、拼提示词之前:世界书扫描也要时间,不能等到发请求才提示。
+  // 声明在 try 之外,finally 才收得干净(任何路径退出都撤掉这一段)。
+  const notice = beginTagNotice(floor, '准备提示词…');
+
   try {
     const memory = readBookMemory(floor, context.chat[floor]?.mes ?? '', context.name1);
     const entriesBefore = charTagsBeforeFloor(floor);
@@ -276,81 +410,40 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
       preparedTarget,
       anchors.text,
     );
-    const channel = getTagGenChannel();
-    // 失败重试:请求异常与「返回无法解析/校验不通过」都视为可重试的异常(后者常见于模型没遵守协议);
-    // 中止信号立即收手,不消耗重试。parseImagePlan 对坏输出抛错,「无画面」则是正常返回空数组。
-    // 解析/校验放进 validate 回调:不过则请求历史如实记为失败(而非「HTTP 拿到文本」的绿色成功),
-    // 错误原样抛回这里走重试——显示与行为同口径。
-    const retries = Math.max(0, Math.floor(Number(settings.autoTag.retryCount) || 0));
-    let plan: ImagePlan | null = null;
-    let lastError = '';
-    for (let attempt = 0; attempt <= retries && !plan; attempt++) {
-      if (controller.signal.aborted) {
-        processed.delete(identity);
-        return;
-      }
-      try {
-        // parsed 用对象壳装着:validate 闭包写入,await 之后读取——请求成功 + 验收通过才非空。
-        // (直接 let 会被 TS 收窄成 null:闭包内的赋值控制流分析看不见。)
-        const parsed: { plan: ImagePlan | null } = { plan: null };
-        const validate = (raw: string) => {
-          const candidate = parseImagePlan(
-            raw,
-            preparedTarget.segments,
-            settings.autoTag.minImages,
-            settings.autoTag.maxImages,
-          );
-          // latent 与 nai 同规范(见 autoTag/prompt.ts),建档校验一并适用:
-          // 两者都要求 characters[] 带 nl,只是最终发给上游时的装法不同。
-          const naiConn = settings.defaultBackend === 'latent' ? settings.latent : settings.nai;
-          if (
-            (settings.defaultBackend === 'nai' || settings.defaultBackend === 'latent') &&
-            naiSupportsCharacterPrompts(naiConn.model) &&
-            candidate.changes.some(change => change.field === 'new' && !change.nl?.trim())
-          ) {
-            throw new Error('NAI 4.5/V5 建档必须附带 nl 外貌描述');
-          }
-          parsed.plan = candidate;
-        };
-        // 有重试时给 source 带上第几次,历史里两条记录一眼看出是重试关系
-        const source =
-          retries > 0 ? `自动 tag(第 ${floor} 楼 · 第 ${attempt + 1} 次)` : `自动 tag(第 ${floor} 楼)`;
-        if (channel) {
-          await requestCompletion(channel, messages, {
-            signal: controller.signal,
-            source,
-            validate,
-          });
-        } else {
-          await requestViaMainApi(messages, {
-            signal: controller.signal,
-            source,
-            validate,
-          });
-        }
-        if (controller.signal.aborted) {
-          processed.delete(identity);
-          return;
-        }
-        plan = parsed.plan;
-      } catch (error) {
-        if (controller.signal.aborted) {
-          processed.delete(identity);
-          return;
-        }
-        lastError = error instanceof Error ? error.message : String(error);
-        console.warn(`[柏宝绘] 第 ${floor} 楼第 ${attempt + 1}/${retries + 1} 次生成 tag 失败`, error);
-      }
-    }
-    if (!plan) {
-      // 重试耗尽:允许同一正文在后续重新渲染后再试
-      processed.delete(identity);
-      toastr.error(
-        `${lastError}${retries > 0 ? `(已自动重试 ${retries} 次)` : ''}`,
-        '柏宝绘自动 tag 失败',
+    // 解析/校验放进 parse 回调:不过则请求历史如实记为失败(而非「HTTP 拿到文本」的
+    // 绿色成功),错误原样抛回 requestImagePlan 走下一轮——显示与行为同口径。
+    // parseImagePlan 对坏输出抛错,「无画面」则是正常返回空数组。
+    const parse = (raw: string): ImagePlan => {
+      const candidate = parseImagePlan(
+        raw,
+        preparedTarget.segments,
+        settings.autoTag.minImages,
+        settings.autoTag.maxImages,
       );
+      // latent 与 nai 同规范(见 autoTag/prompt.ts),建档校验一并适用:
+      // 两者都要求 characters[] 带 nl,只是最终发给上游时的装法不同。
+      const naiConn = settings.defaultBackend === 'latent' ? settings.latent : settings.nai;
+      if (
+        (settings.defaultBackend === 'nai' || settings.defaultBackend === 'latent') &&
+        naiSupportsCharacterPrompts(naiConn.model) &&
+        candidate.changes.some(change => change.field === 'new' && !change.nl?.trim())
+      ) {
+        throw new Error('NAI 4.5/V5 建档必须附带 nl 外貌描述');
+      }
+      return candidate;
+    };
+    const attempted = await requestImagePlan(floor, messages, parse, controller.signal, notice);
+    if (attempted.aborted) {
+      processed.delete(identity);
       return;
     }
+    if (!attempted.plan) {
+      // 所有渠道所有轮次打光:允许同一正文在后续重新渲染后再试
+      processed.delete(identity);
+      toastr.error(`${attempted.lastError}${describeExhausted(attempted)}`, '柏宝绘自动 tag 失败');
+      return;
+    }
+    const plan = attempted.plan;
 
     const planOps = planChangeOps(plan);
     // 锁定角色(全局库)不接受 AI changes:丢弃,不写入楼层、不参与 @替换。
@@ -489,6 +582,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     console.error(`[柏宝绘] 第 ${floor} 楼自动生成 tag 失败`, error);
     toastr.error(message, '柏宝绘自动 tag 失败');
   } finally {
+    notice.done();
     if (running.get(slot) === controller) running.delete(slot);
   }
 }
@@ -496,6 +590,8 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
 function cancelAll(): void {
   diagnostic('cancelAll', { scheduled: scheduled.size, running: running.size });
   clearGeneration();
+  // 提示必须跟着走:切聊天后留一条「正在生成」挂在新聊天上会误导人
+  clearTagNotices();
   for (const timer of scheduled) clearTimeout(timer);
   scheduled.clear();
   for (const controller of running.values()) controller.abort();

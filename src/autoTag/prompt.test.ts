@@ -22,6 +22,8 @@ function prompts(overrides: Partial<AutoTagPrompts> = {}): AutoTagPrompts {
     comfyThinking: '',
     naiThinking: '',
     naiV5Thinking: '',
+    imgRouterSpec: '',
+    imgRouterThinking: '',
     prefill: '',
     ...overrides,
   };
@@ -65,6 +67,7 @@ describe('auto tag prompt', () => {
       maxImages: 3,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts({ jailbreak: '附加规则' }),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -110,6 +113,7 @@ describe('auto tag prompt', () => {
       maxImages: 4,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -127,6 +131,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(
@@ -171,6 +176,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
 
@@ -204,6 +210,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -307,6 +314,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts({ comfyThinking: '自定义清单', prefill: 'custom>' }),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -326,6 +334,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts({
         comfyThinking: 'COMFY-CHECKLIST',
         naiThinking: 'NAI-CHECKLIST',
@@ -376,6 +385,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -448,6 +458,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -502,6 +513,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -542,6 +554,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -583,6 +596,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const library = '【角色固定外貌库(系统维护)】\n小雪: 1girl, long silver hair';
@@ -607,6 +621,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -624,6 +639,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(
@@ -649,6 +665,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -684,6 +701,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -719,6 +737,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -757,6 +776,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const messages = await buildAutoTagMessages(context(), 1, options, null);
@@ -791,6 +811,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;
@@ -833,6 +854,7 @@ describe('auto tag prompt', () => {
       maxImages: 2,
       retryCount: 1,
       autoGenerate: true,
+      notifyProgress: true,
       prompts: prompts(),
     };
     const oldBackend = settings.defaultBackend;

@@ -23,6 +23,8 @@ import {
   DEFAULT_COMFY_NL_SPEC,
   DEFAULT_COMFY_SPEC,
   DEFAULT_COMFY_THINKING,
+  DEFAULT_IMGROUTER_SPEC,
+  DEFAULT_IMGROUTER_THINKING,
   DEFAULT_JAILBREAK_PROMPT,
   DEFAULT_NAI_SPEC,
   DEFAULT_NAI_THINKING,
@@ -34,14 +36,15 @@ import {
 
 /**
  * 按默认后端取 tag 书写规范:
- * - comfyui / imgrouter → comfySpec(留空回落内置默认);{{nl}} 宏按自然语言开关展开/置空,
- *   自定义内容不含宏时开启开关会把自然语言规范追加在末尾(防止开关静默失效)。
- * - nai → naiSpec(留空回落内置默认 DEFAULT_NAI_SPEC)。
+ * - imgrouter → imgRouterSpec(留空回落 DEFAULT_IMGROUTER_SPEC);{{nl}} 宏按渠道「生成自然语言」开关展开/置空。
+ * - comfyui → comfySpec(留空回落 DEFAULT_COMFY_SPEC);{{nl}} 宏按工作流预设「生成自然语言」展开/置空。
+ * - nai / latent → naiV5Spec / naiSpec(留空回落内置默认)。
  * - webui → 暂不附加。
  *
- * imgrouter 复用 comfy 那份而非另写一套:两者的提示词形态是同一类(单串正向 tag + 可选自然语言,
- * 无角色分区),差别只在自然语言开关取自渠道而非工作流预设。另立一份规范等于把同样的内容
- * 维护两遍,还会随上游模型演进而逐渐走样。
+ * ImgRouter 与 ComfyUI 的提示词形态同类(单串正向 tag + 可选自然语言),但两处协议差异必须各写一份:
+ * 1. ImgRouter 把提示词原文 POST 给上游,括号不转义;ComfyUI 有权重语法,括号要转义成 \\(\\)。
+ * 2. ImgRouter 无负面输入(协议里没有 negative 键);ComfyUI 按预设决定 negativeOn。
+ * {{nl}} 宏内容(DEFAULT_COMFY_NL_SPEC)被两份共用:它只讲 nl 怎么写,与后端协议无关。
  */
 /** 当前渠道是否走 NAI 协议(nai / latent)。两者的规范、思维链、角色分区口径完全相同。 */
 function naiProtocolBackend(): boolean {
@@ -53,17 +56,29 @@ function naiProtocolConn() {
   return settings.defaultBackend === 'latent' ? settings.latent : settings.nai;
 }
 
+/**
+ * 抽取 {{nl}} 宏展开逻辑:存在则替换,不存在且开关开则追加到末尾,最后折叠连续空行。
+ * comfy 与 imgrouter 共用,避免同样逻辑写两遍。
+ */
+function resolveNlMacro(template: string, nlOn: boolean): string {
+  const nlSpec = nlOn ? DEFAULT_COMFY_NL_SPEC : '';
+  const resolved = template.includes('{{nl}}')
+    ? template.replaceAll('{{nl}}', nlSpec)
+    : nlSpec
+      ? `${template}\n\n${nlSpec}`
+      : template;
+  // 宏置空后可能留下连续空行,折叠掉
+  return resolved.replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function backendPromptSpec(options: AutoTagSettings, nlOn: boolean, naiCharPromptsOn: boolean): string {
-  if (settings.defaultBackend === 'comfyui' || settings.defaultBackend === 'imgrouter') {
+  if (settings.defaultBackend === 'imgrouter') {
+    const template = (options.prompts?.imgRouterSpec ?? '').trim() || DEFAULT_IMGROUTER_SPEC;
+    return resolveNlMacro(template, nlOn);
+  }
+  if (settings.defaultBackend === 'comfyui') {
     const template = (options.prompts?.comfySpec ?? '').trim() || DEFAULT_COMFY_SPEC;
-    const nlSpec = nlOn ? DEFAULT_COMFY_NL_SPEC : '';
-    const resolved = template.includes('{{nl}}')
-      ? template.replaceAll('{{nl}}', nlSpec)
-      : nlSpec
-        ? `${template}\n\n${nlSpec}`
-        : template;
-    // 宏置空后可能留下连续空行,折叠掉
-    return resolved.replace(/\n{3,}/g, '\n\n').trim();
+    return resolveNlMacro(template, nlOn);
   }
   // latent 与 nai 同规范:产出的数据形状完全一样(Base + characters[]),
   // 差异只在发给上游时怎么装(latent 摊成分段串),与「怎么写 tag」无关。
@@ -81,10 +96,13 @@ function backendPromptSpec(options: AutoTagSettings, nlOn: boolean, naiCharPromp
  * 拆成三份是因为思维链的槽位块要求填的每个字段,都得在同后端规范里有判据和词表:
  * V5 的规范讲的是 Base + Character Prompts,没有景别词表、没有横竖判据,也明令禁止
  * 邻接绑定——共用一份 ComfyUI 口径的思维链会让它被要求填规范从未教过的东西。
- * imgrouter 与 comfy 的提示词形态同类,共用 comfyThinking(与 backendPromptSpec 配对)。
+ * imgrouter 有专属思维链(imgRouterThinking):槽位结构与 comfy 相同,但删掉了 negative 自查与括号转义自查。
  * webui 暂无专属规范,回落 comfy 那份(该后端尚未接入)。
  */
 function backendThinkingPrompt(options: AutoTagSettings, naiCharPromptsOn: boolean): string {
+  if (settings.defaultBackend === 'imgrouter') {
+    return (options.prompts?.imgRouterThinking ?? '').trim() || DEFAULT_IMGROUTER_THINKING;
+  }
   if (naiProtocolBackend()) {
     return naiCharPromptsOn
       ? (options.prompts?.naiV5Thinking ?? '').trim() || DEFAULT_NAI_V5_THINKING

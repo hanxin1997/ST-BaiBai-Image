@@ -366,3 +366,47 @@ export async function deleteImageResult(
   }
   return true;
 }
+
+/**
+ * 按 generationId 删除一条图片记录（图库用）。
+ * 遍历指定消息的全部 swipeId 和 promptHash，找到匹配的 entry 并删除。
+ */
+export async function removeImageEntry(
+  ctx: STContext,
+  messageId: number,
+  swipeId: number,
+  genId: string,
+): Promise<boolean> {
+  let pathToDelete = '';
+  const removed = await mutateStore(ctx, messageId, store => {
+    const bucket = store[String(swipeId)];
+    if (!bucket) return store;
+
+    for (const [hash, list] of Object.entries(bucket)) {
+      const index = list.findIndex(entry => entry.generationId === genId);
+      if (index < 0) continue;
+
+      pathToDelete = list[index].path;
+      const nextList = list.filter((_, i) => i !== index);
+      const next: BbiImageStore = { ...store };
+      next[String(swipeId)] = { ...bucket };
+      if (nextList.length) {
+        next[String(swipeId)][hash] = nextList;
+      } else {
+        delete next[String(swipeId)][hash];
+      }
+      return next;
+    }
+    return store;
+  });
+
+  if (!removed) return false;
+  if (pathToDelete) {
+    try {
+      await deleteImageFile(pathToDelete);
+    } catch (error) {
+      console.warn('[柏宝绘] 删除图片文件失败（留作孤儿）', error);
+    }
+  }
+  return true;
+}

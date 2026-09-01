@@ -7,13 +7,17 @@ import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import { fetchModels, testChannel } from '@/api/client';
 import {
+  ASSIGN_MAIN_API,
   DEFAULT_COMFY_SPEC,
   DEFAULT_COMFY_THINKING,
+  DEFAULT_IMGROUTER_SPEC,
+  DEFAULT_IMGROUTER_THINKING,
   DEFAULT_JAILBREAK_PROMPT,
   DEFAULT_NAI_V5_SPEC,
   DEFAULT_NAI_V5_THINKING,
   DEFAULT_PREFILL_PROMPT,
   SELECTABLE_BACKENDS,
+  getTagGenChannel,
   newChannel,
   sanitizeTagName,
   settings,
@@ -122,6 +126,8 @@ interface TagPromptMeta {
 // ⚠ NAI 只列一对,存的是 naiV5Spec / naiV5Thinking(键名带 V5 是历史包袱,见 settings.ts)。
 // 4.5 以下那套单串 tag 的 naiSpec / naiThinking 已随模型列表收窄一起下线,不再列出:
 // 可选模型只剩 4.5/V5,那两份永远走不到,列出来只会让人以为还有第二种口径要维护。
+//
+// ⚠ 现在共三对:NAI / ComfyUI / ImgRouter。
 const TAG_PROMPT_METAS: TagPromptMeta[] = [
   {
     key: 'jailbreak',
@@ -161,6 +167,25 @@ const TAG_PROMPT_METAS: TagPromptMeta[] = [
     label: 'ComfyUI 思维链',
     hint: '默认后端为 ComfyUI 时使用的输出前思考清单，作为 system 压在任务消息之后（解析时会自动剥掉思考块）。与「ComfyUI 规范」配套。留空用内置默认。',
     builtin: DEFAULT_COMFY_THINKING,
+    macros: [],
+  },
+  {
+    key: 'imgRouterSpec',
+    label: 'ImgRouter 规范',
+    hint: '默认后端为 ImgRouter 时拼进自动 tag 请求，约束 tag / nl 的书写规范。留空用内置默认。',
+    builtin: DEFAULT_IMGROUTER_SPEC,
+    macros: [
+      {
+        token: '{{nl}}',
+        desc: '自然语言规范；ImgRouter 面板开启「生成自然语言」时展开，关闭时置空。不写此宏时，开启开关会自动追加到末尾。',
+      },
+    ],
+  },
+  {
+    key: 'imgRouterThinking',
+    label: 'ImgRouter 思维链',
+    hint: '默认后端为 ImgRouter 时使用的输出前思考清单，作为 system 压在任务消息之后（解析时会自动剥掉思考块）。与「ImgRouter 规范」配套。留空用内置默认。',
+    builtin: DEFAULT_IMGROUTER_THINKING,
     macros: [],
   },
   {
@@ -278,7 +303,22 @@ function removeChannel(id: string) {
   if (idx >= 0) list.splice(idx, 1);
   // 清理指派:生成 tag 若指派了该渠道则清空(回落跟随主 API)
   if (settings.assignments.tagGen === id) settings.assignments.tagGen = '';
+  // 备用指派同理。空串在这一格是「不启用备用」,正是删掉渠道后该有的状态
+  if (settings.assignments.tagGenFallback === id) settings.assignments.tagGenFallback = '';
 }
+
+/**
+ * 备用渠道与主渠道解析到同一个目标(含两边都是「跟随主 API」)。
+ *
+ * getTagGenChain() 会把这种配置去重剔除,UI 这行只是别让它变成沉默的无效配置。
+ * 不过滤下拉选项:选项跳动比一行警告更难用。
+ */
+const fallbackSameAsPrimary = computed<boolean>(() => {
+  const fallbackId = settings.assignments.tagGenFallback;
+  if (!fallbackId) return false; // 空串 = 不启用备用,没什么可警告的
+  if (fallbackId === ASSIGN_MAIN_API) return getTagGenChannel() === null;
+  return getTagGenChannel()?.id === fallbackId;
+});
 
 const testing = ref<Record<string, string>>({});
 async function doTest(ch: ApiChannel) {
@@ -683,7 +723,13 @@ async function confirmUpdate() {
             @change="normalizeAutoTagNumbers"
           />
         </label>
-        <p class="bbi-field-hint">副 API 请求失败或返回无法解析时自动重试；0 = 不重试，最多 5 次。</p>
+        <p class="bbi-field-hint">副 API 请求失败或返回无法解析时自动重试；0 = 不重试，最多 5 次。配了备用渠道时，这个次数对主渠道和备用渠道各算一遍。</p>
+
+        <label class="bbi-switch-row">
+          <span class="bbi-field-label">生成时显示进度提示</span>
+          <input v-model="settings.autoTag.notifyProgress" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p class="bbi-field-hint">生成 tag 期间在酒馆里显示一条常驻提示(重试与切换备用渠道也写在上面),不打开插件面板也能知道它在忙。关掉则只在成功/失败时提示。</p>
       </Collapsible>
 
       <!-- 排除角色:名单与柏宝书共享(见 state/settings.ts 的共享存储),任一端改动自动同步 -->
@@ -818,6 +864,22 @@ async function confirmUpdate() {
           </label>
         </div>
         <p class="bbi-field-hint">不指派渠道时跟随主 API:直接借用你主界面当前正在用的 API(聊天补全/文本补全)来生成画图 tag,无需额外配置。想用不同模型再在下方建副渠道指派。渠道列表与柏宝书共享,任一端改动都会自动同步到另一端。</p>
+
+        <!-- 备用渠道:主渠道把重试次数用光后改用它,再按同样次数重试一轮 -->
+        <div class="bbi-field bbi-assign">
+          <label class="bbi-assign-row">
+            <span class="bbi-field-label">失败后备用渠道</span>
+            <select v-model="settings.assignments.tagGenFallback" class="bbi-input bbi-select">
+              <option value="">不使用</option>
+              <option :value="ASSIGN_MAIN_API">跟随主 API</option>
+              <option v-for="c in settings.channels" :key="c.id" :value="c.id">{{ c.name }}</option>
+            </select>
+          </label>
+        </div>
+        <p class="bbi-field-hint">主渠道把「自动 tag」区的「失败自动重试次数」用完还是失败时,自动换成这个渠道再按同样次数重试一轮。选「不使用」= 保持只在一个渠道上重试的行为。</p>
+        <p v-if="fallbackSameAsPrimary" class="bbi-field-hint">
+          备用渠道与主渠道相同,不会生效——同一个渠道再打一轮换不出运气。
+        </p>
 
         <hr class="bbi-rule" />
 
