@@ -1,0 +1,655 @@
+/*
+ * 楼层卡片样式 v2 —— 沉浸优先:图即卡片。
+ *
+ * 与 v1 的分歧:v1 把设置窗口的「面板语言」(边框/底色/品牌栏/头部按钮行)搬进了
+ * 聊天正文,在 RP 场景里是突兀的 UI 异物,且 max-width:560px 让宽屏下图片铺不满。
+ * v2 原则:
+ * - 无边框、无背景面板、无品牌栏;宽度 100% 跟随楼层正文,图片自身一点圆角;
+ * - 控件全部收进右上角一颗 ⋯ 收纳钮(半透明黑底圆钮):桌面 hover 在其左侧
+ *   横向浮现一排,触屏点开在其下方竖排展开,图片平时只有一颗小点;
+ * - 提示词收进悬浮 文本按钮唤起的面板,平时零占位;
+ * - 生成中 = 磨砂遮罩绝对定位盖住舞台(旧图保留在底下),居中 spinner + 状态 + 取消,
+ *   不再像 v1 那样把状态文案作为 flex 子项与图片并排互挤。
+ *
+ * 注入方式(floor/cardStyles.ts):与 theme.css 一起构造成 CSSStyleSheet,
+ * 经 adoptedStyleSheets 共享给每个卡片的 shadow root——N 张卡零重复。
+ *
+ * 卡片活在**每个锚点各自的 shadow root** 里(floor/hydrate.ts),故:
+ * - 不再需要靠 .bbi- 前缀防冲突(shadow 天然隔离),前缀只为可读性保留;
+ * - ST 全局样式与美化主题进不来了;
+ * - 但**可继承属性**(font/color/line-height…)仍会穿透 shadow 边界,由 hydrate.ts
+ *   在 host 上钉 INHERITED_RESET 切断;
+ * - 自定义属性同样穿透,故 theme.css 的 data-theme='st' 仍能取到宿主 --SmartTheme*。
+ *
+ * 颜色/圆角一律取 theme.css 的 --bbi-* 令牌,与设置窗口同一套设计语言,不写死字面量
+ * (浮钮/翻页器的半透明黑底是「压在图上」的通用解,与主题无关,除外)。
+ */
+
+:host {
+  display: block;
+  margin: 8px 0;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+.bbi-figure {
+  position: relative;
+  width: 100%;
+  color: var(--bbi-ink);
+  font-family: var(--bbi-font-sans);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* ——— 舞台:图片 / 占位 / 遮罩 / 悬浮层都在这 ———
+   overflow:hidden 让骨架与遮罩跟着图片一起圆角。 */
+
+.bbi-figure__stage {
+  position: relative;
+  width: 100%;
+  border-radius: var(--bbi-radius);
+  overflow: hidden;
+}
+
+/* 无图占位:按画幅方向预留高度,出图瞬间不跳版 */
+.bbi-figure__stage[data-placeholder='1'] {
+  background: var(--bbi-surface-2);
+}
+
+.bbi-figure__stage[data-placeholder='1'][data-size='portrait'] {
+  aspect-ratio: 2 / 3;
+}
+
+.bbi-figure__stage[data-placeholder='1'][data-size='landscape'] {
+  aspect-ratio: 3 / 2;
+}
+
+/* ——— 图片:铺满楼层宽度,高度随原图比例 ———
+   不加 max-height/object-fit:竖图就让它高。contain 会在宽盒子里留空柱、
+   cover 会裁切画面,两者都不如「原比例铺满」适合看图场景。 */
+
+.bbi-figure__img {
+  display: block;
+  width: 100%;
+  height: auto;
+  cursor: zoom-in;
+  /* 长按保存:抵消 ST 的 body{touch-action:none}(css/mobile-styles.css:251)。
+     另注意——图片上绝不可 preventDefault touch 事件、不可加 user-select:none,
+     否则移动端长按菜单不会出现。详见 floor/Lightbox.vue 顶部注释。 */
+  touch-action: auto;
+}
+
+/* ——— 生成中遮罩:磨砂盖住整个舞台,旧图在底下隐约可见 ——— */
+
+.bbi-figure__busy {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+  background: color-mix(in srgb, var(--bbi-surface) 55%, transparent);
+  backdrop-filter: blur(3px);
+}
+
+.bbi-figure__busy-text {
+  font-size: 12px;
+  color: var(--bbi-ink-soft);
+}
+
+.bbi-figure__spin {
+  width: 22px;
+  height: 22px;
+  border: 2px solid color-mix(in srgb, var(--bbi-accent) 28%, transparent);
+  border-top-color: var(--bbi-accent);
+  border-radius: 50%;
+  animation: bbi-spin 0.8s linear infinite;
+}
+
+@keyframes bbi-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.bbi-figure__cancel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 26px;
+  padding: 0 14px;
+  border: 1px solid var(--bbi-line-strong);
+  border-radius: var(--bbi-radius-pill);
+  background: var(--bbi-surface);
+  color: var(--bbi-ink-soft);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    border-color var(--bbi-dur) var(--bbi-ease),
+    color var(--bbi-dur) var(--bbi-ease);
+}
+
+.bbi-figure__cancel:hover {
+  border-color: var(--bbi-accent);
+  color: var(--bbi-accent);
+}
+
+/* ——— 无图且空闲:占位区中央的生成入口 / 配置引导 ——— */
+
+.bbi-figure__pending {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+}
+
+.bbi-figure__generate {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: var(--bbi-radius-pill);
+  background: var(--bbi-accent);
+  color: var(--bbi-accent-ink);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: opacity var(--bbi-dur) var(--bbi-ease);
+}
+
+.bbi-figure__generate:hover {
+  opacity: 0.88;
+}
+
+.bbi-figure__generate:focus-visible {
+  outline: 2px solid var(--bbi-accent);
+  outline-offset: 2px;
+}
+
+.bbi-figure__hint {
+  margin: 0;
+  max-width: 32em;
+  text-align: center;
+  font-size: 12px;
+  color: var(--bbi-ink-muted);
+}
+
+/* ——— stale 角标:左上角小胶囊,不再整图压暗 ——— */
+
+.bbi-figure__badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
+  padding: 2px 9px;
+  border-radius: var(--bbi-radius-pill);
+  background: oklch(0 0 0 / 0.55);
+  backdrop-filter: blur(4px);
+  color: var(--bbi-warning);
+  font-size: 10.5px;
+  line-height: 17px;
+  /* 不挡图片点击/长按 */
+  pointer-events: none;
+}
+
+/* ——— 悬浮操作组:右上角 ⋯ 收纳钮 ———
+   全平台统一:⋯ 常驻淡显,钉死在右上角(row-reverse 保证菜单展开时它不位移);
+   桌面(hover:hover)hover ⋯ 时菜单在其左侧横向浮现;
+   触屏(hover:none)点 ⋯ 菜单在其下方竖排展开,点任意操作后收起。 */
+
+.bbi-figure__actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  flex-direction: row-reverse;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ⋯ 常驻淡显:功能入口不能没有,但存在感压到最低。
+   注意:绝不可用 display:none 藏它——.bbi-fab 的 display:inline-flex 声明在后面,
+   同优先级后写的赢,会把它重新点亮(曾经的 bug:桌面 ⋯ 被隐形菜单挤离角落)。 */
+.bbi-figure__more {
+  opacity: 0.65;
+  transition: opacity var(--bbi-dur) var(--bbi-ease);
+}
+
+.bbi-figure__stage:hover .bbi-figure__more,
+.bbi-figure__actions:focus-within .bbi-figure__more,
+.bbi-figure__actions[data-open='1'] .bbi-figure__more {
+  opacity: 1;
+}
+
+/* 菜单隐藏时 pointer-events:none:不在图上留隐形热区
+   (opacity:0 的元素仍可命中点击,会误触隐形按钮、也挡图片点按)。 */
+.bbi-figure__menu {
+  display: flex;
+  gap: 6px;
+  opacity: 0;
+  transform: translateX(4px);
+  pointer-events: none;
+  transition:
+    opacity var(--bbi-dur) var(--bbi-ease),
+    transform var(--bbi-dur) var(--bbi-ease);
+}
+
+@media (hover: hover) {
+  .bbi-figure__actions:hover .bbi-figure__menu,
+  .bbi-figure__actions:focus-within .bbi-figure__menu {
+    opacity: 1;
+    transform: none;
+    pointer-events: auto;
+  }
+}
+
+@media (hover: none) {
+  .bbi-figure__actions {
+    flex-direction: column;
+    align-items: flex-end;
+  }
+
+  .bbi-figure__menu {
+    display: none;
+    flex-direction: column;
+    opacity: 1;
+    transform: none;
+    pointer-events: auto;
+  }
+
+  .bbi-figure__actions[data-open='1'] .bbi-figure__menu {
+    display: flex;
+  }
+}
+
+.bbi-fab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--bbi-radius-pill);
+  background: oklch(0 0 0 / 0.55);
+  backdrop-filter: blur(4px);
+  color: oklch(1 0 0 / 0.92);
+  cursor: pointer;
+  transition:
+    background var(--bbi-dur) var(--bbi-ease),
+    color var(--bbi-dur) var(--bbi-ease);
+}
+
+.bbi-fab:hover:not(:disabled) {
+  background: oklch(0 0 0 / 0.72);
+  color: oklch(1 0 0);
+}
+
+.bbi-fab:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.bbi-fab:focus-visible {
+  outline: 2px solid var(--bbi-accent);
+  outline-offset: 1px;
+}
+
+.bbi-fab--danger:hover:not(:disabled) {
+  background: var(--bbi-danger);
+  color: oklch(1 0 0);
+}
+
+/* 提示词面板开着时,文本钮转强调色表示「已展开」 */
+.bbi-fab--on {
+  background: var(--bbi-accent);
+  color: var(--bbi-accent-ink);
+}
+
+/* ——— 翻页器:叠在图片右下角的胶囊 ——— */
+
+.bbi-figure__pager {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: var(--bbi-radius-pill);
+  background: oklch(0 0 0 / 0.55);
+  backdrop-filter: blur(4px);
+}
+
+.bbi-figure__pager-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: var(--bbi-radius-pill);
+  background: transparent;
+  color: oklch(1 0 0 / 0.9);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.bbi-figure__pager-btn:hover:not(:disabled) {
+  background: oklch(1 0 0 / 0.18);
+}
+
+.bbi-figure__pager-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.bbi-figure__pager-count {
+  padding: 0 4px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: oklch(1 0 0 / 0.9);
+}
+
+/* ——— 折叠动画:grid-template-rows 1fr→0fr 过渡(高度 auto 也能平滑) ———
+   折叠时舞台不卸载,只是高度归零 + 淡出,展开时 <img> 不需要重新请求。
+   不支持 grid 行过渡的老浏览器退化为即时切换,功能不受影响。
+   visibility 延迟到收起动画结束后才 hidden:折叠中的内容保持可见,
+   结束后内部按钮不再可被 Tab 聚焦;展开时立即恢复可见。 */
+
+.bbi-figure__collapse {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition:
+    grid-template-rows calc(var(--bbi-dur) * 1.25) var(--bbi-ease),
+    opacity var(--bbi-dur) var(--bbi-ease),
+    visibility 0s;
+}
+
+.bbi-figure__collapse[data-collapsed='1'] {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    grid-template-rows calc(var(--bbi-dur) * 1.25) var(--bbi-ease),
+    opacity var(--bbi-dur) var(--bbi-ease),
+    visibility 0s calc(var(--bbi-dur) * 1.25);
+}
+
+/* 收起时裁掉内容;overflow:hidden 同时建起 BFC,兜住子级 margin(状态行的上外边距) */
+.bbi-figure__collapse-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ——— 折叠条:收起时替代整个舞台,职责只有「占位 + 展开」 ———
+   整条是一个 <button>,点击展开;生成中/出错在条上给状态但不放操作按钮。
+   折叠条是 v-if(无离场动画),靠入场动画与舞台收起的过渡衔接。 */
+
+.bbi-figure__bar {
+  display: flex;
+  animation: bbi-bar-in var(--bbi-dur) var(--bbi-ease);
+}
+
+/* 出现时轻微淡入下移 */
+@keyframes bbi-bar-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}
+
+.bbi-figure__bar {
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--bbi-radius);
+  background: var(--bbi-surface-2);
+  color: var(--bbi-ink-muted);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color var(--bbi-dur) var(--bbi-ease),
+    background var(--bbi-dur) var(--bbi-ease);
+}
+
+.bbi-figure__bar:hover {
+  color: var(--bbi-ink);
+}
+
+.bbi-figure__bar:focus-visible {
+  outline: 2px solid var(--bbi-accent);
+  outline-offset: 1px;
+}
+
+.bbi-figure__bar-icon {
+  flex: 0 0 auto;
+  opacity: 0.75;
+}
+
+/* 主文案:长提示词截断成单行省略号 */
+.bbi-figure__bar-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bbi-figure__bar-text[data-error='1'] {
+  color: var(--bbi-danger);
+}
+
+.bbi-figure__bar-count {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+.bbi-figure__bar-chevron {
+  flex: 0 0 auto;
+  opacity: 0.55;
+}
+
+/* 折叠条上的迷你 spinner(生成中),与舞台上同构只是更小 */
+.bbi-figure__bar-spin {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  border: 2px solid color-mix(in srgb, var(--bbi-accent) 28%, transparent);
+  border-top-color: var(--bbi-accent);
+  border-radius: 50%;
+  animation: bbi-spin 0.8s linear infinite;
+}
+
+/* ——— 骨架屏(无图的生成中):微光扫过占位底,表示「在动」 ——— */
+
+.bbi-figure__skeleton {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 20%,
+    color-mix(in srgb, var(--bbi-accent) 12%, transparent) 50%,
+    transparent 80%
+  );
+  background-size: 220% 100%;
+  animation: bbi-shimmer 1.6s var(--bbi-ease) infinite;
+}
+
+@keyframes bbi-shimmer {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -120% 0;
+  }
+}
+
+/* ——— 状态行:仅出错 / 提示词已改时出现,平时零占位 ——— */
+
+.bbi-figure__status {
+  margin: 6px 2px 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--bbi-ink-muted);
+}
+
+.bbi-figure__status--error {
+  color: var(--bbi-danger);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bbi-figure__status--warn {
+  color: var(--bbi-warning);
+}
+
+.bbi-figure__retry {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  margin-left: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--bbi-line-strong);
+  border-radius: var(--bbi-radius-pill);
+  background: var(--bbi-surface);
+  color: var(--bbi-accent);
+  font-family: inherit;
+  font-size: 11.5px;
+  vertical-align: baseline;
+  cursor: pointer;
+  transition:
+    border-color var(--bbi-dur) var(--bbi-ease),
+    background var(--bbi-dur) var(--bbi-ease);
+}
+
+.bbi-figure__retry:hover {
+  border-color: var(--bbi-accent);
+  background: var(--bbi-accent-soft);
+}
+
+/* ——— 提示词面板:悬浮 文本按钮唤起 ———
+   复制按钮绝对定位而非与文本并排 flex:提示词是可换行长文本,
+   并排会让按钮跟着文本高度居中飘到中间去。 */
+
+.bbi-figure__prompt-box {
+  position: relative;
+  margin-top: 6px;
+}
+
+.bbi-figure__prompt-copy {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius-pill);
+  /* 压在提示词之上,底色要盖住下面的文字 */
+  background: var(--bbi-surface);
+  color: var(--bbi-ink-muted);
+  cursor: pointer;
+  transition:
+    color var(--bbi-dur) var(--bbi-ease),
+    border-color var(--bbi-dur) var(--bbi-ease);
+}
+
+.bbi-figure__prompt-copy:hover {
+  color: var(--bbi-accent);
+  border-color: var(--bbi-accent);
+}
+
+.bbi-figure__prompt {
+  margin: 0;
+  /* 右侧留出复制按钮的位置(26 + 4×2),否则长 tag 会钻到按钮底下 */
+  padding: 9px 40px 9px 10px;
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-surface-2);
+  color: var(--bbi-ink-soft);
+  font-family: var(--bbi-font-mono);
+  font-size: 11.5px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+  /* 提示词要能选中复制 */
+  user-select: text;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.bbi-figure__prompt-nl {
+  display: block;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--bbi-line);
+  color: var(--bbi-ink-muted);
+  font-family: var(--bbi-font-sans);
+}
+
+.bbi-figure__prompt-negative {
+  color: var(--bbi-warning);
+}
+
+/* ——— 尊重减少动效 ——— */
+@media (prefers-reduced-motion: reduce) {
+  .bbi-figure__skeleton,
+  .bbi-figure__spin,
+  .bbi-figure__bar,
+  .bbi-figure__bar-spin {
+    animation: none;
+  }
+
+  /* 折叠动画豁免:visibility 不再延迟,收起立即隐藏 */
+  .bbi-figure__collapse,
+  .bbi-figure__collapse[data-collapsed='1'] {
+    transition: visibility 0s;
+  }
+
+  .bbi-figure__menu,
+  .bbi-figure__more,
+  .bbi-fab,
+  .bbi-figure__bar,
+  .bbi-figure__cancel,
+  .bbi-figure__generate,
+  .bbi-figure__retry,
+  .bbi-figure__prompt-copy {
+    transition: none;
+  }
+}

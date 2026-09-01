@@ -1,0 +1,580 @@
+/*
+ * 基础样式:作用域全部收在 .bbi-root 下,避免污染 ST 宿主页面。
+ * 不写颜色字面量,一律取 theme.css 的变量。
+ */
+
+/* shadow root 宿主:回到初始值,切断从 ST 继承下来的排版属性。
+   配合 index.ts 里 host 的内联 !important,双保险。 */
+:host {
+  all: initial;
+}
+
+.bbi-root,
+.bbi-root * {
+  box-sizing: border-box;
+}
+
+.bbi-root {
+  font-family: var(--bbi-font-sans);
+  font-size: 14px;
+  color: var(--bbi-ink);
+  -webkit-font-smoothing: antialiased;
+  line-height: 1.6;
+}
+
+/* —— 遮罩层 —— */
+.bbi-overlay {
+  position: fixed;
+  /* 不用 inset 简写:部分移动端 WebView 不认,会让 overlay 高度塌成 auto,
+     进而使子级 height:100% 解析失败(高度为 0)。展开成四个属性更稳。 */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bbi-overlay);
+  backdrop-filter: blur(3px);
+  padding: 24px;
+}
+
+/* —— 窗口外壳 —— */
+.bbi-window {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: var(--bbi-win-max-w);
+  height: var(--bbi-win-max-h);
+  max-height: var(--bbi-win-max-h);
+  background: var(--bbi-bg);
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius-win);
+  box-shadow: var(--bbi-shadow);
+  overflow: hidden;
+}
+
+/* —— 内容区(分页容器) —— */
+.bbi-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--bbi-page-pad);
+}
+
+/* —— 通用排版原子,供各分页复用 —— */
+.bbi-title {
+  font-weight: 600;
+  font-size: 22px;
+  color: var(--bbi-ink);
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+/* 区块/分页标题:比主标题(22px)小一号,跨页统一(摘要/悬念簿/物品/设置) */
+.bbi-title-sub {
+  font-size: 18px;
+}
+
+@media (max-width: 640px) {
+  .bbi-title-sub {
+    font-size: 16px;
+  }
+}
+
+/* —— 通用按钮 —— */
+.bbi-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 14px;
+  border: 1px solid var(--bbi-line-strong);
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-surface);
+  color: var(--bbi-ink);
+  font-family: var(--bbi-font-sans);
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background var(--bbi-dur) var(--bbi-ease),
+    border-color var(--bbi-dur) var(--bbi-ease),
+    opacity var(--bbi-dur) var(--bbi-ease);
+}
+
+.bbi-btn:hover {
+  border-color: var(--bbi-accent);
+  color: var(--bbi-accent);
+}
+
+.bbi-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.bbi-btn:focus-visible {
+  outline: 2px solid var(--bbi-accent);
+  outline-offset: 1px;
+}
+
+.bbi-btn-primary {
+  background: var(--bbi-accent);
+  border-color: var(--bbi-accent);
+  color: var(--bbi-accent-ink);
+}
+
+.bbi-btn-primary:hover {
+  color: var(--bbi-accent-ink);
+  opacity: 0.9;
+}
+
+/* —— 通用输入 —— */
+.bbi-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--bbi-line-strong);
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-surface);
+  color: var(--bbi-ink);
+  font-family: var(--bbi-font-sans);
+  font-size: 13px;
+}
+
+.bbi-input:focus {
+  outline: none;
+  border-color: var(--bbi-accent);
+}
+
+.bbi-rule {
+  height: 1px;
+  background: var(--bbi-line);
+  border: 0;
+  margin: var(--bbi-gap) 0;
+}
+
+/* —— 通用弹窗:供各分页复用(summary 编辑、settings 渠道编辑等)——
+   各页弹窗经 ModalMask 组件 Teleport 到 modalHost(.bbi-root 直接子级,在 .bbi-body
+   滚动容器之外),修复 iOS「可滚动祖先内 fixed 后代定位错乱」。宿主仍在 shadow root 内,
+   故 scoped 样式与 --bbi-* 变量照常生效——不可用会逃出 shadow 的 Teleport to="body"。 */
+.bbi-modal-mask {
+  position: fixed;
+  /* 必须显式 width/height 撑满视口,不能只靠 top/bottom:0——部分移动端 WebView 不认,
+     高度会塌成内容高(auto),align-items:center 随之失效、弹窗挤向顶部跑出屏幕。
+     与 .bbi-overlay 同款写法(见其注释)。teleport 出滚动容器后这点尤其关键:
+     之前嵌在 .bbi-body 里被滚动祖先撑高掩盖了,搬成视口级 fixed 后塌陷才暴露。 */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  z-index: 10001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bbi-overlay);
+  backdrop-filter: blur(3px);
+}
+
+.bbi-modal {
+  width: 100%;
+  max-width: 520px;
+  max-height: 86vh;
+  max-height: 86dvh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border-radius: var(--bbi-radius-win);
+  background: var(--bbi-bg);
+  border: 1px solid var(--bbi-line);
+  box-shadow: var(--bbi-shadow);
+}
+
+/* 标题栏固定:弹窗内容超长时整体滚动,但标题+关闭键随 sticky 钉在顶部不跟滚。
+   负 margin 抵消 .bbi-modal 的 18px 内边距,让标题栏横向铺满、滚动时其不透明背景
+   盖住下方滚上来的内容(否则内容会从标题区透出)。padding 补回内边距。
+   top:-18px 而非 0:.bbi-modal 有 18px 内边距,其滚动视口顶边在内边距处(距窗口边 18px);
+   若 top:0,标题栏会吸附在视口顶边、上方露出 18px 缝隙让内容滚上来。-18px 抵消内边距,贴齐真实顶边。 */
+.bbi-modal-head {
+  position: sticky;
+  top: -18px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: -18px -18px 0;
+  padding: 18px 18px 12px;
+  background: var(--bbi-bg);
+}
+
+.bbi-modal-title {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--bbi-ink);
+}
+
+.bbi-modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.bbi-modal-label {
+  font-size: 12px;
+  color: var(--bbi-ink-soft);
+}
+
+.bbi-modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* —— 弹窗进出场:比窗口(--bbi-dur 0.28s)更快更利落,~0.15s,不墨迹。开关都带动画。
+   Vue Transition name="bbi-modal",由 ModalMask / ConfirmDialog 内部常驻的 Transition 驱动
+   (容器常驻、内部 v-if 切换弹窗,故离场也能播)。遮罩(.bbi-modal-mask)是过渡根元素,
+   卡片(.bbi-modal)靠后代选择器联动——与 App.vue 窗口同款手法。 */
+.bbi-modal-enter-active,
+.bbi-modal-leave-active {
+  transition: opacity 0.15s var(--bbi-ease);
+}
+
+.bbi-modal-enter-active .bbi-modal,
+.bbi-modal-leave-active .bbi-modal {
+  transition:
+    opacity 0.15s var(--bbi-ease),
+    transform 0.15s var(--bbi-ease);
+}
+
+.bbi-modal-enter-from,
+.bbi-modal-leave-to {
+  opacity: 0;
+}
+
+.bbi-modal-enter-from .bbi-modal,
+.bbi-modal-leave-to .bbi-modal {
+  opacity: 0;
+  transform: translateY(8px) scale(0.97);
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+  .bbi-modal-enter-active,
+  .bbi-modal-leave-active,
+  .bbi-modal-enter-active .bbi-modal,
+  .bbi-modal-leave-active .bbi-modal {
+    transition: none;
+  }
+}
+
+/* —— 隐藏滚动条(保留滚动能力):整个 UI 内统一 —— */
+.bbi-root * {
+  scrollbar-width: none;
+  /* Firefox */
+  -ms-overflow-style: none;
+  /* 旧 Edge/IE */
+}
+
+.bbi-root *::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+  /* Chrome/Safari */
+}
+
+/* ============ 响应式:移动端整屏(底部抽屉式) ============ */
+@media (max-width: 640px) {
+  .bbi-overlay {
+    padding: 0;
+    align-items: flex-end;
+  }
+
+  .bbi-window {
+    max-width: 100%;
+    width: 100%;
+    /* 直接用视口高,不依赖父级百分比链 */
+    height: 96vh;
+    height: 96dvh;
+    max-height: 96vh;
+    max-height: 96dvh;
+    border: 0;
+    /* 仅顶部圆角:贴底的抽屉观感 */
+    border-radius: 18px 18px 0 0;
+  }
+}
+
+/* ============ 尊重减少动效 ============ */
+@media (prefers-reduced-motion: reduce) {
+  .bbi-root * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ==========================================================================
+   页面骨架 & 表单语言(跨页通用,风格与柏宝书一致)
+   用法:页根 <section class="bbi-page"> → bbi-page-head(标题+右侧槽位)
+   → hr.bbi-rule → bbi-sections(若干 Collapsible 分组) → 组内 bbi-field。
+   页面自身不带 padding——边距由 .bbi-body 统一提供,避免「页中页」。
+
+   只放真·跨页复用的原子;单页专属外观(如设置页总开关卡)留在该页的
+   <style scoped> 里,别在这儿堆——柏宝书即此分工。
+   ========================================================================== */
+
+.bbi-page {
+  display: flex;
+  flex-direction: column;
+}
+.bbi-page-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.bbi-page-intro {
+  margin: 10px 0 16px;
+  font-size: 13px;
+  color: var(--bbi-ink-muted);
+  line-height: 1.6;
+}
+.bbi-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* —— 字段:标签行(左标签 + 右数值)+ 控件 + 提示 —— */
+.bbi-field {
+  margin-bottom: 18px;
+}
+.bbi-field:last-child {
+  margin-bottom: 0;
+}
+.bbi-field-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.bbi-field-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--bbi-ink);
+}
+.bbi-field-value {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--bbi-accent);
+}
+
+/* 说明文字:独占整行(不塞进开关行里被控件挤成窄柱),折行位置才齐整。
+   跟在它说明的那一行之后,故上间距小、下间距大,读起来是「一段话」而非零散附注。 */
+.bbi-field-hint {
+  margin: 0 0 14px;
+  font-size: 12px;
+  color: var(--bbi-ink-muted);
+  line-height: 1.6;
+}
+.bbi-field-hint:last-child {
+  margin-bottom: 0;
+}
+/* 紧跟控件时补一点上间距(开关行/滑块自带下留白,不在此列) */
+.bbi-input + .bbi-field-hint,
+.bbi-segmented + .bbi-field-hint {
+  margin-top: 8px;
+}
+
+/* —— 开关行:整行 <label>,点标题也能切换;控件靠右 ——
+   说明另起 <p class="bbi-field-hint">,不进本行。 */
+.bbi-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  cursor: pointer;
+}
+
+/* —— 数值行:与开关行同一套几何(左标签 / 右控件、同 padding),
+   让「填数字」和「拨开关」在同一栏里读作同一种行,不再是嵌进去的异形网格。 —— */
+.bbi-num-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+/* 下拉选择行:与开关/数字行同族,左标题右自绘下拉(BbiSelect) */
+.bbi-select-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+}
+/* 数字输入框:窄、右对齐,数位随行右缘对齐(对齐柏宝书) */
+.bbi-num {
+  max-width: 110px;
+  text-align: right;
+}
+
+/* 原生复选框 + accent-color:轻、不抢戏。
+   大号滑动开关只留给「总开关」那一处主控,层级才分明。 */
+.bbi-checkbox {
+  /* flex 行里长文本会把固定宽高的复选框挤扁 → 禁止收缩,保持标准方形 */
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--bbi-accent);
+  cursor: pointer;
+}
+.bbi-checkbox:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+/* 禁用项连同标签一起褪色,「点了没反应」才有解释 */
+.bbi-switch-row:has(.bbi-checkbox:disabled) {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* —— 分段选择器(主题/后端/位置等少量互斥项) —— */
+.bbi-segmented {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--bbi-surface-2);
+  border-radius: var(--bbi-radius);
+}
+.bbi-segmented-wrap {
+  display: flex;
+  flex-wrap: wrap;
+}
+.bbi-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 18px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--bbi-radius-sm);
+  color: var(--bbi-ink-soft);
+  font-family: var(--bbi-font-sans);
+  font-size: 13px;
+  cursor: pointer;
+  transition:
+    background var(--bbi-dur) var(--bbi-ease),
+    color var(--bbi-dur) var(--bbi-ease);
+}
+.bbi-seg:hover {
+  color: var(--bbi-ink);
+}
+.bbi-seg.is-on {
+  background: var(--bbi-surface);
+  color: var(--bbi-accent);
+  box-shadow: 0 1px 3px oklch(0 0 0 / 0.08);
+}
+.bbi-seg:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.bbi-seg:focus-visible {
+  outline: 2px solid var(--bbi-accent);
+  outline-offset: 1px;
+}
+
+/* —— 下拉:自绘小三角,去掉原生大留白箭头 —— */
+.bbi-select {
+  max-width: 100%;
+  font-size: 13px;
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 26px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9.5 12 15.5 18 9.5'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 14px;
+}
+
+/* —— 滑块:主题色,跨浏览器统一外观 —— */
+.bbi-range {
+  width: 100%;
+  height: 4px;
+  margin: 6px 0 12px;
+  border-radius: var(--bbi-radius-pill);
+  background: var(--bbi-surface-2);
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+.bbi-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--bbi-radius-pill);
+  background: var(--bbi-accent);
+  border: 2px solid var(--bbi-surface);
+  box-shadow: 0 1px 3px oklch(0 0 0 / 0.25);
+}
+.bbi-range::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: var(--bbi-radius-pill);
+  background: var(--bbi-accent);
+  border: 2px solid var(--bbi-surface);
+}
+.bbi-range:focus-visible {
+  outline: 2px solid var(--bbi-accent);
+  outline-offset: 3px;
+}
+
+/* —— 小号按钮 —— */
+.bbi-btn-sm {
+  padding: 6px 11px;
+  font-size: 12px;
+}
+
+/* —— 状态药丸:「默认 / 已自定义」。默认 muted,已自定义转强调色。
+   设置页的自定义提示词列表与渠道页的提示词字段共用,故放全局
+   (scoped 样式过不了组件边界)。 —— */
+.bbi-prompt-state {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: var(--bbi-radius-pill);
+  color: var(--bbi-ink-muted);
+  background: var(--bbi-surface);
+  border: 1px solid var(--bbi-line);
+}
+.bbi-prompt-state.is-custom {
+  color: var(--bbi-accent);
+  background: var(--bbi-accent-soft);
+  border-color: transparent;
+}
+
+/* ============ 移动端:表单正文整体收一号,与窄屏标题节奏统一(对齐柏宝书) ============ */
+@media (max-width: 640px) {
+  .bbi-field-label {
+    font-size: 13px;
+  }
+  .bbi-field-hint {
+    font-size: 11px;
+  }
+  .bbi-seg {
+    font-size: 12px;
+  }
+}

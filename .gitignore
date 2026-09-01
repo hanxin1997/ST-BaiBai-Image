@@ -1,0 +1,13 @@
+node_modules/
+*.log
+.DS_Store
+.preview/
+.preview/shot-*.png
+.claude
+.codex/
+.aionrs/
+CLAUDE.md
+.pnpm-store/
+AGENTS.md
+.pi/
+data/
