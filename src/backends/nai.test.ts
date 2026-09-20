@@ -329,6 +329,33 @@ describe('NAI V5 support', () => {
     expect(fallback.sampler).toBe('k_euler_ancestral');
   });
 
+  it('V5 Full 默认负面只排缺陷,不再禁题材/风格/身材/画师', () => {
+    // 老版在官方基线上串过一大串社区词,把 chibi、大胸、暗调、具体画师名等都禁了,
+    // 会跟正向词与画师串长期打架(原作者已声明弃用)。这里锁死:通用默认不碰题材偏好。
+    const neg = naiDefaultUndesired('nai-diffusion-5-full');
+    // 官方基线原样保留(V5 调参依赖它,面板也靠这段认出「未自定义」)
+    expect(neg).toContain('worst quality, bad quality, jpeg artifacts');
+    expect(neg).toContain('dithering, halftone, screentone');
+    for (const banned of [
+      'chibi',
+      'large breasts',
+      'huge breasts',
+      'dark',
+      'high contrast',
+      'artist:',
+      'artist collaboration',
+      '4koma',
+      'oekaki',
+      'black face',
+      'extra people',
+      'honey',
+      'tight pants',
+      'childish',
+    ]) {
+      expect(neg).not.toContain(banned);
+    }
+  });
+
   it('maps Base Tag + NL and native Character Prompts into the V5 caption schema', () => {
     const settings = nai({
       model: 'nai-diffusion-5-full',

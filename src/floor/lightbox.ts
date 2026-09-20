@@ -19,7 +19,6 @@ export interface LightboxOptions {
   src: string;
   prompt?: string;
   filename?: string;
-  deletable?: boolean;
   /** 提供了才显示删除按钮;点删除先关灯箱再回调。 */
   onDelete?: () => void;
 }

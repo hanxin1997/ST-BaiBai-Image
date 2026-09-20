@@ -77,10 +77,15 @@ const QUALITY_TAGS: Record<string, string> = {
   'nai-diffusion-3': 'best quality, amazing quality, very aesthetic, absurdres',
 };
 
-/** 各模型官方 Heavy 负面词，作为无需用户选择的通用默认;用户改过则用其覆盖值。 */
+/**
+ * 各模型官方 Heavy 负面词，作为无需用户选择的通用默认;用户改过则用其覆盖值。
+ * 5-full 在官方基线后额外串一条插件精选的通用负面层:只排画质/解剖/水印等**缺陷**,
+ * 不含题材、风格、身材、画师偏好——那些会跟用户的正向词和画师串长期打架。
+ * 其余模型维持官方基线不动。
+ */
 const DEFAULT_UNDESIRED_CONTENT: Record<string, string> = {
   'nai-diffusion-5-full':
-    'lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, text, watermark, signature, artist:matsunaga kouyou::, artist:xinzoruo, artist:milkpanda, artist collaboration, chibi, 1990s (style), bad anatomy, distorted anatomy, disfigured, bad hands, missing finger, extra digits, mutation, extra arms, extra legs, long neck, bad feet, undetailed eyes, variant set, large variant set, 4koma, 2koma, oekaki, disorganized colors, cheesy, sloppiness, unfinished, Incomplete, -2::chibi::, large breasts, huge breasts, bad face, ugly, deformed, oily skin, dark, high contrast, tight pants, Limbs that disappear out of nowhere, childish stature, The proportions are incorrect, limbs are fused together, The face does not match the body, black face, Eye-catching bright red, extra people, incorrect eyes, red lips, red face, red ears, honey',
+    'lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, text, watermark, signature, username, artist name, bad anatomy, bad hands, bad feet, extra digits, fewer digits, extra fingers, fused fingers, extra limbs, missing limbs, long neck, blurry, poorly drawn, unfinished, plastic skin, waxy skin, oversaturated, washed out',
   'nai-diffusion-5-curated':
     'lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page',
   'nai-diffusion-3':

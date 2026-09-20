@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   appendEntry,
   BBI_IMAGE_EXTRA_KEY,
+  deleteImageFileOnly,
   deleteImageResult,
   generationId,
   historyEntries,
@@ -13,7 +14,10 @@ import {
   prepareImageForStorage,
   promptHash,
   readStore,
+  saveExternalImage,
   saveImageResult,
+  sidecarFileName,
+  sidecarPathFor,
   type BbiImageEntry,
 } from '@/floor/storage';
 import type { STContext, STMessage } from '@/st/context';
@@ -70,6 +74,37 @@ describe('imageFileName', () => {
     expect(imageFileName('\u67cf\u5b9d/\u6d4b\u8bd5 \u5361', 1, 'h', 'g', 'png')).toMatch(
       /^bbi_[0-9a-f]{14}_1_h-g\.png$/,
     );
+  });
+});
+
+describe('sidecar naming', () => {
+  it('swaps the extension of the image filename', () => {
+    expect(sidecarFileName('bbi_abc_0_h-g1.png')).toBe('bbi_abc_0_h-g1.json');
+    expect(sidecarFileName('bbi_abc_0_h-g1.jpg')).toBe('bbi_abc_0_h-g1.json');
+  });
+
+  it('appends .json when there is no extension', () => {
+    expect(sidecarFileName('bbi_abc_0_h-g1')).toBe('bbi_abc_0_h-g1.json');
+  });
+
+  it('stays inside validateAssetFileName limits for real filenames', () => {
+    // 服务端 /api/files/upload 只收 /^[a-zA-Z0-9_\-.]+$/,名字不合规会 400
+    const name = sidecarFileName(imageFileName('柏宝/测试 卡', 1, 'h', 'g', 'png'));
+    expect(name).toMatch(/^[a-zA-Z0-9_\-.]+$/);
+    expect(name.endsWith('.json')).toBe(true);
+  });
+
+  it('derives the sidecar path from an image path', () => {
+    expect(sidecarPathFor('/user/images/柏宝绘_a/bbi_abc_0_h-g1.png')).toBe(
+      '/user/files/bbi_abc_0_h-g1.json',
+    );
+  });
+
+  it('returns empty for files this plugin did not name', () => {
+    // 外来文件算出来的侧写名必然 404,不该白发请求
+    expect(sidecarPathFor('/user/images/柏宝绘_a/photo.png')).toBe('');
+    expect(sidecarPathFor('/user/files/bbi-vibe-thumb-x.jpg')).toBe('');
+    expect(sidecarPathFor('')).toBe('');
   });
 });
 
@@ -245,15 +280,90 @@ describe('prepareImageForStorage', () => {
 });
 
 describe('saveImageResult', () => {
-  it('records the actual seed used into the entry', async () => {
-    const message = fakeMessage();
+  beforeEach(() => {
+    settings.storage.saveAsJpeg = false;
+  });
+
+  it.each([
+    { name: ' 柏宝 ', name2: '柏宝', groupId: undefined, characterName: '柏宝', storedName: '柏宝' },
+    { name: ' 小雪 ', name2: '另一位角色', groupId: 'group-a', characterName: '小雪', storedName: '小雪' },
+    { name: ' ', name2: ' 柏宝 ', groupId: undefined, characterName: '柏宝', storedName: '柏宝' },
+    { name: '', name2: undefined, groupId: undefined, characterName: '未命名角色', storedName: '未命名角色' },
+    { name: ' ', name2: ' ', groupId: undefined, characterName: '未命名角色', storedName: '未命名角色' },
+    { name: '小雪/测试:卡?', name2: '', groupId: undefined, characterName: '小雪/测试:卡?', storedName: '小雪测试卡' },
+  ])('stores images by role with name=$name, name2=$name2, groupId=$groupId', async ({
+    name, name2, groupId, characterName, storedName,
+  }) => {
+    const message = { ...fakeMessage(), name };
+    const tag = '<bbi_image>a</bbi_image>';
+    const hash = promptHash(tag);
+    const legacyEntry = fakeEntry();
+    message.extra = { [BBI_IMAGE_EXTRA_KEY]: appendEntry({}, 0, hash, legacyEntry) };
+    const storedPath = `/user/images/柏宝绘_${storedName}/bbi_seeded.png`;
     const saveChat = vi.fn(async () => undefined);
-    vi.stubGlobal('fetch', vi.fn((url: string) => {
-      if (url === '/api/files/upload') {
-        return Promise.resolve(new Response(JSON.stringify({ path: '/user/files/bbi_seeded.png' }), { status: 200 }));
-      }
-      throw new Error(`unexpected fetch ${url}`);
-    }));
+    const fetchMock = vi.fn(async () => {
+      expect(saveChat).not.toHaveBeenCalled();
+      return new Response(JSON.stringify({ path: storedPath }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('window', {
+      SillyTavern: {
+        getContext: () => ({
+          chat: [message],
+          name2,
+          groupId,
+          saveChat,
+          getRequestHeaders: () => ({}),
+          getCurrentChatId: () => 'chat-a',
+        }),
+      },
+    });
+
+    const result = { url: 'data:image/png;base64,AAAA', filename: 'x.png', format: 'png', revoke() {} };
+    const entry = await saveImageResult(0, 0, 0, tag, 987654321, result);
+
+    const imageName = imageFileName(characterName, 0, hash, entry.generationId, 'png');
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/images/upload', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify({
+        image: 'AAAA',
+        format: 'png',
+        ch_name: `柏宝绘_${characterName}`,
+        filename: imageName,
+      }),
+    });
+    // 第二发是侧写:图库跨聊天浏览时提示词的唯一来源
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [sidecarUrl, sidecarInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+    expect(sidecarUrl).toBe('/api/files/upload');
+    const sidecarBody = JSON.parse(String(sidecarInit.body)) as { name: string; data: string };
+    expect(sidecarBody.name).toBe(sidecarFileName(imageName));
+    // 角色名含中文:btoa 直接吃码点 > 255 会抛,这里连带锁住「必须 UTF-8 编码」
+    expect(JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(sidecarBody.data), c => c.charCodeAt(0))))).toEqual({
+      v: 1,
+      character: characterName,
+      prompt: tag,
+      seed: 987654321,
+      createdAt: entry.createdAt,
+    });
+    expect(entry).toMatchObject({ path: storedPath, seed: 987654321, slotSeq: 0 });
+    expect(historyEntries(readStore(message), 0, hash, 0)).toEqual([legacyEntry, entry]);
+    expect(saveChat).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the image when the sidecar upload fails', async () => {
+    const message = fakeMessage();
+    const tag = '<bbi_image>a</bbi_image>';
+    const storedPath = '/user/images/柏宝绘_c/bbi_seeded.png';
+    const saveChat = vi.fn(async () => undefined);
+    // 图片上传成功、侧写 500:图必须照常存下,只是没有提示词可看
+    const fetchMock = vi.fn(async (url: string) =>
+      url === '/api/files/upload'
+        ? new Response('nope', { status: 500 })
+        : new Response(JSON.stringify({ path: storedPath }), { status: 200 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
     vi.stubGlobal('window', {
       SillyTavern: {
         getContext: () => ({
@@ -266,26 +376,137 @@ describe('saveImageResult', () => {
     });
 
     const result = { url: 'data:image/png;base64,AAAA', filename: 'x.png', format: 'png', revoke() {} };
-    const entry = await saveImageResult(0, 0, 0, '<bbi_image>a</bbi_image>', 987654321, result);
+    const entry = await saveImageResult(0, 0, 0, tag, 1, result);
 
-    expect(entry.seed).toBe(987654321);
-    // 落盘后 extra 可读回同一 entry
-    expect(latestEntry(readStore(message), 0, promptHash('<bbi_image>a</bbi_image>'), 0)?.seed).toBe(987654321);
+    expect(entry.path).toBe(storedPath);
+    expect(historyEntries(readStore(message), 0, promptHash(tag), 0)).toEqual([entry]);
+    expect(saveChat).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves legacy records untouched when the new upload fails', async () => {
+    const message = fakeMessage();
+    const originalStore = appendEntry({}, 0, 'h', fakeEntry());
+    message.extra = { [BBI_IMAGE_EXTRA_KEY]: originalStore };
+    const saveChat = vi.fn(async () => undefined);
+    const fetchMock = vi.fn(async () => new Response('Upload failed', { status: 500 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('window', {
+      SillyTavern: {
+        getContext: () => ({
+          chat: [message],
+          saveChat,
+          getRequestHeaders: () => ({}),
+          getCurrentChatId: () => 'chat-a',
+        }),
+      },
+    });
+
+    const result = { url: 'data:image/png;base64,AAAA', filename: 'x.png', format: 'png', revoke() {} };
+    await expect(saveImageResult(0, 0, 0, '<bbi_image>a</bbi_image>', 1, result)).rejects.toThrow('500');
+    expect(message.extra[BBI_IMAGE_EXTRA_KEY]).toBe(originalStore);
+    expect(saveChat).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('saveExternalImage', () => {
+  beforeEach(() => {
+    settings.storage.saveAsJpeg = false;
+  });
+
+  it('lands in the gallery: 柏宝绘_ folder + a name sidecarPathFor can recognize', async () => {
+    const tag = '<bbi_image>1girl<size>portrait</size></bbi_image>';
+    const storedPath = '/user/images/柏宝绘_小雪/bbi_seeded.png';
+    const fetchMock = vi.fn(async (url: string) =>
+      url === '/api/files/upload'
+        ? new Response('{}', { status: 200 })
+        : new Response(JSON.stringify({ path: storedPath }), { status: 200 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('window', {
+      SillyTavern: { getContext: () => ({ getRequestHeaders: () => ({}) }) },
+    });
+
+    const result = { url: 'data:image/png;base64,AAAA', filename: 'x.png', format: 'png', revoke() {} };
+    expect(await saveExternalImage(' 小雪 ', tag, 123, result)).toBe(storedPath);
+
+    const upload = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body)) as {
+      ch_name: string;
+      filename: string;
+    };
+    // 目录前缀是图库列图的唯一依据:换个前缀,图存下去了但图库里看不见
+    expect(upload.ch_name).toBe('柏宝绘_小雪');
+    // 文件名必须过 sidecarPathFor 的正则,否则图库压根不去请求侧写——
+    // 症状是图在、提示词空白、且没有任何报错
+    expect(sidecarPathFor(`/user/images/柏宝绘_小雪/${upload.filename}`)).toBe(
+      `/user/files/${sidecarFileName(upload.filename)}`,
+    );
+
+    const [sidecarUrl, sidecarInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+    expect(sidecarUrl).toBe('/api/files/upload');
+    const sidecar = JSON.parse(String(sidecarInit.body)) as { name: string; data: string };
+    expect(sidecar.name).toBe(sidecarFileName(upload.filename));
+    expect(
+      JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(sidecar.data), c => c.charCodeAt(0)))),
+    ).toMatchObject({ v: 1, character: '小雪', prompt: tag, seed: 123 });
+  });
+
+  it('falls back to 未命名角色 rather than writing a 柏宝绘_ folder with an empty name', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ path: '/user/images/柏宝绘_未命名角色/bbi_x.png' }), { status: 200 }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('window', {
+      SillyTavern: { getContext: () => ({ getRequestHeaders: () => ({}) }) },
+    });
+
+    const result = { url: 'data:image/png;base64,AAAA', filename: 'x.png', format: 'png', revoke() {} };
+    await saveExternalImage('   ', '<bbi_image>a</bbi_image>', 1, result);
+
+    const upload = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body)) as {
+      ch_name: string;
+    };
+    expect(upload.ch_name).toBe('柏宝绘_未命名角色');
+  });
+
+  it('does not write any chat record (the image belongs to no floor)', async () => {
+    const saveChat = vi.fn(async () => undefined);
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response(JSON.stringify({ path: '/user/images/柏宝绘_c/bbi_x.png' }), { status: 200 }),
+    ));
+    vi.stubGlobal('window', {
+      SillyTavern: {
+        getContext: () => ({ chat: [fakeMessage()], saveChat, getRequestHeaders: () => ({}) }),
+      },
+    });
+
+    const result = { url: 'data:image/png;base64,AAAA', filename: 'x.png', format: 'png', revoke() {} };
+    await saveExternalImage('c', '<bbi_image>a</bbi_image>', 1, result);
+    expect(saveChat).not.toHaveBeenCalled();
   });
 });
 
 describe('deleteImageResult', () => {
-  it('removes the entry and deletes the file after save', async () => {
+  it.each([
+    '/user/images/柏宝绘_c/bbi_a.png',
+    'user/images/柏宝绘_c/bbi_a.png',
+  ])('deletes %s only after saving the chat and leaves legacy entries intact', async path => {
     const message = fakeMessage();
-    const saveChat = vi.fn(async () => undefined);
-    const store = appendEntry({}, 0, 'h', fakeEntry({ generationId: 'g1', path: '/user/files/bbi_a.png' }));
-    const store2 = appendEntry(store, 0, 'h', fakeEntry({ generationId: 'g2', path: '/user/files/bbi_b.png' }));
+    const operations: string[] = [];
+    const saveChat = vi.fn(async () => {
+      await Promise.resolve();
+      operations.push('saved');
+    });
+    const legacyEntry = fakeEntry({ generationId: 'g2', path: '/user/files/bbi_b.png' });
+    const store = appendEntry({}, 0, 'h', fakeEntry({ generationId: 'g1', path }));
+    const store2 = appendEntry(store, 0, 'h', legacyEntry);
     message.extra = { [BBI_IMAGE_EXTRA_KEY]: store2 };
 
-    vi.stubGlobal('fetch', vi.fn((url: string) => {
-      if (url === '/api/files/delete') return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
-      throw new Error(`unexpected fetch ${url}`);
-    }));
+    const fetchMock = vi.fn(async () => {
+      operations.push('deleted');
+      return new Response('{}', { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
     vi.stubGlobal('window', {
       SillyTavern: {
         getContext: () => ({
@@ -299,8 +520,100 @@ describe('deleteImageResult', () => {
 
     const removed = await deleteImageResult(0, 0, 'h', 'g1');
     expect(removed).toBe(true);
-    // g1 已被移除，g2 保留
-    const entries = message.extra?.[BBI_IMAGE_EXTRA_KEY] as Record<string, Record<string, BbiImageEntry[]>>;
-    expect(entries['0']['h'].map(e => e.generationId)).toEqual(['g2']);
+    expect(historyEntries(readStore(message), 0, 'h', 0)).toEqual([legacyEntry]);
+    expect(operations).toEqual(['saved', 'deleted']);
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith('/api/images/delete', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify({ path }),
+    });
+  });
+
+  it('deletes the sidecar alongside a real generated image', async () => {
+    const message = fakeMessage();
+    const path = '/user/images/柏宝绘_c/bbi_abc_0_h-g1.png';
+    const saveChat = vi.fn(async () => undefined);
+    message.extra = { [BBI_IMAGE_EXTRA_KEY]: appendEntry({}, 0, 'h', fakeEntry({ path })) };
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('window', {
+      SillyTavern: {
+        getContext: () => ({
+          chat: [message],
+          saveChat,
+          getRequestHeaders: () => ({}),
+          getCurrentChatId: () => 'chat-a',
+        }),
+      },
+    });
+
+    await expect(deleteImageResult(0, 0, 'h', 'g1')).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files/delete', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify({ path: '/user/files/bbi_abc_0_h-g1.json' }),
+    });
+  });
+
+  it.each([
+    '/user/files/bbi_a.png',
+    'user/files/bbi_a.png',
+  ])('removes a legacy record without deleting %s', async path => {
+    const message = fakeMessage();
+    const saveChat = vi.fn(async () => undefined);
+    message.extra = { [BBI_IMAGE_EXTRA_KEY]: appendEntry({}, 0, 'h', fakeEntry({ path })) };
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('window', {
+      SillyTavern: { getContext: () => fakeCtx(message, saveChat) },
+    });
+
+    await expect(deleteImageResult(0, 0, 'h', 'g1')).resolves.toBe(true);
+    expect(historyEntries(readStore(message), 0, 'h', 0)).toEqual([]);
+    expect(saveChat).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('does not delete the image if saving the chat fails', async () => {
+    const message = fakeMessage();
+    message.extra = {
+      [BBI_IMAGE_EXTRA_KEY]: appendEntry({}, 0, 'h', fakeEntry({ path: '/user/images/柏宝绘_c/bbi_a.png' })),
+    };
+    const saveChat = vi.fn(async () => { throw new Error('Save failed'); });
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('window', {
+      SillyTavern: { getContext: () => fakeCtx(message, saveChat) },
+    });
+
+    await expect(deleteImageResult(0, 0, 'h', 'g1')).rejects.toThrow('Save failed');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('deleteImageFileOnly', () => {
+  it('decodes the encoded gallery src before calling the delete endpoints', async () => {
+    // 图库的 src 是逐段 encodeURIComponent 过的，而 ST 的删除接口不做解码：
+    // 编码路径原样发过去只会 404（图没删掉），这里锁死「先归一化再发请求」。
+    const fetchMock = vi.fn(async () => new Response('OK', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('window', {
+      SillyTavern: { getContext: () => ({ getRequestHeaders: () => ({}) }) },
+    });
+
+    const src = `/user/images/${encodeURIComponent('柏宝绘_测试角色')}/bbi_abc_0_h-g1.png`;
+    await deleteImageFileOnly(src);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/images/delete', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify({ path: 'user/images/柏宝绘_测试角色/bbi_abc_0_h-g1.png' }),
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files/delete', {
+      method: 'POST',
+      headers: {},
+      body: JSON.stringify({ path: '/user/files/bbi_abc_0_h-g1.json' }),
+    });
   });
 });

@@ -3,6 +3,7 @@ import { bindAutoTagging } from '@/autoTag/runner';
 import { bindTagActionButtons } from '@/floor/actionButton';
 import { bindFloorHydration } from '@/floor/hydrate';
 import { injectMenuButton } from '@/menu';
+import { registerPublicInterface } from '@/public/register';
 import { bindCharTagSync } from '@/state/charTags';
 import { initGlobalCharTags } from '@/state/globalCharTags';
 import { hydrateSettings } from '@/state/settings';
@@ -102,6 +103,10 @@ async function hydrateWhenReady(attempt = 0) {
       bindAutoTagging();
       bindFloorHydration();
       bindTagActionButtons();
+      // 公开接口必须排在 hydrateSettings 之后:设置回灌前 getBackendStatus() 读的是
+      // 默认值,会把配好的用户报成「未配置」。排在 bindCharTagSync 之后则是为了让
+      // ready 事件里的 revision 已经对应真实角色库。
+      registerPublicInterface();
       void checkForUpdate();
       console.log(`[柏宝绘] 已加载 v${__BBI_VERSION__},设置已同步`);
     } catch (e) {

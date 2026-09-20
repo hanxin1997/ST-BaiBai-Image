@@ -8,7 +8,7 @@ vi.mock('@/st/context', () => ({
   getContext: () => mocks.context,
 }));
 
-import { deleteUserImage, ImageStoreError, uploadUserImage } from '@/st/images';
+import { deleteUserImage, ImageStoreError, probeUserImage, uploadUserImage } from '@/st/images';
 
 function fakeContext() {
   return { getRequestHeaders: () => ({ 'X-Test': '1' }) };
@@ -101,5 +101,52 @@ describe('deleteUserImage', () => {
       name: 'ImageStoreError',
       status: 500,
     });
+  });
+});
+
+describe('probeUserImage', () => {
+  beforeEach(() => {
+    mocks.context = fakeContext();
+  });
+
+  it('HEAD 取 Content-Length,不下载图片本身', async () => {
+    const fetchMock = vi.fn((url: string, init: any) => {
+      expect(url).toBe('/user/images/f/a.jpg');
+      expect(init.method).toBe('HEAD');
+      return Promise.resolve(new Response(null, { status: 200, headers: { 'content-length': '311300' } }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(probeUserImage('/user/images/f/a.jpg')).resolves.toEqual({ exists: true, size: 311300 });
+  });
+
+  it('404 → exists:false(服务端明确说没有)', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(null, { status: 404 }))));
+    await expect(probeUserImage('/user/images/f/a.jpg')).resolves.toEqual({ exists: false });
+  });
+
+  it('网络错误/5xx → null:分不清,绝不能当成「已删除」', async () => {
+    // 把一次掉线记成删除,会让用户网一抖就看见满屏「文件已删除」
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('Failed to fetch'))));
+    await expect(probeUserImage('/user/images/f/a.jpg')).resolves.toBeNull();
+
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(null, { status: 500 }))));
+    await expect(probeUserImage('/user/images/f/a.jpg')).resolves.toBeNull();
+  });
+
+  it('缺 Content-Length 仍算存在,size 为 null', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(null, { status: 200 }))));
+    await expect(probeUserImage('/user/images/f/a.jpg')).resolves.toEqual({ exists: true, size: null });
+  });
+
+  it('超时中止 → null', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init: any) =>
+        new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+        }),
+      ),
+    );
+    await expect(probeUserImage('/user/images/f/a.jpg', 1)).resolves.toBeNull();
   });
 });

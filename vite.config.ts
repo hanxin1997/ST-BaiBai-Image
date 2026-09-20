@@ -2,6 +2,7 @@ import vue from '@vitejs/plugin-vue';
 import fs from 'node:fs';
 import path from 'node:path';
 import { defineConfig } from 'vite';
+import { configDefaults } from 'vitest/config';
 
 // 浏览器从 /scripts/extensions/third-party/ST-BaiBai-Image/dist/index.js 加载,
 // 想 import 宿主 ST 的模块时需要算出从 dist/ 回到 ST public/ 根的相对路径。
@@ -55,6 +56,11 @@ export default defineConfig(({ mode }) => ({
     alias: {
       '@': path.resolve(__dirname, 'src'),
     },
+  },
+
+  // 仓库里的 ST-BaiBai-Image-main/ 是上游只读快照,不能进本仓库的测试/别名解析。
+  test: {
+    exclude: [...configDefaults.exclude, '**/ST-BaiBai-Image-main/**'],
   },
 
   build: {
