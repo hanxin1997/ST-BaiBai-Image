@@ -20,6 +20,7 @@ import {
   sidecarPathFor,
   type BbiImageEntry,
 } from '@/floor/storage';
+import type { GenerationMeta } from '@/generationMeta';
 import type { STContext, STMessage } from '@/st/context';
 import { settings } from '@/state/settings';
 
@@ -341,7 +342,7 @@ describe('saveImageResult', () => {
     expect(sidecarBody.name).toBe(sidecarFileName(imageName));
     // 角色名含中文:btoa 直接吃码点 > 255 会抛,这里连带锁住「必须 UTF-8 编码」
     expect(JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(sidecarBody.data), c => c.charCodeAt(0))))).toEqual({
-      v: 1,
+      v: 2,
       character: characterName,
       prompt: tag,
       seed: 987654321,
@@ -350,6 +351,51 @@ describe('saveImageResult', () => {
     expect(entry).toMatchObject({ path: storedPath, seed: 987654321, slotSeq: 0 });
     expect(historyEntries(readStore(message), 0, hash, 0)).toEqual([legacyEntry, entry]);
     expect(saveChat).toHaveBeenCalledTimes(1);
+  });
+
+  it('persists generation meta into both the sidecar and the extra pointer', async () => {
+    const message = fakeMessage();
+    const tag = '<bbi_image>a</bbi_image>';
+    const hash = promptHash(tag);
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ path: '/user/images/x.png' }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('window', {
+      SillyTavern: {
+        getContext: () => ({
+          chat: [message],
+          name2: 'c',
+          saveChat: vi.fn(async () => undefined),
+          getRequestHeaders: () => ({}),
+          getCurrentChatId: () => 'chat-a',
+        }),
+      },
+    });
+
+    const result = { url: 'data:image/png;base64,AAAA', filename: 'x.png', format: 'png', revoke() {} };
+    const meta: GenerationMeta = {
+      backend: 'nai',
+      model: 'nai-diffusion-4-5-full',
+      width: 832,
+      height: 1216,
+      positive: 'artist:wlop, 1girl',
+      negative: 'lowres',
+      artist: { id: 'art_a', name: '厚涂', prompt: 'artist:wlop' },
+      vibes: [{ id: 'v1', name: '参考A', group: '', strength: 0.8, effectiveStrength: 0.8 }],
+      params: { sampler: 'k_euler', steps: 28, cfg: 5 },
+    };
+    const entry = await saveImageResult(0, 0, 0, tag, 1, result, meta);
+
+    // extra 指针：图库当前聊天的快速通道直接读这里
+    expect(entry.meta).toEqual(meta);
+    expect(readStore(message)?.['0']?.[hash]?.[0]?.meta).toEqual(meta);
+
+    // 侧写 json：跨聊天浏览时提示词/元信息的唯一来源
+    const [, sidecarInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+    const sidecarBody = JSON.parse(String(sidecarInit.body)) as { data: string };
+    const sidecar = JSON.parse(
+      new TextDecoder().decode(Uint8Array.from(atob(sidecarBody.data), c => c.charCodeAt(0))),
+    );
+    expect(sidecar).toMatchObject({ v: 2, meta });
   });
 
   it('keeps the image when the sidecar upload fails', async () => {
@@ -448,7 +494,7 @@ describe('saveExternalImage', () => {
     expect(sidecar.name).toBe(sidecarFileName(upload.filename));
     expect(
       JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(sidecar.data), c => c.charCodeAt(0)))),
-    ).toMatchObject({ v: 1, character: '小雪', prompt: tag, seed: 123 });
+    ).toMatchObject({ v: 2, character: '小雪', prompt: tag, seed: 123 });
   });
 
   it('falls back to 未命名角色 rather than writing a 柏宝绘_ folder with an empty name', async () => {

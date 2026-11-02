@@ -2,6 +2,7 @@ import type { ComfyImageResult } from '@/backends/comfyui';
 import { bytesToBase64, utf8ToBase64 } from '@/base64';
 import { normalizeImagePath } from '@/floor/missingImages';
 import { deleteUploadedFile, uploadBase64File } from '@/floor/upload';
+import type { GenerationMeta } from '@/generationMeta';
 import { getContext, type STContext, type STMessage } from '@/st/context';
 import { deleteUserImage, uploadUserImage } from '@/st/images';
 import { settings } from '@/state/settings';
@@ -38,6 +39,9 @@ export interface BbiImageEntry {
   /** 生成时所在槽位序号（楼层内第 N 个 tag）。多 tag 楼层按位置隔离结果；
    *  旧数据缺失时按 entrySeq() 回退为 0。 */
   slotSeq?: number;
+  /** 出图元信息（画师串/vibe/采样参数）。图库当前聊天的快速通道读它，避免逐张抓侧写；
+   *  旧数据没有此键。 */
+  meta?: GenerationMeta;
 }
 
 /** [swipeId][promptHash] = 历史 entry 列表。 */
@@ -81,13 +85,15 @@ export function imageFileName(
 
 /** 侧写 json 的内容。v 是版本号：日后想加 backend/model 时靠它分辨老文件。 */
 export interface BbiImageSidecar {
-  v: 1;
+  v: 1 | 2;
   /** 可读角色名（图片文件名里那个是哈希，还原不回来）。 */
   character: string;
   /** 生成时使用的完整 tag 原文（含 <bbi_image> 壳），与 entry.prompt 同源。 */
   prompt: string;
   seed: number | null;
   createdAt: number;
+  /** v2 起：画师串/vibe/采样参数等不在 tag 文本里的信息。老文件没有此键。 */
+  meta?: GenerationMeta;
 }
 
 /**
@@ -342,6 +348,7 @@ async function uploadImageWithSidecar(
   tag: string,
   seed: number,
   result: ComfyImageResult,
+  meta?: GenerationMeta,
 ): Promise<{ path: string; genId: string; createdAt: number; imageFile: string }> {
   const genId = generationId();
   // 先按设置决定落盘格式(开关开启时重编码为 JPG),文件名后缀跟随实际格式
@@ -353,7 +360,14 @@ async function uploadImageWithSidecar(
   // 侧写:图库跨聊天浏览时,提示词只能从这里拿。
   // **失败只警告不抛** —— 图已经存好了,绝不能因为一个附属 json 让整次存图失败;
   // 用户宁可少看一段提示词,也不能丢图。
-  const sidecar: BbiImageSidecar = { v: 1, character: characterName, prompt: tag, seed, createdAt };
+  const sidecar: BbiImageSidecar = {
+    v: 2,
+    character: characterName,
+    prompt: tag,
+    seed,
+    createdAt,
+    ...(meta ? { meta } : {}),
+  };
   try {
     await uploadBase64File(sidecarFileName(imageFile), utf8ToBase64(JSON.stringify(sidecar)));
   } catch (error) {
@@ -379,9 +393,10 @@ export async function saveExternalImage(
   tag: string,
   seed: number,
   result: ComfyImageResult,
+  meta?: GenerationMeta,
 ): Promise<string> {
   const name = characterName.trim() || '未命名角色';
-  const { path } = await uploadImageWithSidecar(name, 0, promptHash(tag), tag, seed, result);
+  const { path } = await uploadImageWithSidecar(name, 0, promptHash(tag), tag, seed, result, meta);
   return path;
 }
 
@@ -397,6 +412,7 @@ export async function saveImageResult(
   tag: string,
   seed: number,
   result: ComfyImageResult,
+  meta?: GenerationMeta,
 ): Promise<BbiImageEntry> {
   const ctx = getContext();
   if (!ctx?.saveChat) throw new Error('SillyTavern 上下文不可用');
@@ -412,6 +428,7 @@ export async function saveImageResult(
     tag,
     seed,
     result,
+    meta,
   );
 
   const entry: BbiImageEntry = {
@@ -423,6 +440,7 @@ export async function saveImageResult(
     status: 'ready',
     createdAt,
     slotSeq: seq,
+    ...(meta ? { meta } : {}),
   };
 
   const saved = await mutateStore(ctx, messageId, store => appendEntry(store, swipeId, hash, entry));

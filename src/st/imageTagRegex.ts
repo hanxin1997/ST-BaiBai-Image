@@ -218,7 +218,12 @@ export function parseImageTagContent(raw: string): ImageTagContent {
           const name = oneLine(typeof rawItem.name === 'string' ? rawItem.name : '');
           const tag = oneLine(typeof rawItem.tag === 'string' ? rawItem.tag : '');
           const nl = oneLine(typeof rawItem.nl === 'string' ? rawItem.nl : '');
-          return name && tag ? [{ name, tag, nl }] : [];
+          // center / uc 只有世界书生图会写;没有就不出现这两个键,老 tag 解析结果逐字段不变
+          const center = oneLine(typeof rawItem.center === 'string' ? rawItem.center : '');
+          const uc = oneLine(typeof rawItem.uc === 'string' ? rawItem.uc : '');
+          return name && tag
+            ? [{ name, tag, nl, ...(center ? { center } : {}), ...(uc ? { uc } : {}) }]
+            : [];
         });
       }
     } catch {
@@ -275,7 +280,9 @@ export function formatPromptText(
     content.tag,
     content.nl,
     ...content.characters.map(character =>
-      [`角色: ${character.name}`, character.tag, character.nl].filter(Boolean).join('\n'),
+      [`角色: ${character.name}`, character.tag, character.nl, character.uc ? `UC: ${character.uc}` : '']
+        .filter(Boolean)
+        .join('\n'),
     ),
     content.negative ? `Negative: ${content.negative}` : '',
   ]

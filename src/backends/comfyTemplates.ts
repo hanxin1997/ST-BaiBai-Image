@@ -15,6 +15,8 @@
  * 由 comfyui.ts 包成 ComfyUIError。
  */
 
+import type { GenerationParams } from '@/generationMeta';
+
 /** 节点引用:[节点 id, 输出槽位]。 */
 type NodeRef = [string, number];
 
@@ -252,13 +254,38 @@ function joinParts(...parts: (string | undefined)[]): string {
  * 正向 = 固定正面 + 生成内容;生成内容有 nl 优先用 nl(Flux/Anima 吃自然语言),
  * 没有才退回短 tag。开关在预设上,用户自己决定模板与开关的搭配。
  */
-function composePositive(simple: ComfySimpleConfig, values: SimpleGenValues): string {
+export function composePositive(simple: ComfySimpleConfig, values: SimpleGenValues): string {
   return joinParts(simple.positive, (values.nl ?? '').trim() || values.prompt);
 }
 
 /** 负面 = 固定负面 + AI 动态负面追加。 */
-function composeNegative(simple: ComfySimpleConfig, values: SimpleGenValues): string {
+export function composeNegative(simple: ComfySimpleConfig, values: SimpleGenValues): string {
   return joinParts(simple.negative, values.negative);
+}
+
+/**
+ * 简易模式的采样参数快照(供随图记录)。只收展示需要的标量;
+ * 固定正/负面的实际全文由 composePositive/Negative 直接进 meta。
+ */
+export function comfySimpleParams(simple: ComfySimpleConfig): GenerationParams {
+  const loras = simple.loras
+    .filter(lora => lora.name.trim())
+    .map(lora => `${lora.name.trim()}×${lora.strength}`)
+    .join('、');
+  return {
+    mode: 'simple',
+    template: simple.template,
+    baseModel: simple.model,
+    vae: simple.vae,
+    clips: [simple.clip1, simple.clip2].filter(Boolean).join('、'),
+    loras,
+    sampler: simple.sampler,
+    scheduler: simple.scheduler,
+    steps: simple.steps,
+    cfg: simple.cfg,
+    guidance: simple.guidance,
+    shift: simple.shift,
+  };
 }
 
 /**

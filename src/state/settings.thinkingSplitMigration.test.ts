@@ -70,6 +70,5 @@ describe('思维链按后端拆分的设置迁移', () => {
     expect(autoTag.prompts.comfySpec).toBe('我的规范');
     expect(autoTag.prompts.naiSpec).toBe('');
     expect(autoTag.prompts.naiV5Spec).toBe('');
-    expect(autoTag.prompts.prefill).toBe('');
   });
 });

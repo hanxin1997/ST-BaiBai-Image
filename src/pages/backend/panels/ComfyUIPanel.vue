@@ -30,6 +30,7 @@ import {
   activeComfyPreset,
   effectiveComfyConn,
   newComfyWorkflow,
+  ORIENTATION_LOCKS,
   settings,
 } from '@/state/settings';
 import { computed, nextTick, ref, watch } from 'vue';
@@ -518,6 +519,28 @@ function applyAssist() {
             <option value="1024×1024">方图</option>
           </datalist>
         </div>
+
+        <div class="bbi-select-row">
+          <span class="bbi-field-label">画幅方向</span>
+          <div class="bbi-segmented" role="tablist" aria-label="工作流画幅方向">
+            <button
+              v-for="opt in ORIENTATION_LOCKS"
+              :key="opt.value"
+              class="bbi-seg"
+              :class="{ 'is-on': active.orientationLock === opt.value }"
+              type="button"
+              role="tab"
+              :aria-selected="active.orientationLock === opt.value"
+              @click="active.orientationLock = opt.value"
+            >
+              {{ opt.label }}
+            </button>
+          </div>
+        </div>
+        <p class="bbi-field-hint wf-switch-hint">
+          「自动」由自动 tag 按画面判定横竖;锁定后这套工作流每张图都按该方向出,自动 tag 也按这个画幅构图。
+          正文里已记下的方向不会被改写,改回「自动」即恢复。
+        </p>
 
         <!-- 简易模式:选模型填参数,JSON 由插件按模板组装。
              分组排布(模型/LoRA/采样/提示词),字段行统一「短标签列 + 输入列」网格,避免长标签把输入框挤得参差不棁。 -->

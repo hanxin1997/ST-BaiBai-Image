@@ -121,9 +121,9 @@ if (!status.configured) {
 {
   apiVersion: 1,
   pluginVersion: "0.2.5",
-  backend: "nai",              // 'nai' | 'comfyui' | 'latent' | 'imgrouter'
+  backend: "nai",              // 'nai' | 'comfyui' | 'latent' | 'imgrouter' | 'latentapi'
   configured: true,
-  model: "nai-diffusion-4-5-full",  // NAI/Latent 是模型名；ComfyUI 是当前工作流预设名；ImgRouter 是模型 id 或 '(渠道默认)'
+  model: "nai-diffusion-4-5-full",  // NAI/Latent 是模型名；ComfyUI 是当前工作流预设名；ImgRouter 是模型 id 或 '(渠道默认)'；Latent 原生 API 固定 'Anima-2.9B-int8-turbo'
   supportsCharacters: true,    // 当前后端支不支持多角色提示
   reason: "",                  // configured=false 时的原因；已就绪为空串
 }
@@ -131,7 +131,7 @@ if (!status.configured) {
 
 > **不含服务地址与 API Key。** 这两样永远不会出现在任何公开返回值里。
 
-`supportsCharacters` 只看模型，与配没配齐无关——你可以在用户还没填 Key 时就知道该不该准备 `characters`。**ComfyUI 与 ImgRouter 恒为 `false`**；Latent 跟 NAI 一样看模型是否 4.5/V5。
+`supportsCharacters` 只看模型，与配没配齐无关——你可以在用户还没填 Key 时就知道该不该准备 `characters`。**ComfyUI 与 ImgRouter 恒为 `false`**；Latent 跟 NAI 一样看模型是否 4.5/V5；Latent 原生 API 恒为 `true`（角色按 Char1/Char2… 打包进提示词）。
 
 ## 调生图
 
@@ -155,7 +155,7 @@ myPanel.querySelector('img').src = result.dataUrl;   // 想显示在哪就显示
 | `nl` | `string?` | 自然语言描述 |
 | `negative` | `string?` | 本画面动态负面。**只对 ComfyUI 生效**；NAI 的负面取用户渠道配置 |
 | `characters` | `PublicCharacterPrompt[]?` | 多角色提示，见下 |
-| `size` | `'portrait' \| 'landscape'?` | 画幅方向，缺省 `'portrait'`。具体像素取用户在渠道页配的尺寸 |
+| `size` | `'portrait' \| 'landscape' \| 'square'?` | 画幅方向，缺省 `'portrait'`。具体像素取用户在渠道页配的尺寸。`'square'` 只有 Latent 原生 API 真出方图，其它后端按竖图出。**用户在渠道里锁定了画幅方向时一律按锁定方向出图**，这里传什么都不算数（0.3.1 起） |
 | `seed` | `number?` | 指定种子（正整数）。省略 = 按用户设置决定 |
 | `save` | `boolean?` | 落盘进柏宝绘图库，**默认 `true`** |
 | `character` | `string?` | 落盘归到哪个角色名下（图库分组名）。省略 = 当前聊天的角色名 |
@@ -179,7 +179,7 @@ myPanel.querySelector('img').src = result.dataUrl;   // 想显示在哪就显示
 
 ### 关于 `save`
 
-- `true`（默认）：图存进 `user/images/柏宝绘_<character>/`，并写一份同名侧写 json 记下提示词和种子。于是用户能在**柏宝绘图库页**里按角色分组看到它、连提示词一起。
+- `true`（默认）：图存进 `user/images/柏宝绘_<character>/`，并写一份同名侧写 json 记下提示词和种子。于是用户能在**柏宝绘图库页**里按角色分组看到它、连提示词一起。侧写记的是**实际出图的方向**（用户锁定了画幅时与你传的 `size` 不同）。
 - `false`：只返回 `dataUrl`，不碰磁盘。适合「预览一下就丢」。
 
 落盘**失败不会抛错**——图已经在 `dataUrl` 里了，不能因为存不进图库就让你连图都拿不到。这种情况 `path` 是 `null`。

@@ -25,10 +25,18 @@ function fakeResult() {
   return { url: 'data:image/png;base64,AAAA', filename: 'x.png', format: 'png', revoke: vi.fn() };
 }
 
+/** generateNaiImage 现在返回 { result, usage }（usage 随图落盘）。 */
+function fakeNaiOutput() {
+  return {
+    result: fakeResult(),
+    usage: { positive: '', negative: '', width: 0, height: 0, artist: null, vibes: [], params: {} },
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(acquireNaiSlot).mockResolvedValue(vi.fn());
-  vi.mocked(generateNaiImage).mockResolvedValue(fakeResult());
+  vi.mocked(generateNaiImage).mockResolvedValue(fakeNaiOutput());
   vi.mocked(generateComfyImage).mockResolvedValue(fakeResult());
   vi.mocked(generateImgRouterImage).mockResolvedValue(fakeResult());
 });
@@ -40,6 +48,7 @@ function naiReady(model: NaiModel = 'nai-diffusion-4-5-full'): void {
   settings.nai.key = 'k';
   settings.nai.model = model;
   settings.nai.seed = 0;
+  settings.nai.orientationLock = 'auto';
 }
 
 /** 把设置调成「ComfyUI 自定义工作流已配齐」。 */
@@ -50,6 +59,7 @@ function comfyReady(): void {
   settings.comfyui.activeWorkflowId = preset.id;
   preset.mode = 'custom';
   preset.workflow = '{"1":{}}';
+  preset.orientationLock = 'auto';
 }
 
 /** 把设置调成「Latent 已配齐」。 */
@@ -279,5 +289,107 @@ describe('generateImage', () => {
       prompt: 'x',
       size: 'portrait',
     });
+  });
+
+  it('auto lock keeps the orientation recorded in the tag, and reports it back', async () => {
+    naiReady();
+    const out = await generateImage({ prompt: 'x', seed: 1, size: 'landscape' });
+    expect(vi.mocked(generateNaiImage).mock.calls[0][1]).toMatchObject({ size: 'landscape' });
+    expect(out.size).toBe('landscape');
+  });
+
+  it('applies the NAI channel lock here — the one path cards and the public API share', async () => {
+    naiReady();
+    settings.nai.orientationLock = 'landscape';
+    try {
+      // tag 里记的是竖图(锁定前的老图 / 第三方传的 size),锁定后一律按横出
+      const out = await generateImage({ prompt: 'x', seed: 1, size: 'portrait' });
+      expect(vi.mocked(generateNaiImage).mock.calls[0][1]).toMatchObject({ size: 'landscape' });
+      // 回报实际方向:公开接口落图库时据此记 tag,不能记成请求里的竖图
+      expect(out.size).toBe('landscape');
+      // 缺省 size 同样被锁覆盖
+      await generateImage({ prompt: 'x', seed: 1 });
+      expect(vi.mocked(generateNaiImage).mock.calls[1][1]).toMatchObject({ size: 'landscape' });
+    } finally {
+      settings.nai.orientationLock = 'auto';
+    }
+  });
+
+  it('takes the ComfyUI lock from the active workflow preset, not from the NAI channel', async () => {
+    comfyReady();
+    const preset = settings.comfyui.workflows[0];
+    preset.orientationLock = 'portrait';
+    // 另一个渠道的锁不该串过来
+    settings.nai.orientationLock = 'landscape';
+    try {
+      const out = await generateImage({ prompt: 'x', seed: 1, size: 'landscape' });
+      expect(vi.mocked(generateComfyImage).mock.calls[0][1]).toMatchObject({ size: 'portrait' });
+      expect(out.size).toBe('portrait');
+    } finally {
+      preset.orientationLock = 'auto';
+      settings.nai.orientationLock = 'auto';
+    }
+  });
+
+  it('bubbles the NAI usage snapshot (artist/vibes) into output.meta', async () => {
+    naiReady();
+    vi.mocked(generateNaiImage).mockResolvedValue({
+      result: fakeResult(),
+      usage: {
+        positive: 'artist:wlop, 1girl, masterpiece',
+        negative: 'lowres',
+        width: 832,
+        height: 1216,
+        artist: { id: 'art_a', name: '厚涂', prompt: 'artist:wlop' },
+        vibes: [{ id: 'v1', name: '参考A', group: '', strength: 0.8, effectiveStrength: 0.8 }],
+        params: { sampler: 'k_euler', steps: 28, cfg: 5 },
+      },
+    });
+
+    const out = await generateImage({ prompt: '1girl', seed: 1 });
+    expect(out.meta).toEqual({
+      backend: 'nai',
+      model: 'nai-diffusion-4-5-full',
+      positive: 'artist:wlop, 1girl, masterpiece',
+      negative: 'lowres',
+      width: 832,
+      height: 1216,
+      artist: { id: 'art_a', name: '厚涂', prompt: 'artist:wlop' },
+      vibes: [{ id: 'v1', name: '参考A', group: '', strength: 0.8, effectiveStrength: 0.8 }],
+      params: { sampler: 'k_euler', steps: 28, cfg: 5 },
+    });
+  });
+
+  it('snapshots the ComfyUI simple-mode recipe (loras/sampler/size) into output.meta', async () => {
+    comfyReady();
+    const preset = settings.comfyui.workflows[0];
+    preset.mode = 'simple';
+    preset.portraitSize = '832×1216';
+    preset.simple.model = 'pony.safetensors';
+    preset.simple.sampler = 'euler_ancestral';
+    preset.simple.steps = 30;
+    preset.simple.cfg = 7;
+    preset.simple.loras = [{ name: 'detail', strength: 0.7 }];
+
+    const out = await generateImage({ prompt: '1girl', negative: 'bad', seed: 1 });
+    expect(out.meta).toMatchObject({
+      backend: 'comfyui',
+      model: preset.name,
+      width: 832,
+      height: 1216,
+      artist: null,
+      vibes: [],
+      params: {
+        mode: 'simple',
+        baseModel: 'pony.safetensors',
+        loras: 'detail×0.7',
+        sampler: 'euler_ancestral',
+        steps: 30,
+        cfg: 7,
+      },
+    });
+    // 简易模式的固定负面 + 动态负面在 meta 里合成全文
+    expect(out.meta.negative).toBe('bad');
+    expect(out.meta.positive).toBe('1girl');
   });
 });

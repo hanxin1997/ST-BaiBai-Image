@@ -3,6 +3,7 @@ import { SELECTABLE_BACKENDS, settings, type BackendId } from '@/state/settings'
 import { computed, ref, watch, type Component } from 'vue';
 import ComfyUIPanel from './panels/ComfyUIPanel.vue';
 import ImgRouterPanel from './panels/ImgRouterPanel.vue';
+import LatentApiPanel from './panels/LatentApiPanel.vue';
 import NaiPanel from './panels/NaiPanel.vue';
 import WebUIPanel from './panels/WebUIPanel.vue';
 
@@ -50,6 +51,7 @@ const PANELS: Record<BackendId, Component> = {
   nai: NaiPanel,
   latent: NaiPanel,
   imgrouter: ImgRouterPanel,
+  latentapi: LatentApiPanel,
 };
 const activePanel = computed(() => PANELS[viewing.value]);
 

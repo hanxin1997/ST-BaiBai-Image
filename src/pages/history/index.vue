@@ -74,6 +74,7 @@ const BACKEND_LABELS: Record<ImageBackend, string> = {
   latent: 'Latent',
   comfyui: 'ComfyUI',
   imgrouter: 'ImgRouter',
+  latentapi: 'Latent 原生 API',
 };
 
 function subtitle(record: HistoryRecord): string {

@@ -69,7 +69,7 @@ export interface LlmRecord extends BaseRecord {
 }
 
 /** 出图后端标识(历史记录用)。与 settings 的 BackendId 不共用:webui 未接入,不会产出记录。 */
-export type ImageBackend = 'nai' | 'latent' | 'comfyui' | 'imgrouter';
+export type ImageBackend = 'nai' | 'latent' | 'comfyui' | 'imgrouter' | 'latentapi';
 
 export interface ImageRecord extends BaseRecord {
   kind: 'image';

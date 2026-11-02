@@ -4,9 +4,10 @@
  * 与 v1 的分歧:v1 把设置窗口的「面板语言」(边框/底色/品牌栏/头部按钮行)搬进了
  * 聊天正文,在 RP 场景里是突兀的 UI 异物,且 max-width:560px 让宽屏下图片铺不满。
  * v2 原则:
- * - 无边框、无背景面板、无品牌栏;宽度 100% 跟随楼层正文,图片自身一点圆角;
- * - 控件全部收进右上角一颗 ⋯ 收纳钮(半透明黑底圆钮):桌面 hover 在其左侧
- *   横向浮现一排,触屏点开在其下方竖排展开,图片平时只有一颗小点;
+ * - 无边框、无背景面板、无品牌栏;宽度跟随楼层正文,图片自身一点圆角;
+ *   显示高度按设置项「楼层图片显示大小」封顶(默认 600px,可选铺满楼层宽度,见「显示大小封顶」段);
+ * - 控件全部收进右上角一颗 ⋯ 收纳钮(半透明黑底圆钮):桌面 hover 浮现、触屏点开,
+ *   都在其左侧横向排开一排(放不下就折行),图片平时只有一颗小点;
  * - 提示词收进悬浮 文本按钮唤起的面板,平时零占位;
  * - 生成中 = 磨砂遮罩绝对定位盖住舞台(旧图保留在底下),居中 spinner + 状态 + 取消,
  *   不再像 v1 那样把状态文案作为 flex 子项与图片并排互挤。
@@ -68,9 +69,15 @@
   aspect-ratio: 3 / 2;
 }
 
-/* ——— 图片:铺满楼层宽度,高度随原图比例 ———
-   不加 max-height/object-fit:竖图就让它高。contain 会在宽盒子里留空柱、
-   cover 会裁切画面,两者都不如「原比例铺满」适合看图场景。 */
+/* 方形只有 Latent 原生 API 真出(其它渠道 effectiveSize 已换回竖屏,走不到这里) */
+.bbi-figure__stage[data-placeholder='1'][data-size='square'] {
+  aspect-ratio: 1 / 1;
+}
+
+/* ——— 图片:默认铺满楼层宽度,高度随原图比例 ———
+   不用 object-fit:contain 会在宽盒子里留空柱、cover 会裁切画面,两者都不如
+   「原比例」适合看图场景。嫌大时的高度封顶见下一段:连舞台一起收窄到图片本身的宽,
+   同样不留空柱、不裁切。 */
 
 .bbi-figure__img {
   display: block;
@@ -81,6 +88,35 @@
      另注意——图片上绝不可 preventDefault touch 事件、不可加 user-select:none,
      否则移动端长按菜单不会出现。详见 floor/Lightbox.vue 顶部注释。 */
   touch-action: auto;
+}
+
+/* ——— 显示大小封顶:设置项「楼层图片显示大小」(Card.vue 挂 data-capped 与 --bbi-figure-max-h) ———
+   封的是高度而不是宽度:PC 上嫌大的,是竖图铺满楼层宽度后比一屏还高;按宽度封顶,
+   竖图照样高、横图反被压小。舞台 fit-content 收成图片本身的宽——悬浮钮、翻页器、角标
+   都以舞台定位,舞台不收窄它们就会飘在图片旁的空白里。宽度仍不超过楼层,窄屏照旧按宽缩放。 */
+
+.bbi-figure[data-capped='1'] .bbi-figure__stage {
+  width: fit-content;
+  max-width: 100%;
+}
+
+.bbi-figure[data-capped='1'] .bbi-figure__img {
+  width: auto;
+  max-width: 100%;
+  max-height: var(--bbi-figure-max-h);
+}
+
+/* 无图占位没有内容可撑宽(fit-content 会塌成 0):按画幅比例反推「高度恰好顶到上限」的宽 */
+.bbi-figure[data-capped='1'] .bbi-figure__stage[data-placeholder='1'][data-size='portrait'] {
+  width: calc(var(--bbi-figure-max-h) * 2 / 3);
+}
+
+.bbi-figure[data-capped='1'] .bbi-figure__stage[data-placeholder='1'][data-size='landscape'] {
+  width: calc(var(--bbi-figure-max-h) * 3 / 2);
+}
+
+.bbi-figure[data-capped='1'] .bbi-figure__stage[data-placeholder='1'][data-size='square'] {
+  width: var(--bbi-figure-max-h);
 }
 
 /* ——— 生成中遮罩:磨砂盖住整个舞台,旧图在底下隐约可见 ——— */
@@ -213,9 +249,12 @@
 }
 
 /* ——— 悬浮操作组:右上角 ⋯ 收纳钮 ———
-   全平台统一:⋯ 常驻淡显,钉死在右上角(row-reverse 保证菜单展开时它不位移);
-   桌面(hover:hover)hover ⋯ 时菜单在其左侧横向浮现;
-   触屏(hover:none)点 ⋯ 菜单在其下方竖排展开,点任意操作后收起。 */
+   全平台统一:⋯ 常驻淡显,钉死在右上角(row-reverse 保证菜单展开时它不位移),
+   菜单在其左侧横向排开:桌面(hover:hover)hover ⋯ 时浮现,触屏(hover:none)点 ⋯ 展开、
+   点任意操作后收起。
+   触屏曾是在 ⋯ 下方竖排展开:横图在手机上只有两百来像素高,六七颗钮竖排越出舞台底边、
+   被 overflow:hidden 裁掉,后面几个按不到。横排放不下(窄图,如封顶后的竖图)就折行,
+   max-width 让它不越过舞台左缘;align-items:flex-start 让 ⋯ 在折行时仍钉在顶上。 */
 
 .bbi-figure__actions {
   position: absolute;
@@ -224,8 +263,9 @@
   z-index: 2;
   display: flex;
   flex-direction: row-reverse;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
+  max-width: calc(100% - 16px);
 }
 
 /* ⋯ 常驻淡显:功能入口不能没有,但存在感压到最低。
@@ -243,9 +283,12 @@
 }
 
 /* 菜单隐藏时 pointer-events:none:不在图上留隐形热区
-   (opacity:0 的元素仍可命中点击,会误触隐形按钮、也挡图片点按)。 */
+   (opacity:0 的元素仍可命中点击,会误触隐形按钮、也挡图片点按)。
+   折行时 flex-end 让末行靠右贴着 ⋯,不在左边落单。 */
 .bbi-figure__menu {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
   opacity: 0;
   transform: translateX(4px);
@@ -265,14 +308,8 @@
 }
 
 @media (hover: none) {
-  .bbi-figure__actions {
-    flex-direction: column;
-    align-items: flex-end;
-  }
-
   .bbi-figure__menu {
     display: none;
-    flex-direction: column;
     opacity: 1;
     transform: none;
     pointer-events: auto;

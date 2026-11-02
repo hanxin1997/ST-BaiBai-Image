@@ -11,6 +11,13 @@ export interface ImageCharacterPrompt {
   name: string;
   tag: string;
   nl: string;
+  /**
+   * 角色在画面中的位置(NAI 5×5 网格标签,A–E 列 × 1–5 行,C3 = 正中)。
+   * 只有世界书生图会写(autoTag/worldbookImage.ts);AI 协议不产出它。缺省 = 不指定位置。
+   */
+  center?: string;
+  /** 该角色专属负面词(NAI 的分角色 UC);只有世界书生图会写。缺省 = 空。 */
+  uc?: string;
 }
 
 export interface ImageInsertion {

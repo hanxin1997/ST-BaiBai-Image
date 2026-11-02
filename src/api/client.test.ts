@@ -47,7 +47,6 @@ const channel: ApiChannel = {
   maxTokens: 1024,
   timeoutSec: 60,
   stream: false,
-  prefill: true,
   excludeParams: [],
   reasoningEffort: '',
 };
@@ -77,7 +76,7 @@ describe('buildRequestBody:思考强度与两条源分支', () => {
   const build = (over: Partial<typeof channel> = {}) =>
     buildRequestBody({ ...channel, ...over }, msgs, 'https://api.example.com/v1', false);
 
-  it('未设思考强度 → 走 openai 源,请求体与加功能前逐字节一致', () => {
+  it('未设思考强度 → 走 openai 源(除新增的 tool_choice 外,请求体与加功能前一致)', () => {
     expect(build()).toEqual({
       chat_completion_source: 'openai',
       reverse_proxy: 'https://api.example.com/v1',
@@ -87,9 +86,19 @@ describe('buildRequestBody:思考强度与两条源分支', () => {
       temperature: 1,
       max_tokens: 1024,
       stream: false,
+      tool_choice: 'none',
       presence_penalty: 0,
       frequency_penalty: 0,
     });
+  });
+
+  it('两条源分支都带 tool_choice:none(给防截断类 fetch 拦截器的放行握手)', () => {
+    // Kemini 等预设脚本拦截所有 /generate 请求,看到调用方自带 tool_choice 就放行,
+    // 不再注入合成工具 + 控制消息(否则生图 tag 会被拖慢甚至逼出重试)。
+    expect(build().tool_choice).toBe('none');
+    expect(build({ reasoningEffort: 'high' }).tool_choice).toBe('none');
+    // 若用户真想让第三方改写,可用 excludeParams 删掉它
+    expect(build({ excludeParams: ['tool_choice'] }).tool_choice).toBeUndefined();
   });
 
   it('设了思考强度 → 切 custom 源,并经 custom_include_body 透传', () => {

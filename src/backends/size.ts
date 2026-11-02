@@ -8,7 +8,11 @@
  * 依赖具体 Settings 类型会绕出循环引用。按方向取尺寸的入参用结构化约束表达。
  */
 
-export type Orientation = 'portrait' | 'landscape';
+/**
+ * 画幅方向。square 只有「Latent 原生 API」渠道真出方图(它的 resolution 有方形一档);
+ * 其它渠道只配了竖/横两格尺寸,pickSize 把 square 落到竖屏那格。
+ */
+export type Orientation = 'portrait' | 'landscape' | 'square';
 
 export interface ImageSize {
   width: number;
@@ -27,11 +31,15 @@ const LANDSCAPE_WORDS = ['landscape', 'horizontal', 'widescreen', 'wide', '横',
  * 竖屏是插件原本的固定默认(832×1216),降级到它 = 维持现状,
  * 因此模型漏给/给乱值时不该抛错——parseImagePlan 抛错会白白消耗 runner 的重试次数。
  * 也认「16:9 / 1216x832」这类比例写法:宽 > 高即横屏。
+ *
+ * square 只认这个字面量:1:1 这类比例写法仍归竖屏,与加方形之前逐字一致(老 tag 不变样)。
+ * 世界书生图的 size:WxH 由 autoTag/worldbookImage.ts 自己换算,不走这里的比例分支。
  */
 export function normalizeOrientation(value: unknown): Orientation {
   if (typeof value !== 'string') return 'portrait';
   const text = value.trim().toLowerCase();
   if (!text) return 'portrait';
+  if (text === 'square') return 'square';
   if (LANDSCAPE_CODES.has(text)) return 'landscape';
 
   // 比例/尺寸写法:16:9、1216x832、1216×832 → 比较宽高
@@ -71,8 +79,42 @@ export interface SizePair {
   landscapeSize: string;
 }
 
-/** 按方向取用户配置的尺寸串(未填时返回空串,由调用方决定回落)。 */
+/** 按方向取用户配置的尺寸串(未填时返回空串,由调用方决定回落)。square 落竖屏那格。 */
 export function pickSize(pair: SizePair, orientation: Orientation): string {
   const text = orientation === 'landscape' ? pair.landscapeSize : pair.portraitSize;
   return (text ?? '').trim();
+}
+
+/**
+ * 画幅锁:'auto' = 由自动 tag 按画面判定横竖(默认,即改动前的行为);
+ * 'portrait' / 'landscape' = 该渠道一律出这个方向。
+ *
+ * 归属与尺寸对相同(NAI 渠道级一份、ComfyUI 每套工作流各一份),面板上也与横竖尺寸并排:
+ * 它本质是「这对尺寸只用哪一格」。从前的替代做法是把两格填成同一个尺寸——
+ * 出图是统一了,AI 却仍按横竖判据取景(锁竖时照样为群像构思宽画面)。
+ */
+export type OrientationLock = 'auto' | Orientation;
+
+/**
+ * 容忍式归一:只认三个方向值,其余(含老数据缺字段)一律 'auto' = 维持改动前的行为。
+ * square 只有 Latent 原生 API 的面板给得出;别的渠道就算存了它,pickSize 也按竖屏出。
+ */
+export function normalizeOrientationLock(value: unknown): OrientationLock {
+  return value === 'portrait' || value === 'landscape' || value === 'square' ? value : 'auto';
+}
+
+/** 宽高 → 方向:宽 > 高横屏,高 > 宽竖屏,相等方形。世界书生图的 size:WxH 用它。 */
+export function orientationOfSize(size: ImageSize): Orientation {
+  if (size.width > size.height) return 'landscape';
+  return size.width < size.height ? 'portrait' : 'square';
+}
+
+/**
+ * 实际出图方向:锁了用锁定方向,否则用 tag 里记的那个(AI 判定或用户手改)。
+ *
+ * 只在出图时覆盖,**tag 原文不改写**:promptHash 吃的是 tag 原文,批量改写会让老图
+ * 无辜变成「旧提示词」;解锁后每张图仍按自己记的方向出。
+ */
+export function effectiveOrientation(lock: OrientationLock, size: Orientation): Orientation {
+  return lock === 'auto' ? size : lock;
 }

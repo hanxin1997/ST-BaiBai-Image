@@ -60,6 +60,7 @@ import {
   newNaiArtist,
   newNaiEndpoint,
   NAI_MODELS,
+  ORIENTATION_LOCKS,
   settings,
   type NaiArtistPreset,
   type NaiEndpoint,
@@ -1144,6 +1145,17 @@ async function removeVibe(vibe: NaiVibe) {
           </select>
         </div>
 
+        <label class="bbi-switch-row">
+          <span class="bbi-field-label">生成自然语言</span>
+          <input v-model="conn.naturalLanguage" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p class="bbi-field-hint">
+          开:自动 tag 为画面与每个角色额外写一段英文描述;关:只写 tag。4.5 的提示词上限约 512 token
+          (画面与所有角色共用),自然语言最占篇幅,超了会被截断、画面走样,可以关掉试试。
+          只影响之后新写的提示词:正文里已有的自然语言照常发送,想对比可在「编辑提示词」里点「AI 重写提示词」。
+          多角色提示照常按角色拆分,只是每个角色同样只写 tag。
+        </p>
+
         <div class="be-row">
           <div class="bbi-field">
             <div class="bbi-field-head">
@@ -1182,7 +1194,27 @@ async function removeVibe(vibe: NaiVibe) {
             </datalist>
           </div>
         </div>
-        <p class="bbi-field-hint">竖屏用于单人、特写、立绘;横屏用于群像、远景、全景;方向由自动 tag 判定。</p>
+        <div class="bbi-select-row">
+          <span class="bbi-field-label">画幅方向</span>
+          <div class="bbi-segmented" role="tablist" :aria-label="`${label} 画幅方向`">
+            <button
+              v-for="opt in ORIENTATION_LOCKS"
+              :key="opt.value"
+              class="bbi-seg"
+              :class="{ 'is-on': conn.orientationLock === opt.value }"
+              type="button"
+              role="tab"
+              :aria-selected="conn.orientationLock === opt.value"
+              @click="conn.orientationLock = opt.value"
+            >
+              {{ opt.label }}
+            </button>
+          </div>
+        </div>
+        <p class="bbi-field-hint">
+          竖屏用于单人、特写、立绘;横屏用于群像、远景、全景。「自动」由自动 tag 按画面判定;
+          锁定后每张图都按该方向出,自动 tag 也按这个画幅构图。正文里已记下的方向不会被改写,改回「自动」即恢复。
+        </p>
 
         <div class="be-row">
           <div class="bbi-field">

@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { normalizeOrientation, parseSize, pickSize } from '@/backends/size';
+import {
+  effectiveOrientation,
+  normalizeOrientation,
+  normalizeOrientationLock,
+  parseSize,
+  pickSize,
+} from '@/backends/size';
 
 describe('normalizeOrientation', () => {
   it('认标准值与大小写/空白变体', () => {
@@ -67,5 +73,36 @@ describe('pickSize', () => {
   it('未填返回空串,交由调用方回落', () => {
     expect(pickSize({ portraitSize: '  ', landscapeSize: '' }, 'portrait')).toBe('');
     expect(pickSize({ portraitSize: '', landscapeSize: '' }, 'landscape')).toBe('');
+  });
+});
+
+describe('normalizeOrientationLock', () => {
+  it('只认两个方向值', () => {
+    expect(normalizeOrientationLock('portrait')).toBe('portrait');
+    expect(normalizeOrientationLock('landscape')).toBe('landscape');
+    expect(normalizeOrientationLock('auto')).toBe('auto');
+  });
+
+  it('老数据缺字段或乱值一律 auto(维持改动前由 AI 判定的行为)', () => {
+    expect(normalizeOrientationLock(undefined)).toBe('auto');
+    expect(normalizeOrientationLock(null)).toBe('auto');
+    expect(normalizeOrientationLock('')).toBe('auto');
+    // 不做 normalizeOrientation 那套宽松识别:这是用户点选的设置,不是模型的自由输出
+    expect(normalizeOrientationLock('横屏')).toBe('auto');
+    expect(normalizeOrientationLock('LANDSCAPE')).toBe('auto');
+    expect(normalizeOrientationLock(true)).toBe('auto');
+  });
+});
+
+describe('effectiveOrientation', () => {
+  it('auto 时用 tag 里记的方向', () => {
+    expect(effectiveOrientation('auto', 'portrait')).toBe('portrait');
+    expect(effectiveOrientation('auto', 'landscape')).toBe('landscape');
+  });
+
+  it('锁定时无视 tag 里记的方向', () => {
+    expect(effectiveOrientation('portrait', 'landscape')).toBe('portrait');
+    expect(effectiveOrientation('landscape', 'portrait')).toBe('landscape');
+    expect(effectiveOrientation('landscape', 'landscape')).toBe('landscape');
   });
 });

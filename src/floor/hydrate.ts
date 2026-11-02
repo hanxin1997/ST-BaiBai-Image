@@ -6,6 +6,7 @@ import { cardStyleSheet, cardStyleTextFallback } from '@/floor/cardStyles';
 import { onChatMutation } from '@/floor/chatObserver';
 import { setNaiConcurrency } from '@/floor/genQueue';
 import { clearAllGen, pruneGenSlots } from '@/floor/genState';
+import { clearAllTagPlans } from '@/floor/tagPlanState';
 import { SlotRegistry } from '@/floor/registry';
 import { checkSlotHealth, floorIdOf } from '@/floor/slotHealth';
 import { historyEntries, latestStaleEntry, promptHash, readStore } from '@/floor/storage';
@@ -354,6 +355,8 @@ export function bindFloorHydration(): boolean {
     clearAutoGenerateFlags();
     // A deleted/switched chat no longer owns in-flight generation work.
     clearAllGen();
+    // 提示词重写同理:旧聊天的在途重写由 runner 的 cancelAll 中止,这里只清展示态
+    clearAllTagPlans();
     // 楼层号在新聊天里指向别的楼,已提示过的记录一并作废,否则新聊天里同号楼永久静默
     hiddenWarned.clear();
     scheduleHydration(hydrateAll, hydrateVisible);

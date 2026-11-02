@@ -164,7 +164,7 @@ export async function requestCompletion(
  * 两条分支,按渠道有没有设思考强度二选一:
  *
  * ① 未设(reasoningEffort 为空 = auto):走 `chat_completion_source: 'openai'`,
- *    与加本功能之前**逐字节一致**——存量用户零变化。
+ *    除下面固定的 `tool_choice` 外,与加本功能之前**逐字节一致**——存量用户零变化。
  *
  * ② 已设:走 `'custom'`。因为 ST 代理对 openai 源的 reasoning_effort 卡**模型名白名单**
  *    (src/constants.js 的 OPENAI_REASONING_EFFORT_MODELS,精确匹配 o1/o3/gpt-5 那批),
@@ -183,6 +183,18 @@ export async function requestCompletion(
  *   key 里带 `:` `#` `{` 或以 `*` 开头都会让 YAML 解析炸 → header 没注入 →
  *   退回用 ST 的 Custom 密钥,可能把用户另一个服务商的 key 发到本端点。
  *   故一律用 JSON.stringify 生成(YAML 是 JSON 的超集),转义交给它,不手拼。
+ *
+ * 另:请求体固定带 `tool_choice: 'none'`,这是给第三方 fetch 拦截器的声明式放行握手。
+ * 酒馆助手预设脚本(如 Kemini Dramatron 面板)可能 monkey-patch `window.parent.fetch`,
+ * 拦截所有 `/api/backends/…/generate` 请求并注入合成工具 + 控制消息,让模型把整段输出
+ * 塞进工具调用。对生图 tag 这种「要严格 JSON 协议」的请求,它会把控制消息插进对话、
+ * 诱导模型改用工具调用而非直接输出 JSON,拖慢数倍甚至逼出重试。
+ * 这类拦截器普遍支持「调用方自带 tool_choice 就放行」(Dramatron 的 callerControlsTools
+ * 对 'none' 明确 bypass),所以我们主动声明不用工具。
+ * 对上游无影响:ST 服务端只在 tools 为非空数组时才转发 tool_choice
+ * (src/endpoints/backends/chat-completions.js),本函数从不发 tools,该字段到不了服务商。
+ *
+ * (与柏宝书 src/api/client.ts 的同名函数同源,行为保持一致。)
  */
 export function buildRequestBody(
   channel: ApiChannel,
@@ -197,6 +209,8 @@ export function buildRequestBody(
     temperature: channel.temperature ?? 1.0,
     max_tokens: channel.maxTokens ?? 65535,
     stream,
+    // 不用工具:见函数头注释,防第三方 fetch 拦截器把生图 tag 改写成工具调用
+    tool_choice: 'none',
     // 静默:不影响主对话状态
     presence_penalty: 0,
     frequency_penalty: 0,
@@ -236,13 +250,7 @@ async function requestCompletionAtUrl(
   if (!channel.url || !channel.model) throw new ApiError('副 API 渠道未配置完整(缺 url 或 model)');
 
   const stream = channel.stream ?? false;
-  // 预填充开关(默认开):关闭时丢掉末尾那条 assistant 预填充消息。
-  // 对不支持预填充(不续写)的端点形同浪费、个别端点还要求「最后一条须为 user」。
-  const outMessages =
-    channel.prefill === false && messages[messages.length - 1]?.role === 'assistant'
-      ? messages.slice(0, -1)
-      : messages;
-  const body = buildRequestBody(channel, outMessages, reverseProxy, stream);
+  const body = buildRequestBody(channel, messages, reverseProxy, stream);
 
   const timeoutSec = validTimeoutSec(channel.timeoutSec);
 
@@ -253,7 +261,7 @@ async function requestCompletionAtUrl(
       channelName: channel.name || channel.model || '(未命名渠道)',
       model: channel.model,
       stream,
-      messages: outMessages,
+      messages,
     }),
   );
 
@@ -305,7 +313,7 @@ async function requestCompletionAtUrl(
         }),
       );
       // 没有真值(流式)才估算。估算是异步的,不 await——不能让它拖慢主流程。
-      if (!hasReal) void estimateTokens(historyId, outMessages, result.content);
+      if (!hasReal) void estimateTokens(historyId, messages, result.content);
     }
     return result.content;
   } catch (e) {
@@ -416,6 +424,9 @@ export function mainApiAvailable(): boolean {
  * 用「当前主 API」(主界面正在用的聊天补全/文本补全设置)发一次补全。
  * 走 ST 的 generateRaw:只发我们给的这几条消息,不带聊天历史/角色卡;无需连接档。
  * quiet 类型内部强制非流式,返回清洗后的整段文本;失败抛 ApiError。
+ *
+ * ⚠️ 这条路径的请求体由 ST 构造,带不上 `tool_choice: 'none'`,第三方 fetch 拦截器
+ * (如 Kemini 防截断脚本)仍可能改写它。生成 tag 尽量指派副 API 渠道,走 buildRequestBody 那条路。
  */
 export async function requestViaMainApi(messages: ChatMsg[], opts: RequestOptions = {}): Promise<string> {
   const ctx = getContext();

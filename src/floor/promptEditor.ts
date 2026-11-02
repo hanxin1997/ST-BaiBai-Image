@@ -1,11 +1,15 @@
 import { h, render } from 'vue';
 
 import PromptEditor from '@/floor/PromptEditor.vue';
+import { cancelFloorTags, requestSlotTag } from '@/autoTag/runner';
 import { markForAutoGenerate, consumeAutoGenerate } from '@/floor/autoGenerate';
 import { hydrateMessage } from '@/floor/hydrate';
+import { awaitTagPlan, isTagPlanning, runTagPlan } from '@/floor/tagPlanState';
+import { slotKey } from '@/floor/genState';
 import { confirmDialog } from '@/components/confirm';
 import { getContext } from '@/st/context';
 import {
+  parseImageTagContent,
   parseImageTags,
   replaceImageTagAt,
   serializeImageTag,
@@ -146,6 +150,26 @@ async function writeBack(
   return true;
 }
 
+/**
+ * 从正文里重读第 seq 条 tag,算出重写落盘后弹窗该换成什么(纯函数,便于单测)。
+ *
+ * 返回 null = 什么都别动:正文读不到、seq 已不存在、或原文压根没变。不猜、不兜底——
+ * 正文是提示词的唯一真源(见文件头),读不出就该保留用户眼前的东西。
+ *
+ * **rawTag 与 content 必须一起换**:只换 content(回填了输入框)不换 rawTag,用户接着点
+ * 「应用」会撞上「这条 tag 已被改动」,而改动它的正是我们自己触发的这次重写。
+ */
+export function nextEditorState(
+  text: string | undefined,
+  seq: number,
+  currentRawTag: string,
+): { rawTag: string; content: ImageTagContent } | null {
+  if (typeof text !== 'string') return null;
+  const nextRaw = parseImageTags(text)[seq];
+  if (nextRaw === undefined || nextRaw === currentRawTag) return null;
+  return { rawTag: nextRaw, content: parseImageTagContent(nextRaw) };
+}
+
 export function openPromptEditor(options: PromptEditorOptions): void {
   const root = document.getElementById(HOST_ID)?.shadowRoot;
   if (!root) return;
@@ -161,6 +185,33 @@ export function openPromptEditor(options: PromptEditorOptions): void {
   /** 正在问「放弃修改?」:ConfirmDialog 自己不处理 Esc,而本弹窗的捕获监听还活着,
    *  不挡住的话连按 Esc 会叠出好几个确认框。 */
   let asking = false;
+  /**
+   * 弹窗当前展示的内容。AI 重写落盘后换成正文里的新版本,组件 watch 到即回填输入框。
+   * 与 options.content 分开:那是开窗时的快照,不该被改。
+   */
+  let content: ImageTagContent = options.content;
+  /**
+   * 写回 CAS 用的 tag 原文。**重写落盘后必须换成新的** ——
+   * 否则用户接着点「应用」会撞上「这条 tag 已被改动」,而改动它的正是我们自己。
+   */
+  let rawTag = options.at.rawTag;
+  /**
+   * 本窗内 AI 重写已经落过盘。弹窗不自动关,用户回头看到的是一份「已经存进正文」的提示词,
+   * 与他自己手打、还没点应用的草稿长得一样 —— 不明说一句,没法分辨哪份已经生效。
+   */
+  let rewritten = false;
+  /** 本槽位的运行态 key,与 genState / tagPlanState 同构。 */
+  const planKey = slotKey(options.at.chatId, options.at.messageId, options.at.swipeId, options.at.seq);
+  /**
+   * 本窗已经关了(含被后来者顶掉)。**迟到的回调一律不准再渲染** ——
+   * 重写跑在 tagPlanState 里、活得比弹窗长,它的收尾回调会在关窗之后才到。
+   *
+   * 这道闸门不是洁癖:容器虽已 remove,但 ModalMask 是 <Teleport> 到 modalHost 的,
+   * **容器脱离文档并不等于看不见** —— 往脱档容器里 render 一次,弹窗会原地复活到屏幕上,
+   * 而且复活的是全新实例(closing 的 watch 没有 immediate,顶着 closing=true 挂载也不会自行隐藏),
+   * 随后 requestClose / onApply 又都在 closing 上早退 → 叉、取消、应用全部点不动,窗关不掉。
+   */
+  let closed = false;
 
   const close = () => {
     if (closeCurrent !== close) return; // 已被后来者替换,不重复清理
@@ -169,11 +220,89 @@ export function openPromptEditor(options: PromptEditorOptions): void {
     closing = true;
     paint();
     setTimeout(() => {
+      // 置 closed 必须在 render(null) **之前**:两者之间若插进一次迟到的 paint,
+      // 卸载的就是刚被它重新挂上的那个实例,等于白关。
+      closed = true;
       render(null, container);
       container.remove();
     }, LEAVE_MS);
   };
   closeCurrent = close;
+
+  /**
+   * 重写收尾后:从**当前正文**把这一槽的 tag 重新读一份,回填输入框。
+   * 判定在 nextEditorState(纯函数,有单测),这里只负责取正文与赋值。
+   * 返回 true = 确实换了新提示词(据此给一行「已保存」的说明)。
+   */
+  const refreshFromMessage = (): boolean => {
+    const next = nextEditorState(
+      getContext()?.chat?.[options.at.messageId]?.mes,
+      options.at.seq,
+      rawTag,
+    );
+    if (!next) return false;
+    rawTag = next.rawTag;
+    content = next.content;
+    rewritten = true;
+    return true;
+  };
+
+  /**
+   * 真正发起重写。
+   *
+   * 跑在 tagPlanState 里而不是本弹窗里:**关掉弹窗不中断重写**(用户的明确要求)。
+   * runner 自己会落盘并 force 出图,所以这里只负责收尾后把新提示词读回来、重绘。
+   * 弹窗**不自动关**——点一下就闪退像是崩了。
+   */
+  const startRewrite = (): void => {
+    if (busy || closing || isTagPlanning(planKey)) return;
+    const task = runTagPlan(planKey, () => requestSlotTag(options.at.messageId, options.at.seq));
+    paint();
+    void task
+      .catch(() => {
+        // 失败原因 runner 已经 toast 过了,这里只负责把转圈停掉
+      })
+      .finally(() => {
+        refreshFromMessage();
+        paint();
+      });
+  };
+
+  /**
+   * 「AI 重写提示词」按钮。
+   *
+   * 草稿改过就先问一句:重写是**真落盘**的,收尾后草稿必然被新提示词顶掉
+   * (不顶掉更糟——用户接着点「应用」会拿旧草稿把刚重写的覆盖回去)。手打了半天被一次
+   * 点击无声吞掉是丢数据,口径同 requestClose;共用 asking 挡住叠出好几个确认框。
+   */
+  const rewrite = (): void => {
+    if (busy || asking || closing || isTagPlanning(planKey)) return;
+    if (!dirty) {
+      startRewrite();
+      return;
+    }
+    asking = true;
+    void confirmDialog({
+      title: 'AI 重写提示词',
+      text: '你手改的内容还没有应用。AI 重写完会直接保存，并把这些改动顶掉。',
+      confirmText: '重写',
+    }).then(ok => {
+      asking = false;
+      if (ok) startRewrite();
+    });
+  };
+
+  // 重开弹窗时接上在途的重写:请求属于 store,关窗没有中断它。
+  // 不重复发起,只等它收尾后照样回填(用户要的「续上」)。
+  const rejoin = awaitTagPlan(planKey);
+  if (rejoin) {
+    void rejoin
+      .catch(() => {})
+      .finally(() => {
+        refreshFromMessage();
+        paint();
+      });
+  }
 
   /** 关窗请求:草稿改过就先问一句,免得手打半天被一下 Esc 吞掉。 */
   const requestClose = () => {
@@ -204,21 +333,28 @@ export function openPromptEditor(options: PromptEditorOptions): void {
    * → 拿不到实例 → 关不掉弹窗。状态一律走 props/emit。
    */
   const paint = () => {
+    // 迟到的重绘一律丢弃(见 closed 的注释):容器已脱档,但 ModalMask 会 Teleport 出去,
+    // 渲染进去等于把关掉的弹窗又贴回屏幕,且再也关不掉。
+    if (closed) return;
     render(
       h(PromptEditor, {
-        content: options.content,
+        content,
         historyCount: options.historyCount,
         configured: options.configured,
         busy,
+        rewriting: isTagPlanning(planKey),
+        rewritten,
         closing,
         onDirty: (value: boolean) => {
           dirty = value;
         },
+        onRewrite: rewrite,
+        onCancelRewrite: () => cancelFloorTags(options.at.messageId),
         onApply: (value: ImageTagContent, regenerate: boolean) => {
           if (busy || closing) return;
           busy = true;
           paint();
-          void writeBack(options.at, value, regenerate).then(ok => {
+          void writeBack({ ...options.at, rawTag }, value, regenerate).then(ok => {
             busy = false;
             if (ok) close();
             else paint();

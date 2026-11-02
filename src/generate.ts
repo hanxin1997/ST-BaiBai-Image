@@ -24,13 +24,27 @@
  */
 
 import type { ImageCharacterPrompt } from '@/autoTag/protocol';
-import { validateSimpleConfig } from '@/backends/comfyTemplates';
+import {
+  comfySimpleParams,
+  composeNegative,
+  composePositive,
+  validateSimpleConfig,
+  type SimpleGenValues,
+} from '@/backends/comfyTemplates';
 import { generateComfyImage, randomSeed, type ComfyImageResult } from '@/backends/comfyui';
-import { generateImgRouterImage } from '@/backends/imgRouter';
+import { generateImgRouterImage, imgRouterFullPrompt } from '@/backends/imgRouter';
+import { generateLatentApiImage, LATENT_API_MODEL } from '@/backends/latentApi';
 import { generateNaiImage, naiRandomSeed, naiSupportsCharacterPrompts } from '@/backends/nai';
-import type { Orientation } from '@/backends/size';
+import { effectiveOrientation, parseSize, pickSize, type Orientation, type SizePair } from '@/backends/size';
 import { acquireNaiSlot } from '@/floor/genQueue';
-import { activeComfyPreset, effectiveComfyConn, settings, type BackendId } from '@/state/settings';
+import type { GenerationMeta } from '@/generationMeta';
+import {
+  activeComfyPreset,
+  activeOrientationLock,
+  effectiveComfyConn,
+  settings,
+  type BackendId,
+} from '@/state/settings';
 
 /** 一次生成的输入。与协议层 ImageInsertion 同形,但不含正文位置信息。 */
 export interface GenerateInput {
@@ -42,7 +56,10 @@ export interface GenerateInput {
   negative?: string;
   /** NAI 4.5/V5 原生多角色提示;ComfyUI / ImgRouter 不支持(见 charactersApplied)。 */
   characters?: ImageCharacterPrompt[];
-  /** 画幅方向;缺省竖屏。具体像素取渠道配置里的横竖尺寸。 */
+  /**
+   * 画幅方向;缺省竖屏。具体像素取渠道配置里的横竖尺寸。
+   * 渠道锁定了方向(activeOrientationLock)时一律按锁定方向出,这里传什么都不算数。
+   */
   size?: Orientation;
   /** 本次种子。由调用方经 decideSeed() 先行确定(埋点要在发请求前拿到它)。 */
   seed: number;
@@ -62,6 +79,8 @@ export interface GenerateOutput {
   result: ComfyImageResult;
   /** 本次实际使用的种子(原样回传,调用方不必自己记)。 */
   seed: number;
+  /** 本次实际出图的画幅方向(渠道锁定时即锁定方向,可能与入参 size 不同)。 */
+  size: Orientation;
   backend: BackendId;
   /**
    * characters 是否真的发给了后端。
@@ -70,6 +89,11 @@ export interface GenerateOutput {
    * 不在这里「降级拼进 prompt」:那正是 0.2.3 修掉的重叠躯干问题(一张图里多份完整外貌)。
    */
   charactersApplied: boolean;
+  /**
+   * 本次实际使用的画师串 / vibe / 采样参数 / 模型，供落盘随图记录（见 generationMeta.ts）。
+   * NAI 的画师串与 vibe 不在 tag 文本里，不在这里冒泡出去就只能永久丢失。
+   */
+  meta: GenerationMeta;
 }
 
 /** 后端就绪状态。 */
@@ -160,6 +184,12 @@ export function backendStatus(): BackendStatus {
     };
   }
 
+  if (backend === 'latentapi') {
+    const reason = urlKeyReason(settings.latentApi.url, settings.latentApi.key, 'Latent 地址', 'Latent API Key');
+    // 角色按 Char1/Char2… 打包进提示词(见 backends/latentApi.ts),对第三方而言等于支持 characters
+    return { backend, model: LATENT_API_MODEL, supportsCharacters: true, configured: !reason, reason };
+  }
+
   if (backend === 'comfyui') return comfyStatus();
 
   // webui 只剩存量类型(设置迁移会把它归一成 comfyui/nai),真出现就是「没选后端」
@@ -176,7 +206,7 @@ export function backendStatus(): BackendStatus {
  * 定本次种子。**必须在发请求前定好**:一是部分采样器节点不接受 -1 自动随机,
  * 二是埋点与落盘(entry.seed)都要记下它,事后「同种子再来一张」才有依据。
  *
- * 口径:显式指定 > ImgRouter 恒 0 > NAI/Latent 面板固定种子(>0) > 随机。
+ * 口径:显式指定 > ImgRouter 恒 0 > NAI/Latent/Latent 原生 API 面板固定种子(>0) > 随机。
  * ImgRouter 协议没有 seed,记 0 —— 不用 -1:BbiImageEntry.seed 明确不支持该值。
  */
 export function decideSeed(backend: BackendId, override?: number): number {
@@ -186,51 +216,141 @@ export function decideSeed(backend: BackendId, override?: number): number {
     const conn = naiConnOf(backend);
     return conn.seed > 0 ? conn.seed : naiRandomSeed();
   }
+  // 接口种子范围 0 ~ 2^53-1;随机复用 NAI 那份(正整数,足够用)
+  if (backend === 'latentapi') return settings.latentApi.seed > 0 ? settings.latentApi.seed : naiRandomSeed();
   return randomSeed();
 }
 
-async function dispatchGenerate(
-  status: BackendStatus,
+/** 一个后端跑完的产出:图 + 随图记录的配方。 */
+interface BackendRun {
+  result: ComfyImageResult;
+  meta: GenerationMeta;
+}
+
+/** 画幅像素(未解析出时 0 = 由后端/工作流自带尺寸),口径与各后端组装请求时一致。 */
+function pickedPixels(pair: SizePair, size: Orientation): { width: number; height: number } {
+  const px = parseSize(pickSize(pair, size));
+  return { width: px?.width ?? 0, height: px?.height ?? 0 };
+}
+
+async function runNai(
+  status: BackendStatus & { backend: 'nai' | 'latent' },
   input: GenerateInput,
+  size: Orientation,
   signal: AbortSignal | undefined,
   progress: GenerateProgress,
-): Promise<ComfyImageResult> {
-  const size = input.size ?? 'portrait';
-  const characters = input.characters ?? [];
-  if (status.backend === 'imgrouter') {
-    return generateImgRouterImage(
-      settings.imgrouter,
-      { prompt: input.prompt, nl: input.nl ?? '', size },
-      signal,
-    );
-  }
-  if (status.backend === 'nai' || status.backend === 'latent') {
-    return generateNaiImage(
-      naiConnOf(status.backend),
-      {
-        prompt: input.prompt,
-        nl: input.nl ?? '',
-        characters,
-        seed: input.seed,
-        size,
-        flatten: status.backend === 'latent',
-      },
-      signal,
-      { onRetry: info => progress.onRetry?.({ attempt: info.attempt, max: info.max }) },
-    );
-  }
-  return generateComfyImage(
-    effectiveComfyConn(),
+): Promise<BackendRun> {
+  // characters 原样透传:不支持的模型由 buildNaiParameters 自己滤掉(同一口径
+  // naiSupportsCharacterPrompts),在这儿再滤一遍只会多一处会漂的判据
+  const output = await generateNaiImage(
+    naiConnOf(status.backend),
     {
       prompt: input.prompt,
       nl: input.nl ?? '',
-      negative_prompt: input.negative ?? '',
+      characters: input.characters ?? [],
       seed: input.seed,
       size,
+      flatten: status.backend === 'latent',
     },
+    signal,
+    { onRetry: info => progress.onRetry?.({ attempt: info.attempt, max: info.max }) },
+  );
+  return { result: output.result, meta: { backend: status.backend, model: status.model, ...output.usage } };
+}
+
+async function runImgRouter(
+  status: BackendStatus,
+  input: GenerateInput,
+  size: Orientation,
+  signal: AbortSignal | undefined,
+): Promise<BackendRun> {
+  const conn = settings.imgrouter;
+  const nl = input.nl ?? '';
+  const result = await generateImgRouterImage(conn, { prompt: input.prompt, nl, size }, signal);
+  const meta: GenerationMeta = {
+    backend: 'imgrouter',
+    model: status.model,
+    ...pickedPixels(conn, size),
+    positive: imgRouterFullPrompt(conn, input.prompt, nl),
+    // ImgRouter 协议没有负面输入,也没有画师串 / vibe
+    negative: '',
+    artist: null,
+    vibes: [],
+    params: {},
+  };
+  return { result, meta };
+}
+
+async function runLatentApi(
+  status: BackendStatus,
+  input: GenerateInput,
+  size: Orientation,
+  signal: AbortSignal | undefined,
+): Promise<BackendRun> {
+  const conn = settings.latentApi;
+  const output = await generateLatentApiImage(
+    conn,
+    { prompt: input.prompt, nl: input.nl ?? '', characters: input.characters ?? [], seed: input.seed, size },
+    signal,
+  );
+  const meta: GenerationMeta = {
+    backend: 'latentapi',
+    model: status.model,
+    width: output.width,
+    height: output.height,
+    positive: output.prompt,
+    negative: conn.negativePrompt.trim(),
+    artist: null,
+    vibes: [],
+    params: { sampler: conn.sampler, scheduler: conn.scheduler, steps: conn.steps },
+  };
+  return { result: output.result, meta };
+}
+
+async function runComfy(
+  status: BackendStatus,
+  input: GenerateInput,
+  size: Orientation,
+  signal: AbortSignal | undefined,
+  progress: GenerateProgress,
+): Promise<BackendRun> {
+  const conn = effectiveComfyConn();
+  const result = await generateComfyImage(
+    conn,
+    { prompt: input.prompt, nl: input.nl ?? '', negative_prompt: input.negative ?? '', seed: input.seed, size },
     signal,
     { onQueue: ahead => progress.onQueue?.(ahead) },
   );
+  // ComfyUI 没有运行期跳过的概念，配方全在预设里，可在此直接快照。
+  const pixels = pickedPixels(conn, size);
+  const simpleValues: SimpleGenValues = { prompt: input.prompt, nl: input.nl, negative: input.negative, seed: input.seed, ...pixels };
+  const simple = conn.mode === 'simple';
+  const meta: GenerationMeta = {
+    backend: 'comfyui',
+    model: status.model,
+    ...pixels,
+    // custom 模式的提示词由工作流里的占位符决定，无法在这里拼出全文，留空。
+    positive: simple ? composePositive(conn.simple, simpleValues) : '',
+    negative: simple ? composeNegative(conn.simple, simpleValues) : '',
+    artist: null,
+    vibes: [],
+    params: simple ? comfySimpleParams(conn.simple) : { mode: 'custom' },
+  };
+  return { result, meta };
+}
+
+function dispatchGenerate(
+  status: BackendStatus,
+  input: GenerateInput,
+  size: Orientation,
+  signal: AbortSignal | undefined,
+  progress: GenerateProgress,
+): Promise<BackendRun> {
+  const backend = status.backend;
+  if (backend === 'nai' || backend === 'latent') return runNai({ ...status, backend }, input, size, signal, progress);
+  if (backend === 'imgrouter') return runImgRouter(status, input, size, signal);
+  if (backend === 'latentapi') return runLatentApi(status, input, size, signal);
+  return runComfy(status, input, size, signal, progress);
 }
 
 /**
@@ -260,10 +380,13 @@ export async function generateImage(
   try {
     if (isNaiProtocol(status.backend)) release = await acquireNaiSlot(signal);
     progress.onStart?.();
-    const result = await dispatchGenerate(status, input, signal, progress);
+    // 画幅锁在这里统一生效(卡片与公开接口同走本函数):只决定这一次用哪格尺寸,
+    // tag 里记的方向原样不动——promptHash 吃 tag 原文,改写会让老图无辜变 stale。
+    const size = effectiveOrientation(activeOrientationLock(), input.size ?? 'portrait');
+    const { result, meta } = await dispatchGenerate(status, input, size, signal, progress);
     // 退避文案到此为止:图已拿到,落盘还要一会儿,不该继续显示「稍后重试」
     progress.onRetry?.(null);
-    return { result, seed: input.seed, backend: status.backend, charactersApplied };
+    return { result, seed: input.seed, size, backend: status.backend, charactersApplied, meta };
   } finally {
     release?.();
   }

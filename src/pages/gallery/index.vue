@@ -6,6 +6,7 @@ import { imageDownloadFileName } from '@/floor/download';
 import { openLightbox } from '@/floor/lightbox';
 import { markImagesMissing, normalizeImagePath } from '@/floor/missingImages';
 import { deleteImageFileOnly, readStore, sidecarPathFor, type BbiImageSidecar } from '@/floor/storage';
+import { formatGenerationMeta, type GenerationMeta } from '@/generationMeta';
 import { mapLimit } from '@/pool';
 import { getContext } from '@/st/context';
 import { formatPromptText, parseImageTagContent } from '@/st/imageTagRegex';
@@ -93,11 +94,15 @@ function downloadName(characterName: string, file: string): string {
  */
 const promptCache = ref(new Map<string, string | null>());
 
-/** 侧写/extra 里存的都是 tag 原文,统一在这里解析成人读的全文(与卡片同一口径)。 */
-function renderPrompt(rawTag: string, seed: number | null): string {
+/** 侧写/extra 里存的都是 tag 原文,统一在这里解析成人读的全文(与卡片同一口径)。
+ *  meta(画师串/vibe/采样参数)是只读溯源信息,追加在后面;它不在可编辑的 tag 文本里。 */
+function renderPrompt(rawTag: string, seed: number | null, meta?: GenerationMeta): string {
   const text = formatPromptText(parseImageTagContent(rawTag));
   if (!text) return '';
-  return seed === null ? text : `${text}\n\nSeed: ${seed}`;
+  const lines = [text];
+  if (seed !== null) lines.push(`Seed: ${seed}`);
+  if (meta) lines.push(formatGenerationMeta(meta));
+  return lines.filter(Boolean).join('\n\n');
 }
 
 /**
@@ -117,7 +122,7 @@ function seedPromptsFromChat(): void {
       for (const list of Object.values(bucket)) {
         for (const entry of list) {
           if (!entry?.path || !entry.prompt) continue;
-          next.set(normalizeImagePath(entry.path), renderPrompt(entry.prompt, entry.seed ?? null));
+          next.set(normalizeImagePath(entry.path), renderPrompt(entry.prompt, entry.seed ?? null, entry.meta));
         }
       }
     }
@@ -141,7 +146,7 @@ async function fetchSidecarPrompt(imagePath: string): Promise<string | null> {
     if (!response.ok) return null;
     const data = (await response.json()) as Partial<BbiImageSidecar>;
     if (!data || typeof data.prompt !== 'string' || !data.prompt) return null;
-    return renderPrompt(data.prompt, typeof data.seed === 'number' ? data.seed : null);
+    return renderPrompt(data.prompt, typeof data.seed === 'number' ? data.seed : null, data.meta);
   } catch {
     return null;
   } finally {
