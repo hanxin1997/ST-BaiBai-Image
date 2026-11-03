@@ -6,7 +6,7 @@ import { cancelFloorTags } from '@/autoTag/runner';
 import { effectiveOrientation, type Orientation } from '@/backends/size';
 import Icon from '@/components/Icon.vue';
 import { confirmDialog } from '@/components/confirm';
-import { backendStatus, decideSeed, generateImage, isNaiProtocol } from '@/generate';
+import { backendStatus, decideSeed, generateImage, hasClientGate } from '@/generate';
 import { consumeAutoGenerate, shouldAutoGenerate } from '@/floor/autoGenerate';
 import { isCollapsed, setCollapsed } from '@/floor/collapseState';
 import { imageDownloadFileName, saveImageFile } from '@/floor/download';
@@ -288,12 +288,12 @@ async function generate(): Promise<void> {
     characters: props.characters.map(character => ({ ...character })),
     size: effectiveSize.value,
   };
-  // NAI 系(含 latent)需要闸门排队 → 先显示「排队中」;
+  // NAI 系(含 latent)与 Latent 原生 API 需要闸门排队 → 先显示「排队中」;
   // ComfyUI 有服务端队列、ImgRouter 无客户端闸门,都直接进 generating
   const { signal, token } = beginGen(
     slot,
     currentHash,
-    isNaiProtocol(settings.defaultBackend) ? 'queued' : 'generating',
+    hasClientGate(settings.defaultBackend) ? 'queued' : 'generating',
   );
   // 历史记录 id:在 seed 确定后才登记(见下),故这里先置空,catch 里据此判断要不要收尾。
   let historyId: number | null = null;

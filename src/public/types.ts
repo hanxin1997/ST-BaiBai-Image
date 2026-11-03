@@ -159,7 +159,7 @@ export interface GenerateOptions {
 
 export interface PublicGenerateProgress {
   /**
-   * - 'queued'     在柏宝绘的 NAI 并发闸门里排队(等别的请求让出槽位)
+   * - 'queued'     在柏宝绘的出图并发闸门里排队(NAI 系 / Latent 原生 API,等别的请求让出槽位)
    * - 'generating' 请求已发出,后端正在画
    * - 'queued-remote' 在 ComfyUI **服务端**队列里(ahead 为前面还有几个)
    * - 'retrying'   被限流了,正在退避重试(attempt/max)

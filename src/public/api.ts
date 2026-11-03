@@ -5,7 +5,7 @@ import { NaiError } from '@/backends/nai';
 import { ComfyUIError } from '@/backends/comfyui';
 import { ImgRouterError } from '@/backends/imgRouter';
 import { LatentApiError } from '@/backends/latentApi';
-import { backendStatus, decideSeed, generateImage, isNaiProtocol } from '@/generate';
+import { backendStatus, decideSeed, generateImage, hasClientGate } from '@/generate';
 import { saveExternalImage } from '@/floor/storage';
 import type { GenerationMeta } from '@/generationMeta';
 import { getContext } from '@/st/context';
@@ -259,8 +259,8 @@ export async function generate(
   const size = normalizeOrientation(request.size);
   const seed = decideSeed(status.backend, request.seed);
 
-  // NAI 系要过并发闸门,可能先排一会儿队;ComfyUI / ImgRouter 直接发
-  report({ phase: isNaiProtocol(status.backend) ? 'queued' : 'generating' });
+  // NAI 系与 Latent 原生 API 要过并发闸门,可能先排一会儿队;ComfyUI / ImgRouter 直接发
+  report({ phase: hasClientGate(status.backend) ? 'queued' : 'generating' });
 
   let output;
   try {

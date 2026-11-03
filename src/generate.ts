@@ -13,8 +13,9 @@
  * generateNaiImage 会跑在 floor/genQueue.ts 的并发闸门与全局节奏之外,0.2.0 整版的
  * NAI 限流自愈(429 全局冷却、相邻请求最小间隔、退避重试)当场失效。第三方并发调用
  * 是常态,绕过去的症状是用户 NAI 账号吃一串密集 429 —— 而用户只会认为柏宝绘坏了。
- * 故公开接口与卡片共用本函数,闸门在这里包死。nai 与 latent 共用闸门;ImgRouter
- * 与 ComfyUI 不持槽(前者无客户端并发、后者队列在服务端)。
+ * 故公开接口与卡片共用本函数,闸门在这里包死。nai 与 latent 共用 NAI 闸门;
+ * latentapi 走它自己的固定串行闸门(站点并发只有 1);ImgRouter 与 ComfyUI
+ * 不持槽(前者无客户端并发、后者队列在服务端)。
  *
  * 本模块**刻意不碰**:楼层坐标、genState、extra、水合、请求历史埋点。
  * 埋点留给调用方是有意为之:一条历史记录的「成功」判据各家不同——楼层卡片要等
@@ -36,7 +37,7 @@ import { generateImgRouterImage, imgRouterFullPrompt } from '@/backends/imgRoute
 import { generateLatentApiImage, LATENT_API_MODEL } from '@/backends/latentApi';
 import { generateNaiImage, naiRandomSeed, naiSupportsCharacterPrompts } from '@/backends/nai';
 import { effectiveOrientation, parseSize, pickSize, type Orientation, type SizePair } from '@/backends/size';
-import { acquireNaiSlot } from '@/floor/genQueue';
+import { acquireLatentApiSlot, acquireNaiSlot } from '@/floor/genQueue';
 import type { GenerationMeta } from '@/generationMeta';
 import {
   activeComfyPreset,
@@ -111,6 +112,11 @@ export interface BackendStatus {
 /** nai 与 latent 走同一条 NAI 协议 + 同一道客户端闸门。 */
 export function isNaiProtocol(backend: BackendId): boolean {
   return backend === 'nai' || backend === 'latent';
+}
+
+/** 该后端是否有客户端并发闸门(取槽可能先排队,卡片/公开接口据此先报 queued)。 */
+export function hasClientGate(backend: BackendId): boolean {
+  return isNaiProtocol(backend) || backend === 'latentapi';
 }
 
 function naiConnOf(backend: 'nai' | 'latent') {
@@ -359,8 +365,8 @@ function dispatchGenerate(
  * 不负责落盘、不负责显示、不登记运行态、不做埋点 —— 那些是调用方的事。
  * signal 一路透传到 fetch/轮询;取消时抛 AbortError(DOMException)。
  *
- * 闸门纪律(见 floor/genQueue.ts):NAI 系路径必须持槽发请求,release 放在 finally,
- * 漏一格就永久少一格并发。
+ * 闸门纪律(见 floor/genQueue.ts):NAI 系与 Latent 原生 API 路径必须持槽发请求,
+ * release 放在 finally,漏一格就永久少一格并发。
  */
 export async function generateImage(
   input: GenerateInput,
@@ -379,6 +385,7 @@ export async function generateImage(
   let release: (() => void) | null = null;
   try {
     if (isNaiProtocol(status.backend)) release = await acquireNaiSlot(signal);
+    else if (status.backend === 'latentapi') release = await acquireLatentApiSlot(signal);
     progress.onStart?.();
     // 画幅锁在这里统一生效(卡片与公开接口同走本函数):只决定这一次用哪格尺寸,
     // tag 里记的方向原样不动——promptHash 吃 tag 原文,改写会让老图无辜变 stale。
