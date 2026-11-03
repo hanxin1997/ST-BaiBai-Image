@@ -17,6 +17,7 @@ import {
   fetchWorldInfo,
 } from '@/autoTag/context';
 import type { BookMemoryContext } from '@/autoTag/bookMemory';
+import { resolveJailbreakPrompt } from '@/autoTag/stPreset';
 import { isAiStoryMessage, isStoryMessage, type STContext } from '@/st/context';
 import type { AutoTagSettings } from '@/state/settings';
 import {
@@ -420,8 +421,9 @@ ${characterRule}
 
   // 消息顺序与柏宝书摘要请求一致:破限 → 角色设定 → 主角设定 → 世界设定 → 任务规则 → 正文。
   const messages: ChatMsg[] = [];
-  // 破限词与柏宝书同口径:留空回落内置默认(同款文本),永远置顶第一条 system。
-  const jailbreak = (options.prompts?.jailbreak ?? '').trim() || DEFAULT_JAILBREAK_PROMPT;
+  // 破限词来源:自定义文本(留空回落内置默认),或实时跟随酒馆当前聊天补全预设。
+  // 无论哪种来源,最终都置顶第一条 system;解析失败回退自定义/内置默认。
+  const jailbreak = resolveJailbreakPrompt(options, DEFAULT_JAILBREAK_PROMPT);
   if (jailbreak) messages.push({ role: 'system', content: jailbreak });
   if (charCard) messages.push({ role: 'system', content: buildCharCardSystem(charCard) });
   if (persona) messages.push({ role: 'system', content: buildPersonaSystem(persona) });

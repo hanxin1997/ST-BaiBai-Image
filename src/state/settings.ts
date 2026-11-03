@@ -520,6 +520,20 @@ export const WORLDBOOK_FORMATS: { value: WorldbookFormat; label: string }[] = [
   { value: 'anima', label: 'Anima' },
 ];
 
+/**
+ * 破限词来源。
+ * - custom: 用 `AutoTagPrompts.jailbreak` 的自定义文本(留空回落内置默认),存量行为。
+ * - stPreset: 实时读取酒馆当前聊天补全预设,按勾选的 identifier 拼接。
+ */
+export interface JailbreakSource {
+  mode: 'custom' | 'stPreset';
+  /** stPreset 模式下勾选的提示词 identifier;拼接顺序跟预设顺序,不按此数组顺序。 */
+  presetEntries: string[];
+}
+
+/** 新装/切到跟随预设时的默认勾选:越狱 + NSFW 两条,最贴近「破限词」的用途。 */
+export const DEFAULT_JAILBREAK_PRESET_ENTRIES = ['jailbreak', 'nsfw'];
+
 export interface AutoTagSettings {
   /** 新 AI 正文落地后自动请求模型。 */
   enabled: boolean;
@@ -553,6 +567,12 @@ export interface AutoTagSettings {
   worldbookFormat: WorldbookFormat;
   /** 可编辑提示词集(破限/后端规范/思维链);空串 = 回落内置默认。 */
   prompts: AutoTagPrompts;
+  /**
+   * 破限词来源(后加字段,可选以兼容旧配置)。
+   * 缺省 = custom:只用 `prompts.jailbreak`,行为与加功能前完全一致。
+   * 选 stPreset 时才读取酒馆当前聊天补全预设;读不到自动回退 custom/内置默认。
+   */
+  jailbreakSource?: JailbreakSource;
 }
 
 /**
@@ -1716,6 +1736,10 @@ function defaults(): ImageSettings {
         latentApiSpec: '',
         latentApiThinking: '',
       },
+      jailbreakSource: {
+        mode: 'custom',
+        presetEntries: [...DEFAULT_JAILBREAK_PRESET_ENTRIES],
+      },
     },
     excludes: excludesDefaults(),
     storage: { saveAsJpeg: true },
@@ -2307,6 +2331,33 @@ function normalizeExcludes(raw: unknown): ExcludesSettings {
   };
 }
 
+/**
+ * 破限词来源归一化:只认两个合法 mode;entries 去空、去重、保序。
+ * 缺失/脏数据回落 custom + 默认勾选——绝不因为一个坏字段把存量用户的破限词换掉。
+ */
+function normalizeJailbreakSource(raw: unknown): JailbreakSource {
+  const fallback: JailbreakSource = {
+    mode: 'custom',
+    presetEntries: [...DEFAULT_JAILBREAK_PRESET_ENTRIES],
+  };
+  if (!raw || typeof raw !== 'object') return fallback;
+  const value = raw as Partial<JailbreakSource>;
+  const presetEntries = Array.isArray(value.presetEntries)
+    ? Array.from(
+        new Set(
+          value.presetEntries
+            .filter((x): x is string => typeof x === 'string')
+            .map(x => x.trim())
+            .filter(Boolean),
+        ),
+      )
+    : fallback.presetEntries;
+  return {
+    mode: value.mode === 'stPreset' ? 'stPreset' : 'custom',
+    presetEntries,
+  };
+}
+
 /** 把任意来源的原始对象并入默认值,容错缺字段/类型不符。 */
 function normalize(raw: unknown): ImageSettings {
   if (!raw || typeof raw !== 'object') return defaults();
@@ -2421,6 +2472,7 @@ function normalize(raw: unknown): ImageSettings {
         latentApiThinking: typeof rp.latentApiThinking === 'string' ? rp.latentApiThinking : '',
       };
     })(),
+    jailbreakSource: normalizeJailbreakSource(rt.jailbreakSource),
   };
   merged.excludes = normalizeExcludes(r.excludes);
   // 存储行为:嵌套对象逐字段兜底(老数据无 storage 键 → 默认关)

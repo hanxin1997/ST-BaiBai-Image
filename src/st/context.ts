@@ -67,6 +67,45 @@ export interface STCharacter {
   [k: string]: unknown;
 }
 
+/**
+ * 酒馆聊天补全预设里的单条提示词(只声明读取所需的字段)。
+ * `marker` 为聊天历史/世界书等占位项,`system_prompt === false` 是 user/assistant 角色条目。
+ */
+export interface STPresetPrompt {
+  identifier?: string;
+  name?: string;
+  content?: string;
+  marker?: boolean;
+  system_prompt?: boolean;
+  [k: string]: unknown;
+}
+
+/** 预设提示词顺序表里的一项:identifier + 是否在酒馆里启用。 */
+export interface STPresetOrderEntry {
+  identifier?: string;
+  enabled?: boolean;
+  [k: string]: unknown;
+}
+
+/** 一个角色/全局的提示词顺序表。聊天补全的全局顺序用 character_id 100001。 */
+export interface STPresetOrder {
+  character_id?: string | number;
+  order?: STPresetOrderEntry[];
+  [k: string]: unknown;
+}
+
+/**
+ * 当前聊天补全预设的实时设置(酒馆 `getContext().chatCompletionSettings` = `oai_settings`)。
+ * 只声明读取提示词所需的最小字段;预设名在 `preset_settings_openai`。
+ * 旧版酒馆没有该字段时调用方回退,不影响主流程。
+ */
+export interface STChatCompletionSettings {
+  preset_settings_openai?: string;
+  prompts?: STPresetPrompt[];
+  prompt_order?: STPresetOrder[];
+  [k: string]: unknown;
+}
+
 export interface STContext {
   chat: STMessage[];
   chatMetadata: Record<string, unknown>;
@@ -77,6 +116,11 @@ export interface STContext {
   characterId?: string | number;
   /** 当前群组 id;非群聊为空 */
   groupId?: string;
+  /**
+   * 当前聊天补全预设的实时设置(含 prompts / prompt_order / 预设名)。
+   * 酒馆 1.12+ 稳定 API;旧版缺失时读取方回退自定义文本/内置默认。
+   */
+  chatCompletionSettings?: STChatCompletionSettings;
   getCurrentChatId: () => string | undefined;
   getRequestHeaders: () => Record<string, string>;
   saveMetadataDebounced: () => void;

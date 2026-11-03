@@ -6,12 +6,14 @@ import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import { fetchModels, testChannel } from '@/api/client';
+import { readCurrentChatPreset, type StPresetSnapshot } from '@/autoTag/stPreset';
 import {
   ASSIGN_MAIN_API,
   DEFAULT_COMFY_SPEC,
   DEFAULT_COMFY_THINKING,
   DEFAULT_IMGROUTER_SPEC,
   DEFAULT_IMGROUTER_THINKING,
+  DEFAULT_JAILBREAK_PRESET_ENTRIES,
   DEFAULT_JAILBREAK_PROMPT,
   DEFAULT_NAI_V5_SPEC,
   DEFAULT_NAI_V5_THINKING,
@@ -155,7 +157,7 @@ const TAG_PROMPT_METAS: TagPromptMeta[] = [
   {
     key: 'jailbreak',
     label: '破限词',
-    hint: '作为置顶 system 附加在自动 tag 请求里，降低副 API 拒答率。留空则用内置默认（与柏宝书同款文本）。全后端通用。',
+    hint: '作为置顶 system 附加在自动 tag 请求里，降低副 API 拒答率。可选自定义文本，或实时跟随酒馆当前聊天补全预设并勾选其中的提示词条目。自定义留空则用内置默认（与柏宝书同款文本）。全后端通用。',
     builtin: DEFAULT_JAILBREAK_PROMPT,
     macros: [],
   },
@@ -234,15 +236,51 @@ const editingTagPrompt = ref<TagPromptMeta | null>(null);
 const tagPromptDraft = ref('');
 const tagPromptArea = ref<InstanceType<typeof BbiTextarea> | null>(null);
 
+/* —— 破限词来源草稿:只在编辑「破限词」时使用,与文本草稿一起在「完成」时落盘 —— */
+const jailbreakModeDraft = ref<'custom' | 'stPreset'>('custom');
+const jailbreakEntriesDraft = ref<string[]>([]);
+/** 打开弹窗时的酒馆预设快照;null = 读不到(旧版酒馆/非浏览器环境)。 */
+const jailbreakPreset = ref<StPresetSnapshot | null>(null);
+
 // 该条是否已自定义(非空即视为已覆盖内置)
 function isTagPromptCustom(key: keyof AutoTagPrompts): boolean {
   return settings.autoTag.prompts[key].trim().length > 0;
+}
+
+/** 列表状态药丸:破限词处于跟随预设时单独标出,其余仍按「已自定义/默认」。 */
+function tagPromptState(key: keyof AutoTagPrompts): { label: string; custom: boolean } {
+  if (key === 'jailbreak' && settings.autoTag.jailbreakSource?.mode === 'stPreset') {
+    return { label: '跟随预设', custom: true };
+  }
+  const custom = isTagPromptCustom(key);
+  return { label: custom ? '已自定义' : '默认', custom };
+}
+
+/** 已勾选但当前预设里不存在的 identifier:请求时会被跳过,UI 明确列出。 */
+const missingJailbreakEntries = computed(() => {
+  if (!jailbreakPreset.value) return [];
+  const present = new Set(jailbreakPreset.value.entries.map(entry => entry.identifier));
+  return jailbreakEntriesDraft.value.filter(identifier => !present.has(identifier));
+});
+
+function refreshJailbreakPreset() {
+  jailbreakPreset.value = readCurrentChatPreset();
+}
+
+function loadJailbreakDraft() {
+  const source = settings.autoTag.jailbreakSource;
+  jailbreakModeDraft.value = source?.mode === 'stPreset' ? 'stPreset' : 'custom';
+  jailbreakEntriesDraft.value = [
+    ...(source?.presetEntries ?? DEFAULT_JAILBREAK_PRESET_ENTRIES),
+  ];
+  refreshJailbreakPreset();
 }
 
 function openTagPrompt(meta: TagPromptMeta) {
   editingTagPrompt.value = meta;
   // 已自定义→载入用户内容;未自定义→预填内置模板,方便直接在其上改
   tagPromptDraft.value = settings.autoTag.prompts[meta.key].trim() || meta.builtin;
+  if (meta.key === 'jailbreak') loadJailbreakDraft();
 }
 function closeTagPrompt() {
   editingTagPrompt.value = null;
@@ -254,11 +292,23 @@ function saveTagPrompt() {
   // 草稿与内置完全一致→存空串(回落内置),避免把模板冗余存进设置、也便于显示「默认」
   const v = tagPromptDraft.value.trim();
   settings.autoTag.prompts[meta.key] = v === meta.builtin.trim() ? '' : tagPromptDraft.value;
+  if (meta.key === 'jailbreak') {
+    settings.autoTag.jailbreakSource = {
+      mode: jailbreakModeDraft.value,
+      presetEntries: [...jailbreakEntriesDraft.value],
+    };
+  }
   closeTagPrompt();
 }
-// 「恢复默认」:把草稿重置回内置模板(保存后即回落内置)
+// 「恢复默认」:把草稿重置回内置模板(保存后即回落内置);破限词同时复位来源。
 function resetTagPromptDraft() {
-  if (editingTagPrompt.value) tagPromptDraft.value = editingTagPrompt.value.builtin;
+  const meta = editingTagPrompt.value;
+  if (!meta) return;
+  tagPromptDraft.value = meta.builtin;
+  if (meta.key === 'jailbreak') {
+    jailbreakModeDraft.value = 'custom';
+    jailbreakEntriesDraft.value = [...DEFAULT_JAILBREAK_PRESET_ENTRIES];
+  }
 }
 // 点宏标签 → 插入到文本框光标处(无焦点则追加到末尾);光标定位由组件内部处理
 function insertTagMacro(token: string) {
@@ -913,8 +963,8 @@ async function confirmUpdate() {
           <li v-for="m in TAG_PROMPT_METAS" :key="m.key" class="bbi-prompt-item">
             <button class="bbi-prompt-open" type="button" @click="openTagPrompt(m)">
               <span class="bbi-prompt-name">{{ m.label }}</span>
-              <span class="bbi-prompt-state" :class="{ 'is-custom': isTagPromptCustom(m.key) }">
-                {{ isTagPromptCustom(m.key) ? '已自定义' : '默认' }}
+              <span class="bbi-prompt-state" :class="{ 'is-custom': tagPromptState(m.key).custom }">
+                {{ tagPromptState(m.key).label }}
               </span>
               <Icon name="edit" class="bbi-prompt-edit" />
             </button>
@@ -1211,6 +1261,80 @@ async function confirmUpdate() {
         </header>
 
         <p class="bbi-modal-label">{{ editingTagPrompt.hint }}</p>
+
+        <!-- 破限词来源:自定义文本(存量行为) / 实时跟随酒馆聊天补全预设 -->
+        <div v-if="editingTagPrompt.key === 'jailbreak'" class="bbi-jb-source">
+          <div class="bbi-segmented" role="group" aria-label="破限词来源">
+            <button
+              class="bbi-seg"
+              :class="{ 'is-on': jailbreakModeDraft === 'custom' }"
+              type="button"
+              @click="jailbreakModeDraft = 'custom'"
+            >
+              自定义文本
+            </button>
+            <button
+              class="bbi-seg"
+              :class="{ 'is-on': jailbreakModeDraft === 'stPreset' }"
+              type="button"
+              @click="jailbreakModeDraft = 'stPreset'"
+            >
+              跟随酒馆预设
+            </button>
+          </div>
+
+          <div v-if="jailbreakModeDraft === 'stPreset'" class="bbi-jb-preset">
+            <div class="bbi-jb-preset-head">
+              <span class="bbi-jb-preset-name">
+                当前预设：{{ jailbreakPreset?.presetName || '未命名预设' }}
+                <template v-if="jailbreakPreset">（{{ jailbreakPreset.entries.length }} 条可选）</template>
+              </span>
+              <button class="bbi-btn bbi-btn-sm" type="button" @click="refreshJailbreakPreset">
+                <Icon name="refresh" /> 刷新
+              </button>
+            </div>
+
+            <p v-if="!jailbreakPreset" class="bbi-field-hint bbi-jb-warn">
+              读不到酒馆聊天补全预设（可能是旧版酒馆）。保存后会回退到下方文本。
+            </p>
+            <template v-else>
+              <ul v-if="jailbreakPreset.entries.length" class="bbi-jb-list">
+                <li
+                  v-for="entry in jailbreakPreset.entries"
+                  :key="entry.identifier"
+                  class="bbi-jb-item"
+                  :class="{ 'is-off': !entry.enabled }"
+                >
+                  <label class="bbi-jb-row">
+                    <input
+                      v-model="jailbreakEntriesDraft"
+                      class="bbi-checkbox"
+                      type="checkbox"
+                      :value="entry.identifier"
+                      :disabled="!entry.enabled && !jailbreakEntriesDraft.includes(entry.identifier)"
+                    />
+                    <span class="bbi-jb-name">{{ entry.name }}</span>
+                    <span class="bbi-jb-id">{{ entry.identifier }}</span>
+                    <span v-if="!entry.enabled" class="bbi-jb-badge">酒馆中未启用</span>
+                  </label>
+                  <p class="bbi-jb-preview">{{ entry.content }}</p>
+                </li>
+              </ul>
+              <p v-else class="bbi-field-hint">当前预设没有可拼接的提示词条目。</p>
+
+              <p v-if="missingJailbreakEntries.length" class="bbi-field-hint bbi-jb-warn">
+                已勾选但当前预设里不存在（请求时会跳过）：{{ missingJailbreakEntries.join('、') }}
+              </p>
+              <p class="bbi-field-hint">
+                实时读取酒馆「聊天补全」当前预设；只拼接勾选且酒馆里已启用的条目，按预设顺序用空行连接。预设改动无需重开插件。
+              </p>
+            </template>
+          </div>
+        </div>
+
+        <p v-if="editingTagPrompt.key === 'jailbreak'" class="bbi-jb-textlabel">
+          {{ jailbreakModeDraft === 'stPreset' ? '回退文本（预设取不到时使用；留空则用内置默认）' : '自定义文本（留空则用内置默认）' }}
+        </p>
 
         <!-- 可用宏:点一下插入到光标处(仅 ComfyUI 规范有 {{nl}};无宏的条目不显示这一栏) -->
         <div v-if="editingTagPrompt.macros.length" class="bbi-macro-bar">
@@ -1681,6 +1805,96 @@ async function confirmUpdate() {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   tab-size: 2;
+}
+
+/* —— 破限词来源:分段开关 + 预设条目勾选 —— */
+.bbi-jb-source {
+  margin-bottom: 12px;
+}
+.bbi-jb-preset {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius);
+  background: var(--bbi-surface-2);
+}
+.bbi-jb-preset-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.bbi-jb-preset-name {
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--bbi-ink-soft);
+  overflow-wrap: anywhere;
+}
+.bbi-jb-list {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.bbi-jb-item {
+  padding: 8px 10px;
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-surface);
+}
+.bbi-jb-item.is-off {
+  opacity: 0.7;
+}
+.bbi-jb-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.bbi-jb-name {
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.bbi-jb-id {
+  font-family: var(--bbi-font-mono);
+  font-size: 11px;
+  color: var(--bbi-ink-muted);
+}
+.bbi-jb-badge {
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: var(--bbi-radius-pill);
+  background: var(--bbi-warning-soft);
+  color: var(--bbi-warning);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.bbi-jb-preview {
+  margin: 5px 0 0 24px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--bbi-ink-muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.bbi-jb-warn {
+  color: var(--bbi-warning);
+}
+.bbi-jb-textlabel {
+  margin: 12px 0 6px;
+  font-size: 12px;
+  color: var(--bbi-ink-muted);
 }
 
 /* ============ 排除名单(chips + 弹窗列表):与柏宝书同款交互,类名换 bbi 前缀 ============ */
