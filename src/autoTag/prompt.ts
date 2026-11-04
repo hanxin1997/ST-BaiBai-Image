@@ -217,9 +217,7 @@ function sampleImageFor(
         characters: [
           {
             name: '小雪',
-            tag: library
-              ? 'girl, long silver hair, red eyes, white dress, waving'
-              : 'girl, short black hair, blue eyes, white dress, waving',
+            tag: `${latentApi ? 'girl, 小雪 (original), ' : 'girl, '}${library ? 'long silver hair, red eyes' : 'short black hair, blue eyes'}, white dress, waving`,
             ...(profile.characterNl ? { nl: 'The girl waves on the left side of the frame.' } : {}),
           },
         ],
@@ -363,15 +361,21 @@ export async function buildAutoTagMessages(
   // 生成自相矛盾的数量协议。上限至少 1,下限 0 表示保留「本楼无需插图」的质量优先口径。
   const maxImages = Math.max(1, Math.floor(Number(options.maxImages)) || 1);
   const minImages = Math.min(maxImages, Math.max(0, Math.floor(Number(options.minImages)) || 0));
+  const femaleAdmissionRule = latentApiOn
+    ? ' 女性准入优先于数量下限：本渠道每图必须至少有一名实际可见的女性；若目标正文没有足够的合格女性节点，宁可少于下限或返回空数组，也不得输出纯男性图或把不在场女性写进画面。'
+    : '';
   const imageCountRule =
-    minImages === 0
+    (minImages === 0
       ? `2. images 数量必须在 0～${maxImages} 之间。没有值得绘制的可见瞬间时可以返回空数组；不要为了接近上限而凑数。`
-      : `2. images 数量必须在 ${minImages}～${maxImages} 之间。下限 ${minImages} 是用户明确要求：即使最强候选不足，也必须从目标正文中较次但仍可见的单一瞬间补足，不得返回少于 ${minImages} 张或空数组。达到下限后不要为了接近上限而凑数。`;
+      : `2. images 数量必须在 ${minImages}～${maxImages} 之间。下限 ${minImages} 是用户明确要求：即使最强候选不足，也必须从目标正文中较次但仍可见的单一瞬间补足，不得返回少于 ${minImages} 张或空数组。达到下限后不要为了接近上限而凑数。`) + femaleAdmissionRule;
 
   const sizeRule = sizeRuleFor(profile);
 
+  const identityTagRule = latentApiOn
+    ? 'The library fandom field has the form "character name (copyright name)"; in the Anima tag split it into two separate tags — character name first, copyright name second — and never keep the parentheses. Original characters use "name (original)".'
+    : 'The fandom identity tag (fields.fandom) goes first, verbatim.';
   const libraryReferenceRule = naiCharPromptsOn
-    ? `- If a visible character exists in the fixed appearance library or is created in this changes array, copy the fixed fields into that character own characters[].tag; keep appearance wording verbatim but convert 1girl/1boy to girl/boy. The fandom identity tag (fields.fandom) goes first, verbatim. Do not put them in Base or assign them to another character.${profile.characterNl ? ' Library natural-language notes may inform that character nl.' : ''} Use the library entry name verbatim for characters[].name and for any name inside ${nlOn ? 'tag/nl' : 'tag'} — never transliterate, translate, or vary it.`
+    ? `- If a visible character exists in the fixed appearance library or is created in this changes array, copy the fixed fields into that character own characters[].tag; keep appearance wording verbatim but convert 1girl/1boy to girl/boy. ${identityTagRule} Do not put them in Base or assign them to another character.${profile.characterNl ? ' Library natural-language notes may inform that character nl.' : ''} Use the library entry name verbatim for characters[].name and for any name inside ${nlOn ? 'tag/nl' : 'tag'} — never transliterate, translate, or vary it.`
     : '- 画面中的角色只要已在【角色固定外貌库】，或在本次 changes 中建了档，tag 与 nl 就必须照抄库中/刚建档的字段值，用词一字不改，不得自行改写或增删其固定外貌。fandom 字段只作档案记录，ComfyUI 画图时不照抄它，同人身份 tag 按下发的 ComfyUI 规范现场判定并按规范转义括号。\n   - 同一角色的固定外貌在一张图里只写一遍：同一图内再次提到他时用简短指代（the boy、the silver-haired girl）承接，禁止把整串外貌重复第二遍——重复会让模型以为画面里有多个同样的人，把一个人画成互不相连的几块。';
   // 建档 nl 只在角色项写 nl 时要求(runner 的验收同一口径,见 autoTagProfile 的 characterNl)
   const newCharacterNlRule = !naiCharPromptsOn

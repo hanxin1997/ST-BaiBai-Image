@@ -218,7 +218,7 @@ const TAG_PROMPT_METAS: TagPromptMeta[] = [
   {
     key: 'latentApiSpec',
     label: 'Latent 原生 API 规范',
-    hint: '默认后端为 Latent 原生 API 时拼进自动 tag 请求，按 Anima 写法（Scene / Char / Description）约束书写；内置默认照 anima寻迹 世界书提炼。{{#nl}}…{{/nl}} / {{^nl}}…{{/nl}} 按该渠道「生成自然语言」开关取舍。留空用内置默认。',
+    hint: '默认后端为 Latent 原生 API 时拼进自动 tag 请求，按 Anima 写法（Scene / Char / Description）约束书写；内置默认照 anima寻迹 与 绘境成章 提炼。{{#nl}}…{{/nl}} / {{^nl}}…{{/nl}} 按该渠道「生成自然语言」开关取舍。留空用内置默认。',
     builtin: DEFAULT_LATENT_API_SPEC,
     macros: NL_SECTION_MACROS,
   },

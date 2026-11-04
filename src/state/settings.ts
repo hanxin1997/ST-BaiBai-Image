@@ -1280,7 +1280,9 @@ Example (小雪 is the principal character and has a library profile; 三年级�
 {{#nl}}{"position":"P2","tag":"2girls, rooftop, sunset, medium shot, foot on hand","nl":"Two girls on a rooftop at sunset, one pinning the other's hand under her foot.","characters":[{"name":"小雪","tag":"girl, long black hair, blue eyes, white dress, source#stepping on","nl":"The girl on the left presses her opponent's hand down with one foot."},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, lying on ground, surprised, looking up, target#stepped on","nl":"The other girl lies on the ground on the right, her hand pinned, staring up in shock."}],"size":"landscape"}{{/nl}}{{^nl}}{"position":"P2","tag":"2girls, rooftop, sunset, medium shot, foot on hand","characters":[{"name":"小雪","tag":"girl, long black hair, blue eyes, white dress, source#stepping on"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, lying on ground, surprised, looking up, target#stepped on"}],"size":"landscape"}{{/nl}}`;
 
 /**
- * Latent 原生 API(Anima-2.9B-int8-turbo)规范内置默认,照 anima寻迹 世界书提炼。
+ * Latent 原生 API(Anima-2.9B-int8-turbo)规范内置默认,照 anima寻迹 与 绘境成章 世界书提炼。
+ * 绘境成章 只取通用规则(事实来源/单帧/衣物非推导/可见结构/施受因果/内部透视),
+ * 不搬它的 NAI 专用协议(centers/UC/n::/状态栏/插入位置)。
  *
  * 协议形态借 NAI 那套 Base + characters[](runner / 解析 / 角色库 / 编辑弹窗都不用另起一套),
  * 出图时 backends/latentApi.ts 再按世界书格式打包成 `Scene:… Char1:… Description:…`。
@@ -1293,7 +1295,8 @@ Example (小雪 is the principal character and has a library profile; 三年级�
  */
 export const DEFAULT_LATENT_API_SPEC = `【Latent 原生 API（Anima）提示词规范】
 你写的画面会被插件打包成 Anima 格式发给生图模型：Scene:<tag>. Char1:<角色1 tag>. Char2:<角色2 tag>.{{#nl}} Description:<nl>{{/nl}}
-质量词前缀与负面词由渠道设置注入，你不写质量词、负面词、权重语法（如 (tag:1.5)）或 XML。
+质量词前缀与负面词由渠道设置注入，你不写质量词、负面词或 XML。
+权重只用 Anima 数字语法 (tag:1.1~1.5)，且只套在少数关键项上：身份、发色、核心着装、核心动作。普通项不加权，不整槽加权；禁止 A1111 的 {tag} 写法（Anima 上不可靠）。
 
 JSON 键与 Anima 段的对应：
 - tag（Base）→ Scene：分级、人数、场景环境、构图镜头、光影氛围、多人共同的互动。不写任何单个角色的外貌、服装或个人动作。
@@ -1302,39 +1305,48 @@ JSON 键与 Anima 段的对应：
 {{/nl}}{{^nl}}- 本次只写 tag，Base 与角色都不写 nl。
 {{/nl}}
 标签格式：
-- 英文、全小写、多词用空格不用下划线；保留 danbooru 复合标签（school uniform、wedding dress）。
+- 英文、全小写、多词用空格不用下划线；保留 danbooru 复合标签（school uniform、wedding dress）。Danbooru 与 Gelbooru 写法不同时优先 Gelbooru。
+- 同人角色：characters[].tag 首位写角色名，紧跟作品名，两个独立 tag（fujiwara chika, kaguya-sama wa kokurasetai）；不要写成 name (series)。原创角色写 name (original)。多人场景每个 Char 都必须写自己的外观，不能只列名字。
+- 画面内文字渲染弱：speech bubble、招牌文字只用单词或短句，长句不要写进画面。
 - Scene 第一个 tag 必须是分级：safe / sensitive / nsfw / explicit 四选一，缺省模型会按 safe 处理。露骨性行为 explicit；裸露或性暗示 nsfw / sensitive；其余 safe。
 - Scene 接着写人数：1girl, solo / 1girl, 1boy / 2girls 等，只数取景框内可见的人。
-- 场景由大到小（indoors/outdoors → 具体地点 → 细节）、由静到动（家具建筑 → 风雨蒸汽）、由远及近（背景 → 中景 → 前景）；至少两个具体环境细节。角色状态与环境相邻联动（wet clothes, rain, puddles）。提示词越详细越好，短提示会生成简陋背景。
-- 构图紧跟场景：视角（pov / 第三人称不写）、景别（close-up / bust shot / upper body / cowboy shot / full body / wide shot 只选一个）、机位（eye level / from above / from below / from side / from behind / three-quarter view）、焦点（depth of field 等）。
+- 场景由大到小（indoors/outdoors → 具体地点 → 细节）、由静到动（家具建筑 → 风雨蒸汽）、由远及近（背景 → 中景 → 前景）；至少两个具体环境细节。角色状态与环境相邻联动（wet clothes, rain, puddles）。需要气味、声音、触感时把它们转成可见线索：听觉用 headphones / musical notes / sound waves，嗅觉用 flowers / smoke / rain / food，触觉用材质词；情绪用环境表达（孤独→empty space, cold colors；温馨→warm lighting, cozy interior；紧张→harsh shadows, confined space）。提示词越详细越好，短提示会生成简陋背景。
+- 构图紧跟场景：视角（pov / 第三人称不写）、景别（close-up / bust shot / upper body / cowboy shot / full body / wide shot 只选一个）、机位（eye level / from above / from below / from side / from behind / three-quarter view）、焦点（depth of field 等）。同一轮多图切换景别，避免连续同景别。
 - 光影紧跟构图，写出因果：光源从哪来、照亮了什么、阴影落向哪（warm lamp light from the left, soft shadow on the far side），不要只写 dramatic lighting。
 
 角色（每个 Char 都要回答：他是谁、什么样子、穿什么、什么表情、看哪里、在做什么）：
-- 外貌：身份标识在前（同人照抄档案 fandom 字段；原创写名字），再写发长/发色/发型、瞳色、肤色、体型、标志配饰。【角色固定外貌库】里有的照抄字段值，一字不改；1girl/1boy 写成 girl/boy，数字人数只在 Scene。
-- 着装：每件服装都带颜色；裙、靴、袜、外套带长度词；从内到外逐件列出；写出当前状态（完整 / 破损 / 湿 / 半脱）。
+- 外貌：身份标识在前——同人写「角色名, 作品名」两个独立 tag，原创写 name (original)；档案 fandom 字段里的 name (series) 必须拆开，不照抄括号。接着写发长/发色/发型、瞳色、肤色、体型、标志配饰。【角色固定外貌库】里有的照抄字段值，一字不改；1girl/1boy 写成 girl/boy，数字人数只在 Scene。
+- 着装：每件服装都带颜色；裙、靴、袜、外套带长度词；从内到外逐件列出；写出当前状态（完整 / 破损 / 湿 / 半脱）。属性只归具体衣物：颜色、材质、厚薄、透明、湿润、破损、敞开、脱下、裸露互不推导；未知不补，破损不扩大范围，敞开不等于脱下，半透明不升级成全透明；可见内层必须有依据，不编内衣或裸露。
 - 表情：默认克制自然（slight smile, soft gaze, calm expression, parted lips）。ahegao、drooling、face distortion 这类夸张颜艺只在正文明确写到极端情绪时才用。
 - 视线：**每个 Char 必写一个视线 tag**，不写模型就默认看镜头。从这些里选：looking at another / looking at object / looking away / looking to the side / looking down / looking up / looking back / closed eyes / eyes off-screen。looking at viewer 只在 pov 里角色直视「你」、自拍直播海报、或正文写明「她看着你」时用；第三人称一律不用。
-- 动作：整体体位 + 支撑点（standing on…, sitting on…, lying on…, leaning against…, kneeling on…），左右手分别写在做什么；写**已经完成**的状态（holding, pressed, kissing），不写 reaching / about to。
+- 动作：整体体位 + 支撑点（standing on…, sitting on…, lying on…, leaning against…, kneeling on…），左右手分别写在做什么；写**已经完成**的状态（holding, pressed, kissing），不写 reaching / about to。每处肢体接触写清「谁的哪个部位 → 碰到谁的哪里」：施动方写动作，受动方只写承受位置与可见反应，不把同一个动作在两边各写一遍。
+- 可见结构：只写本图镜头、朝向、裁切和遮挡下真正看得见的外部结构，不整串枚举；按取景选必要项（胸部可见时写 breasts / nipples / areolae；下半身可见时按需写 vulva / labia majora / labia minora / clitoral hood / vaginal opening，男性写 penis / glans penis / scrotum）。外阴不等于内部阴道；遮挡或画外不补；多人逐人写自己的结构，不互抄、不混接。
+- 内部透视：剧情明确涉及体内、贯穿、受孕、内部结构示意等适合节点时，默认用局部内部透视（x-ray / cross-section / cutaway view）；Scene 只写全局表现方式，具体人物、区域、结构写本人 Char；保留外轮廓，不扩散到其他人物；不是衣物透明或背景透明；没有明确内部展示对象时保持普通外观图，不为用效果强行展示器官。内部透视、裸露与性内容只用于已确立为成年人的角色（判据见「年龄与身份」）。
 - 每个 Char 只写本角色的锚点，不串别人的特征；共用物品在各 Char 里状态一致。
 - 可见性：只写本景别与朝向下看得见的部位——背对镜头不写正面表情与瞳色，特写不写下半身，被遮挡的不写。
 - 比例匹配正文：正文和设定没写的，不加夸大身材、暴露服装或性感姿态；默认自然比例。
 
 年龄与身份：
 - 年龄用面容成熟度体现，不只写 older/younger：青涩（youthful face, soft features, round cheeks）、成熟（mature face, defined features, sharp jawline）、苍老（aged face, wrinkles）。身份必须匹配面容：写母亲就是成熟面容。
-- 身高、头身比、气质随年龄：儿童矮小、圆脸、大眼睛；成年比例匀称；老年身高略缩、白发皱纹。
+- 身高、头身比、气质可随年龄变化，但不作为硬约束：儿童通常矮小、圆脸、大眼睛；老年身高略缩、白发皱纹；成年角色按设定写，不默认某种体型。
 - 家人共享面部基因（眼型、鼻型、脸型相似），年龄差用成熟度区分；双胞胎靠服装、表情、姿势区分。
-- 成年角色的身材按设定写，没写就自然比例。
-- **sensitive / nsfw / explicit 只用于明确成年的角色**：不得与 child、adolescent、teenager、young girl 等描述同时出现，也不得给未成年角色写任何性征或性暗示。
+- 成年角色的身材按设定写，没写就自然比例，不因年龄或身份套固定体型模板。
+- **sensitive / nsfw / explicit 只用于已确立为成年人的角色**：档案或正文给出成年依据即可——明确年龄 ≥18，或父母、职场等只由成年人担任的身份；不要求在 tag 里另写年龄数字，也不用身材或面容反推年龄。未成年判定只看明确身份与年龄：出现 child、adolescent、teenager、young girl 等描述，或身份是儿童、中小学生时，只能写 safe，不写任何性征或性暗示；没有成年依据的一律按未成年处理。成年角色的身材不设限，petite、flat chest、small stature 照常按设定写。
 
 视角（pov 优先）：
 - 对话、互动场景首选 pov：角色看着「你」时写 looking at viewer。男性 / 观众默认不入镜。
 - **有肢体接触时观众肢体必须入镜**，写成一个单独的 Char（如 {"name":"你","tag":"boy, pov hands, holding white lace handkerchief, reaching from lower frame"}）；否则模型会让角色抱自己、摸自己。
 - 不写指向看不见对象的关系（arms around viewer's neck 会变成搂自己）；改写成可见的姿态（both arms extended forward, hands out of frame near camera），或让观众的手 / 肩入镜（pov hands at bottom of frame, viewer's shoulder visible at edge）。
 - 第三人称时角色绝不 looking at viewer。
+- 每张图单独判断 pov / 第三人称：同一轮允许有的图第一人称、有的第三人称；按本图表现重点选，不机械交替、不按图片编号轮换。
 
 取景与剧情：
+- **女性准入（本渠道硬规则）**：每图至少一名性别明确的女性实际可见，并在 characters[] 里拥有自己的 Char 块；禁纯男性图、无女性图。男性只在有合格女性同框时作为真实互动对象入镜，男性主角/用户不享有单独出图例外。本段没有合格女性节点时不配图，改选同一正文里其他合格节点；这条优先于任务协议里「主要角色单独出镜同样成立」的通用说法。
+- **单帧**：一张图只画一个静态瞬间；不写连续动作、多镜头、分镜；不把先后两个时刻拼成同时发生。同一瞬间的触发行为与即时反应可以同时表达。
+- **事实来源**：只写当前正文、用户设定、有效历史已成立的事实；不从示例、词库、常识补人物、动作、衣物、裸露、道具或场景。
 - 读完整段再构图：先写结果、后写原因的，画出原因与结果同框的完整瞬间（「惊讶 + 被亲吻」，不是只有「惊讶」）。
 - 只画完成态：动作做到哪一步画到哪一步，以段落的最后状态为准；不画正文没发生的事。
+- 同一轮多图仍必须是明显不同的瞬间；如果剧情确实跨越多个动作阶段，按因果链推进，动作相位只进不退（蓄力→执行→命中→后果→余韵），不为同一瞬间换镜头或返回相邻重复动作；场景/时间跳转才重置。
 - 取景突出玩家主角或主要角色与核心互动；无关的在场者与人群可以留在镜头外；核心互动需要的无名参与者照常入画，没有档案不是裁掉他的理由。人群不逐个写，作为一个整体写进 Scene。
 - 人物不要撑满画面：全身图人物约占 60–70%，环境必须看得见；近景特写可以虚化背景。
 
@@ -1344,21 +1356,23 @@ JSON 键与 Anima 段的对应：
 {{#nl}}
 Description（JSON 的 nl 键）：
 - 英文自然语言，按镜头能直接拍到的事实写：以画面里的人物、肢体、物体为主语，只写可见之物；可以写否定（no visible…）与层级（still wearing…, layered over…）。
+- 能标签化的内容优先写进 tag；微妙语感、空间关系、材质质感、因果这些标签说不清的，用自然语言补。自然语言至少 2 句，越具体越好。
 - 依次覆盖：谁在画面里、在什么位置、在做什么 → 空间关系 → 光源与阴影 → 动态瞬间 → 情绪基调 → 材质质感。通常 6–12 句，画面简单就少写。
 - 角色名照抄档案原名（中文名写中文）；【一次性】角色用正文里的指称。
 {{/nl}}
-长度：Scene、全部 Char{{#nl}} 与 Description{{/nl}} 合计控制在约 1800 字符以内（接口上限 2000，前缀要占一部分）。超了先删次要的修饰，再删次要 tag。
+长度：Scene、全部 Char{{#nl}} 与 Description{{/nl}} 合计控制在约 1800 字符以内（接口上限 2000，前缀要占一部分）。超了按这个顺序删：冗余背景 → 质量词/同义词 → 次要修饰 → 次要 tag；身份、有效状态、衣物、因果接触、可见结构不删。
 
 落笔前清理：去掉完全重复的词、画面里看不见的词、语义重复的词（留更具体的：white shirt 留，shirt 删）、互相矛盾的词（bra 与 topless、standing 与 lying、pantyhose 与 barefoot 等）。
 
-名字：已建档或本次建档的角色，characters[].name 与 tag{{#nl}}/nl{{/nl}} 里出现的名字照抄档案原名，不音译、不翻译。一次性无名角色用正文的指称原词作 name，绝不编造人名。
+名字：已建档或本次建档的角色，characters[].name 与 tag{{#nl}}/nl{{/nl}} 里出现的名字照抄档案原名，不音译、不翻译。同人身份 tag 按「角色名, 作品名」两个独立 tag 写，作品名照抄档案 fandom 里的 series 部分；不交换顺序、不加括号。一次性无名角色用正文的指称原词作 name，绝不编造人名。
 
 示例（小雪是主要角色、已建档；三年级队长是核心互动需要的无名对手，不建档）：
-{{#nl}}{"position":"P2","tag":"safe, 2girls, outdoors, school rooftop, chain-link fence, water tank, concrete floor, sunset, cowboy shot, from side, warm orange sunlight from the right, long shadows","nl":"小雪 stands on the left of the concrete rooftop, pressing her right foot down on the other girl's hand. 三年级队长 lies on her side on the right, propped on one elbow, staring up in shock. Warm orange sunlight from the right catches the edge of the chain-link fence and stretches both of their shadows across the floor.","characters":[{"name":"小雪","tag":"girl, long black hair, blue eyes, white dress, knee-length dress, standing, right foot pressing down on hand, arms at sides, looking down, calm expression"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, long sleeves, lying on concrete floor, propped on one elbow, hand pinned under foot, looking up, surprised, open mouth"}],"size":"landscape"}{{/nl}}{{^nl}}{"position":"P2","tag":"safe, 2girls, outdoors, school rooftop, chain-link fence, water tank, concrete floor, sunset, cowboy shot, from side, warm orange sunlight from the right, long shadows","characters":[{"name":"小雪","tag":"girl, long black hair, blue eyes, white dress, knee-length dress, standing, right foot pressing down on hand, arms at sides, looking down, calm expression"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, long sleeves, lying on concrete floor, propped on one elbow, hand pinned under foot, looking up, surprised, open mouth"}],"size":"landscape"}{{/nl}}`;
+{{#nl}}{"position":"P2","tag":"safe, 2girls, outdoors, school rooftop, chain-link fence, water tank, concrete floor, sunset, cowboy shot, from side, warm orange sunlight from the right, long shadows","nl":"小雪 stands on the left of the concrete rooftop, pressing her right foot down on the other girl's hand. 三年级队长 lies on her side on the right, propped on one elbow, staring up in shock. Warm orange sunlight from the right catches the edge of the chain-link fence and stretches both of their shadows across the floor.","characters":[{"name":"小雪","tag":"girl, 小雪 (original), long black hair, blue eyes, (white dress:1.2), knee-length dress, standing, right foot pressing down on hand, arms at sides, looking down, calm expression"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, long sleeves, lying on concrete floor, propped on one elbow, hand pinned under foot, looking up, surprised, open mouth"}],"size":"landscape"}{{/nl}}{{^nl}}{"position":"P2","tag":"safe, 2girls, outdoors, school rooftop, chain-link fence, water tank, concrete floor, sunset, cowboy shot, from side, warm orange sunlight from the right, long shadows","characters":[{"name":"小雪","tag":"girl, 小雪 (original), long black hair, blue eyes, (white dress:1.2), knee-length dress, standing, right foot pressing down on hand, arms at sides, looking down, calm expression"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, long sleeves, lying on concrete floor, propped on one elbow, hand pinned under foot, looking up, surprised, open mouth"}],"size":"landscape"}{{/nl}}`;
 
 /**
  * Latent 原生 API 思维链内置默认。三层结构与 DEFAULT_NAI_V5_THINKING 相同(第一层整楼一次、
- * 第二层逐图槽位、第三层只核对),内容换成 anima寻迹 世界书的「内部构思」与「自检六问」。
+ * 第二层逐图槽位、第三层只核对),内容换成 anima寻迹 的「内部构思」与「自检六问」,
+ * 并补入 绘境成章 的事实来源/单帧/女性准入/衣物非推导/可见结构检查。
  * 槽位与 DEFAULT_LATENT_API_SPEC 一一对应:Scene 块 + 每个可见个体一块。
  */
 export const DEFAULT_LATENT_API_THINKING = `【输出前思考清单】
@@ -1370,23 +1384,29 @@ export const DEFAULT_LATENT_API_THINKING = `【输出前思考清单】
 
 A. 事实与状态账本
    - 只给目标正文选图；此前上下文与历史 <bbi_image> 只作连续性线索，不能覆盖正文。
+   - 只写当前正文、用户设定、有效历史已成立的事实；不从示例、词库、常识补人物、动作、衣物、裸露、道具或场景。
+   - 一张图只取一个静态瞬间；不写连续动作、多镜头、分镜，不把先后两个时刻拼成同时发生；同一瞬间的触发行为与即时反应可以同时表达。
+   - 先做女性准入预判：本节点最终镜头里至少要有一名性别明确的女性实际可见；没有就换节点，不硬配纯男性图。
    - 区分三类状态：角色库里的永久特征；本场景内要延续的临时状态（衣物穿脱、湿身、污渍、伤势、手持物）；只属于单帧的表情、视线、姿势。临时状态只随剧情渐变，没有明确解除或场景切换就不复原。
 
 B. 角色清点与建档（具体字段见任务协议）
    - 列出目标正文里实际在场的**全部**角色，有名的和只有指称的都列。每人一行，先标类别：【已建档】名字实际列在【角色固定外貌库】里；【本次建档】库里没有、但有设定或持续参与剧情的正式角色，本次 field:"new"；【一次性】只有指称、不持续出场的角色，不建档、不写 changes，入画时在他自己的角色块里一次性补外貌，绝不编造人名。
    - 清点名单不是入画名单；人群列一行「人群」，入镜时写进 Scene。
-   - 仅对【已建档】【本次建档】判定原创或同人；同人的身份 tag 写进档案 fandom，画图时放在该角色 tag 首位。
-   - 缺发色、发型或瞳色时一次性补全，全楼不再变。年龄用面容成熟度定一次（youthful / mature / aged），家人共享面部特征。
+   - 仅对【已建档】【本次建档】判定原创或同人；同人的身份 tag 写进档案 fandom，画图时拆成「角色名, 作品名」两个独立 tag 放在该角色 tag 首位，不照抄 name (series) 括号；原创写 name (original)。多人场景每人各自写外观。
+   - 缺发色、发型或瞳色时一次性补全，全楼不再变。年龄用面容成熟度定一次（youthful / mature / aged），家人共享面部特征。写 sensitive / nsfw / explicit 前先确认成年依据：明确年龄 ≥18，或父母、职场等成年身份；没有依据就按未成年处理。
    - 对照角色库检查永久变化（染发、剪发、永久变身），写进 changes 并标出生效 P编号；假发、湿发、光照变色不写。
 
 C. 服装时间线（【已建档】【本次建档】角色各一行：从 P 几起穿什么）
    - 每件服装定下颜色、材质、款式、长度，从内到外列一次；全楼复用同一份，有穿脱或换装才从对应 P 起更新。【一次性】角色不占行。
+   - 颜色、材质、厚薄、透明、湿润、破损、敞开、脱下、裸露互不推导；未知保持未知，破损不扩大范围，敞开不等于脱下，半透明不升级成全透明。
 
 D. 时代与世界观
    - 定一套具体自洽的视觉体系全楼沿用；它只决定「怎么画」，不把未知的场景事实具体化。
 
 E. 选段
    - 候选必须是可见的**完成态**瞬间；读完整段，因果场景同框画完整。
+   - 每个入选节点都必须有至少一名性别明确的女性实际可见；纯男性节点直接跳过，改选其他合格节点。
+   - 同一轮多图必须是明显不同的瞬间；如果剧情确实跨越多个动作阶段，按因果链推进，动作相位只进不退，不为同一瞬间换镜头或返回相邻重复动作。
    - 优先突出玩家主角或主要角色与核心互动，先定主体与互动，再定谁入镜；无关在场者留在镜头外，核心互动需要的无名参与者照常保留。
    - 按任务协议的数量范围写出 P 列表，先数一遍，多于上限当场砍掉。
 
@@ -1395,18 +1415,21 @@ E. 选段
 ■ P<编号>｜Scene
   分级：<safe / sensitive / nsfw / explicit>
   人数：<只数取景框内可见的人；无人物写 no humans>
-  视角：<pov / 第三人称 / 过肩等特殊取景>
+  视角：<逐图判断 pov / 第三人称 / 过肩等特殊取景，不整轮固定>
   景别与机位：<景别只选一个 + 垂直/水平角度；必须容纳核心互动>
   场景：<室内外 + 地点 + 至少两个可见细节>
   光影：<光源位置 → 照亮什么 → 阴影方向 + 色调>
+  内部透视：<仅适合节点：x-ray / cross-section / cutaway view 的全局表现方式；否则写「无」>
   size：<portrait / landscape / square>
 
 ■ P<编号>｜<角色名或正文指称>（每个本图可见的个体各一块）
-  外貌：<身份 tag + 发色发型 + 瞳色 + 体型 + 配饰；已建档照抄库字段>
-  着装：<本景别可见的部件，每件带颜色，裙袜外套带长度>
+  外貌：<同人「角色名, 作品名」两个 tag / 原创 name (original) + 发色发型 + 瞳色 + 体型 + 配饰；已建档照抄库字段>
+  着装：<本景别可见的部件，每件带颜色，裙袜外套带长度；不推导透明/湿润/破损/裸露>
   表情：<克制自然的标准 tag>
   视线：<必写一个视线 tag>
-  动作：<体位 + 支撑点 + 左右手分别在做什么，完成态>
+  动作：<体位 + 支撑点 + 左右手分别在做什么，完成态；接触写清谁碰谁哪里>
+  结构：<只写本图可见的外部结构，按取景选必要项，逐人归属>
+  权重：<只给少数关键项标 (tag:1.1~1.5)；没有就写「无」>
 
 槽位要求：
    - 每个槽位只写最终决定；表情、视线、动作都用英文标准 tag，不写中文感受。
@@ -1419,7 +1442,14 @@ E. 选段
    - 每个角色都有视线 tag；第三人称没有 looking at viewer。
    - pov 有肢体接触时，观众的手或肩已入镜。
    - 每个姿势都写了支撑点与重心；人物没撑满画面，环境看得见。
-   - Scene 第一个 tag 是分级；sensitive / nsfw / explicit 只出现在明确成年的角色画面里，且没有与 child、adolescent、teenager 等描述同时出现。
+   - Scene 第一个 tag 是分级；sensitive / nsfw / explicit 只出现在已确立为成年人的角色画面里，且没有与 child、adolescent、teenager 等描述同时出现。
+   - 本图至少有一名性别明确的女性实际可见，没有纯男性图。
+   - 同人写成「角色名, 作品名」两个独立 tag，原创带 (original)；没有照抄 name (series) 括号。
+   - 衣物属性没有互相推导；未知保持未知，敞开没有写成脱下。
+   - 结构只写可见项、归属正确；看不见的部位没有补。
+   - 权重只套在少数关键项上，没有 {tag}，没有整槽加权。
+   - 内部透视只用在已确立为成年人的角色、且正文确实涉及内部结构的节点；普通节点保持外观图。
+   - 单帧没有拼时刻、没有多镜头或分镜。
    - 没有正文未写的夸大身材或暴露服装；看不见的部位、重复词、矛盾词都已去掉。
    - 每个在场角色都能三选一：库中同名条目、changes 里的 field:"new"、或【一次性】；【一次性】没有被写进 changes。
    - size 与景别一致；Scene + 全部 Char{{#nl}} + Description{{/nl}} 合计约 1800 字符以内。
