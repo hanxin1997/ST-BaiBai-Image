@@ -1,4 +1,9 @@
-import { getContext, type STChatCompletionSettings, type STPresetOrder } from '@/st/context';
+import {
+  getContext,
+  type STChatCompletionSettings,
+  type STPresetOrder,
+  type STPresetPrompt,
+} from '@/st/context';
 import type { AutoTagSettings } from '@/state/settings';
 
 /**
@@ -22,8 +27,12 @@ export interface StPresetEntry {
   identifier: string;
   name: string;
   content: string;
-  /** 酒馆里是否启用;未启用的条目即使勾选也不会被拼接。 */
+  /** 酒馆顺序表里是否启用;仅作提示,勾选后仍会使用其文本。 */
   enabled: boolean;
+  /** 是否在酒馆的提示词顺序表里;不在的条目酒馆不会主动发送,但文本仍可复用。 */
+  inOrder: boolean;
+  /** 占位项(聊天历史/角色卡字段等),通常没有固定文本,不能作为破限词。 */
+  marker: boolean;
 }
 
 export interface StPresetSnapshot {
@@ -33,34 +42,50 @@ export interface StPresetSnapshot {
 
 let fallbackWarned = false;
 
-/** 取当前生效的顺序表:全局 100001 → 默认 100000 → 第一条非空顺序表。 */
+/** 取当前生效的顺序表:全局 100001 → 默认 100000 → 条目最多的非空顺序表。 */
 function pickOrder(orders: STPresetOrder[] | undefined): STPresetOrder['order'] {
   if (!Array.isArray(orders)) return [];
   const byId = (id: number) => orders.find(order => String(order?.character_id) === String(id));
-  const candidates = [byId(GLOBAL_ORDER_ID), byId(DEFAULT_ORDER_ID), ...orders];
-  for (const candidate of candidates) {
+  for (const candidate of [byId(GLOBAL_ORDER_ID), byId(DEFAULT_ORDER_ID)]) {
     if (Array.isArray(candidate?.order) && candidate.order.length) return candidate.order;
   }
-  return [];
+  let longest: STPresetOrder['order'] = [];
+  for (const order of orders) {
+    if (Array.isArray(order?.order) && order.order.length > (longest?.length ?? 0)) {
+      longest = order.order;
+    }
+  }
+  return longest;
+}
+
+/** 把预设里的单条提示词转成列表项;保留 marker/空内容,由 UI 标明不可选。 */
+function toPresetEntry(
+  prompt: STPresetPrompt,
+  identifier: string,
+  enabled: boolean,
+  inOrder: boolean,
+): StPresetEntry {
+  return {
+    identifier,
+    name: typeof prompt.name === 'string' && prompt.name.trim() ? prompt.name.trim() : identifier,
+    content: typeof prompt.content === 'string' ? prompt.content.trim() : '',
+    enabled,
+    inOrder,
+    marker: prompt.marker === true,
+  };
 }
 
 /**
- * 从一份聊天补全设置里抽出可拼接的提示词条目(纯函数)。
- * 跳过重复 identifier、marker 占位项、非系统提示词条目与空内容;顺序跟预设一致。
+ * 从一份聊天补全设置里抽出全部提示词条目(纯函数)。
+ * 先按顺序表排列,再补上顺序表里没有的条目——不静默丢条目,否则用户会以为预设只剩几条。
+ * 占位项、空内容、非系统角色条目都保留,是否可选由调用方按 content 判断。
  */
 export function readPresetEntries(settings: STChatCompletionSettings | undefined): StPresetEntry[] {
   if (!settings) return [];
-  const byId = new Map<string, { name: string; content: string }>();
+  const byId = new Map<string, STPresetPrompt>();
   for (const prompt of Array.isArray(settings.prompts) ? settings.prompts : []) {
     const identifier = typeof prompt?.identifier === 'string' ? prompt.identifier : '';
-    if (!identifier || byId.has(identifier)) continue;
-    if (prompt.marker === true || prompt.system_prompt === false) continue;
-    const content = typeof prompt.content === 'string' ? prompt.content.trim() : '';
-    if (!content) continue;
-    byId.set(identifier, {
-      name: typeof prompt.name === 'string' && prompt.name.trim() ? prompt.name.trim() : identifier,
-      content,
-    });
+    if (identifier && !byId.has(identifier)) byId.set(identifier, prompt);
   }
 
   const entries: StPresetEntry[] = [];
@@ -70,7 +95,10 @@ export function readPresetEntries(settings: STChatCompletionSettings | undefined
     const prompt = identifier ? byId.get(identifier) : undefined;
     if (!prompt || seen.has(identifier)) continue;
     seen.add(identifier);
-    entries.push({ identifier, ...prompt, enabled: order.enabled === true });
+    entries.push(toPresetEntry(prompt, identifier, order.enabled === true, true));
+  }
+  for (const [identifier, prompt] of byId) {
+    if (!seen.has(identifier)) entries.push(toPresetEntry(prompt, identifier, false, false));
   }
   return entries;
 }
@@ -99,8 +127,9 @@ function expandMacros(text: string): string {
 }
 
 /**
- * 按勾选的 identifier 取当前预设文本:只拼「勾选 ∩ 存在 ∩ 酒馆启用 ∩ 非空」的条目,
- * 顺序跟预设顺序。读不到/全空返回空串,由调用方回退。
+ * 按勾选的 identifier 取当前预设文本:只拼「勾选 ∩ 存在 ∩ 非空」的条目,
+ * 顺序跟预设顺序。启用状态只作提示——用户显式勾选就尊重选择。
+ * 读不到/全空返回空串,由调用方回退。
  */
 export function resolvePresetJailbreak(identifiers: readonly string[]): string {
   if (!identifiers.length) return '';
@@ -109,7 +138,7 @@ export function resolvePresetJailbreak(identifiers: readonly string[]): string {
   const wanted = new Set(identifiers);
   const texts: string[] = [];
   for (const entry of readPresetEntries(settings)) {
-    if (!entry.enabled || !wanted.has(entry.identifier)) continue;
+    if (!wanted.has(entry.identifier) || !entry.content) continue;
     const text = expandMacros(entry.content).trim();
     if (text) texts.push(text);
   }

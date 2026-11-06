@@ -1287,7 +1287,7 @@ async function confirmUpdate() {
             <div class="bbi-jb-preset-head">
               <span class="bbi-jb-preset-name">
                 当前预设：{{ jailbreakPreset?.presetName || '未命名预设' }}
-                <template v-if="jailbreakPreset">（{{ jailbreakPreset.entries.length }} 条可选）</template>
+                <template v-if="jailbreakPreset">（{{ jailbreakPreset.entries.length }} 条）</template>
               </span>
               <button class="bbi-btn bbi-btn-sm" type="button" @click="refreshJailbreakPreset">
                 <Icon name="refresh" /> 刷新
@@ -1303,7 +1303,7 @@ async function confirmUpdate() {
                   v-for="entry in jailbreakPreset.entries"
                   :key="entry.identifier"
                   class="bbi-jb-item"
-                  :class="{ 'is-off': !entry.enabled }"
+                  :class="{ 'is-off': !entry.content }"
                 >
                   <label class="bbi-jb-row">
                     <input
@@ -1311,13 +1311,18 @@ async function confirmUpdate() {
                       class="bbi-checkbox"
                       type="checkbox"
                       :value="entry.identifier"
-                      :disabled="!entry.enabled && !jailbreakEntriesDraft.includes(entry.identifier)"
+                      :disabled="!entry.content && !jailbreakEntriesDraft.includes(entry.identifier)"
                     />
                     <span class="bbi-jb-name">{{ entry.name }}</span>
                     <span class="bbi-jb-id">{{ entry.identifier }}</span>
-                    <span v-if="!entry.enabled" class="bbi-jb-badge">酒馆中未启用</span>
+                    <span v-if="entry.marker" class="bbi-jb-badge">占位项</span>
+                    <span v-else-if="!entry.inOrder" class="bbi-jb-badge">未加入顺序</span>
+                    <span v-else-if="!entry.enabled" class="bbi-jb-badge">酒馆中未启用</span>
                   </label>
-                  <p class="bbi-jb-preview">{{ entry.content }}</p>
+                  <p v-if="entry.content" class="bbi-jb-preview">{{ entry.content }}</p>
+                  <p v-else class="bbi-jb-preview is-empty">
+                    {{ entry.marker ? '占位项：由酒馆运行时填充，没有固定文本。' : '该条目内容为空。' }}
+                  </p>
                 </li>
               </ul>
               <p v-else class="bbi-field-hint">当前预设没有可拼接的提示词条目。</p>
@@ -1326,7 +1331,7 @@ async function confirmUpdate() {
                 已勾选但当前预设里不存在（请求时会跳过）：{{ missingJailbreakEntries.join('、') }}
               </p>
               <p class="bbi-field-hint">
-                实时读取酒馆「聊天补全」当前预设；只拼接勾选且酒馆里已启用的条目，按预设顺序用空行连接。预设改动无需重开插件。
+                列表包含预设里的全部提示词条目；占位项与空内容不可勾选。勾选后按预设顺序用空行连接，启用状态只作提示。预设改动无需重开插件。
               </p>
             </template>
           </div>
@@ -1887,6 +1892,9 @@ async function confirmUpdate() {
   -webkit-box-orient: vertical;
   overflow: hidden;
   overflow-wrap: anywhere;
+}
+.bbi-jb-preview.is-empty {
+  font-style: italic;
 }
 .bbi-jb-warn {
   color: var(--bbi-warning);
