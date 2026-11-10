@@ -7,6 +7,7 @@ import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import { fetchModels, testChannel } from '@/api/client';
 import { readCurrentChatPreset, type StPresetSnapshot } from '@/autoTag/stPreset';
+import { parseWorldbookImport } from '@/autoTag/worldbookChain';
 import {
   ASSIGN_MAIN_API,
   DEFAULT_COMFY_SPEC,
@@ -21,6 +22,10 @@ import {
   DEFAULT_LATENT_API_THINKING,
   IMAGE_DISPLAY_SIZES,
   SELECTABLE_BACKENDS,
+  WORLDBOOK_CHAIN_MAX_BOOKS,
+  WORLDBOOK_CHAIN_MAX_IMAGES,
+  WORLDBOOK_CHAIN_TAG_LIMIT_MAX,
+  WORLDBOOK_CHAIN_TAG_LIMIT_MIN,
   WORLDBOOK_FORMATS,
   getTagGenChannel,
   newChannel,
@@ -30,6 +35,7 @@ import {
   type AutoTagPrompts,
   type BackendId,
   type ImageDisplaySize,
+  type WorldbookChainBook,
   type WorldbookFormat,
 } from '@/state/settings';
 import { getContext } from '@/st/context';
@@ -97,6 +103,88 @@ const worldbookFormatSel = computed<string>({
   get: () => settings.autoTag.worldbookFormat,
   set: v => (settings.autoTag.worldbookFormat = v as WorldbookFormat),
 });
+
+/* —— 世界书链:书库只存组装请求需要的字段;导入后按书名替换,支持更新同一本 —— */
+const worldbookChainBookSel = computed<string>({
+  get: () => settings.worldbookChain.activeBookId || settings.worldbookChain.books[0]?.id || '',
+  set: v => (settings.worldbookChain.activeBookId = v),
+});
+const worldbookChainBookOptions = computed(() =>
+  settings.worldbookChain.books.map(book => ({ value: book.id, label: book.name })),
+);
+const activeWorldbookBook = computed<WorldbookChainBook | null>(
+  () =>
+    settings.worldbookChain.books.find(book => book.id === settings.worldbookChain.activeBookId) ??
+    settings.worldbookChain.books[0] ??
+    null,
+);
+const activeWorldbookEnabledCount = computed(
+  () => activeWorldbookBook.value?.entries.filter(entry => entry.enabled).length ?? 0,
+);
+const worldbookChainInput = ref<HTMLInputElement | null>(null);
+const confirmDeleteWorldbookOpen = ref(false);
+
+function normalizeWorldbookChainNumbers() {
+  settings.worldbookChain.maxImages = Math.min(
+    WORLDBOOK_CHAIN_MAX_IMAGES,
+    Math.max(1, Math.floor(Number(settings.worldbookChain.maxImages) || 1)),
+  );
+  settings.worldbookChain.tagLimitChars = Math.min(
+    WORLDBOOK_CHAIN_TAG_LIMIT_MAX,
+    Math.max(WORLDBOOK_CHAIN_TAG_LIMIT_MIN, Math.floor(Number(settings.worldbookChain.tagLimitChars) || 1)),
+  );
+}
+
+function onImportWorldbookChain(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data: unknown = JSON.parse(String(reader.result ?? ''));
+      const books = parseWorldbookImport(data, file.name.replace(/\.json$/i, ''));
+      if (!books.length) {
+        toastr.warning('没有从文件里读到可用的世界书条目', '柏宝绘');
+        return;
+      }
+      let lastBookId = '';
+      let addedBooks = 0;
+      let addedEntries = 0;
+      for (const book of books) {
+        const existing = settings.worldbookChain.books.findIndex(item => item.name === book.name);
+        if (existing >= 0) {
+          settings.worldbookChain.books.splice(existing, 1, book);
+        } else if (settings.worldbookChain.books.length >= WORLDBOOK_CHAIN_MAX_BOOKS) {
+          toastr.warning(`最多保存 ${WORLDBOOK_CHAIN_MAX_BOOKS} 本世界书，请先删除不用的`, '柏宝绘');
+          break;
+        } else {
+          settings.worldbookChain.books.push(book);
+        }
+        lastBookId = book.id;
+        addedBooks += 1;
+        addedEntries += book.entries.length;
+      }
+      if (lastBookId) settings.worldbookChain.activeBookId = lastBookId;
+      toastr.success(`已导入 ${addedBooks} 本世界书，共 ${addedEntries} 条`, '柏宝绘');
+    } catch (error) {
+      console.error('[柏宝绘] 世界书导入失败', error);
+      toastr.error(error instanceof Error ? error.message : '世界书文件格式无法识别', '柏宝绘');
+    }
+  };
+  reader.onerror = () => toastr.error('读取文件失败', '柏宝绘');
+  reader.readAsText(file);
+}
+
+function confirmDeleteWorldbook() {
+  const book = activeWorldbookBook.value;
+  if (!book) return;
+  const index = settings.worldbookChain.books.findIndex(item => item.id === book.id);
+  if (index >= 0) settings.worldbookChain.books.splice(index, 1);
+  settings.worldbookChain.activeBookId = settings.worldbookChain.books[0]?.id ?? '';
+  confirmDeleteWorldbookOpen.value = false;
+}
 
 /* —— 渠道:列表只读展示,编辑/新建都在弹窗里进行,避免一长列表平铺误触。
    渠道列表与柏宝书共享(见 state/settings.ts 的共享存储),任一端改动自动同步。 —— */
@@ -852,6 +940,98 @@ async function confirmUpdate() {
         </label>
         <p class="bbi-field-hint">生成 tag 期间在酒馆里显示一条常驻提示(重试与切换备用渠道也写在上面),不打开插件面板也能知道它在忙。关掉则只在成功/失败时提示。</p>
       </Collapsible>
+
+      <!-- 世界书链:导入的世界书整段替代内置思维链与破限词;与「自动生成 tag」互不影响 -->
+      <Collapsible title="世界书链" :open="false">
+        <label class="bbi-switch-row">
+          <span class="bbi-field-label">启用世界书链</span>
+          <input v-model="settings.worldbookChain.enabled" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p class="bbi-field-hint">
+          用导入的世界书替代内置思维链与破限词,按原消息角色与触发词组装后发给自动 tag 渠道;AI 仍按本插件的图片管线写回。
+          启用并选中世界书时,自动/手动整楼生图走本链,楼层上的单张重写仍走旧链;不需要再打开上面的「自动生成 tag」。
+        </p>
+
+        <div class="bbi-channel-bar">
+          <span class="bbi-field-label">
+            已导入 {{ settings.worldbookChain.books.length }} / {{ WORLDBOOK_CHAIN_MAX_BOOKS }} 本
+          </span>
+          <button class="bbi-btn bbi-btn-primary bbi-btn-sm" type="button" @click="worldbookChainInput?.click()">
+            <Icon name="upload" /> 导入世界书
+          </button>
+        </div>
+        <input
+          ref="worldbookChainInput"
+          type="file"
+          accept=".json,application/json"
+          style="display: none"
+          @change="onImportWorldbookChain"
+        />
+        <p class="bbi-field-hint">
+          支持 st-chatu8 导出/测试上下文与酒馆标准世界书 JSON;条目角色、触发词、启用状态原样保留,不做改写。
+          同名书再次导入会整体替换,便于更新到最新版。
+        </p>
+
+        <div v-if="settings.worldbookChain.books.length" class="bbi-select-row">
+          <span class="bbi-field-label">当前世界书</span>
+          <BbiSelect v-model="worldbookChainBookSel" :options="worldbookChainBookOptions" aria-label="当前世界书" />
+        </div>
+        <p v-if="activeWorldbookBook" class="bbi-field-hint">
+          {{ activeWorldbookBook.name }} · {{ activeWorldbookBook.entries.length }} 条,启用
+          {{ activeWorldbookEnabledCount }} 条
+        </p>
+
+        <label v-if="activeWorldbookBook" class="bbi-num-row">
+          <span class="bbi-field-label">单楼最多图片数</span>
+          <input
+            v-model.number="settings.worldbookChain.maxImages"
+            class="bbi-input bbi-num"
+            type="number"
+            min="1"
+            :max="WORLDBOOK_CHAIN_MAX_IMAGES"
+            step="1"
+            @change="normalizeWorldbookChainNumbers"
+          />
+        </label>
+
+        <label class="bbi-switch-row">
+          <span class="bbi-field-label">限制单张提示词长度</span>
+          <input v-model="settings.worldbookChain.enforceTagLimit" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p class="bbi-field-hint">
+          只把限制写进发给 AI 的提示词,不截断输出。上游生图模型单张约接收 2000 token,超长会被拒绝。
+        </p>
+        <label v-if="settings.worldbookChain.enforceTagLimit" class="bbi-num-row">
+          <span class="bbi-field-label">单张字符上限</span>
+          <input
+            v-model.number="settings.worldbookChain.tagLimitChars"
+            class="bbi-input bbi-num"
+            type="number"
+            :min="WORLDBOOK_CHAIN_TAG_LIMIT_MIN"
+            :max="WORLDBOOK_CHAIN_TAG_LIMIT_MAX"
+            step="1"
+            @change="normalizeWorldbookChainNumbers"
+          />
+        </label>
+
+        <div v-if="activeWorldbookBook" class="bbi-channel-bar">
+          <span class="bbi-field-hint">删除当前世界书不会自动关闭开关;书库为空时本链按未启用处理。</span>
+          <button class="bbi-btn bbi-btn-sm" type="button" @click="confirmDeleteWorldbookOpen = true">
+            删除当前世界书
+          </button>
+        </div>
+      </Collapsible>
+
+      <ConfirmDialog
+        v-model:open="confirmDeleteWorldbookOpen"
+        title="删除世界书"
+        confirm-text="删除"
+        confirm-icon="trash"
+        tone="danger"
+        @confirm="confirmDeleteWorldbook"
+      >
+        确定删除「{{ activeWorldbookBook?.name ?? '' }}」吗?删除后需要重新导入才能使用。
+      </ConfirmDialog>
 
       <!-- 排除角色:名单与柏宝书共享(见 state/settings.ts 的共享存储),任一端改动自动同步 -->
       <Collapsible title="排除角色" :open="false">

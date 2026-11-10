@@ -34,14 +34,17 @@ export interface WorldbookConversion {
 /** 一块生图词:可选的 <image> 壳 + image###…###。壳连同块一起替换,标题行等其余正文不动。 */
 const BLOCK_PATTERN = /(?:<image>\s*)?image###([\s\S]*?)###(?:\s*<\/image>)?/gi;
 
-/** 键名只认字段边界处(开头 / 空白 / 分隔符之后),Description 里的普通单词不会被当成键。 */
+/**
+ * 键名只认字段边界处(开头 / 空白 / 分隔符之后),Description 里的普通单词不会被当成键。
+ * NAI 同时认全角冒号/分号/逗号/句号:绘境物语是中文书,模型可能把字段标点写成全角。
+ */
 const KEY_PATTERNS: Record<WorldbookImageFormat, RegExp> = {
-  nai: /(?:^|[\s;.,])(Scene Composition|Character\s*(\d+)\s*(Prompt|UC))\s*:/gi,
+  nai: /(?:^|[\s;.,；，。])(Scene Composition|Character\s*(\d+)\s*(Prompt|UC))\s*[:：]/gi,
   anima: /(?:^|[\s;.,])(size|Scene|Char\s*(\d+)|Description)\s*:/gi,
 };
 
-/** NAI 版角色 Prompt 末尾的位置后缀。 */
-const CENTERS_SUFFIX = /\|\s*centers\s*:\s*([A-Za-z]\d)[^|]*$/i;
+/** NAI 版角色 Prompt 末尾的位置后缀(全角冒号同样容忍)。 */
+const CENTERS_SUFFIX = /\|\s*centers\s*[:：]\s*([A-Za-z]\d)[^|]*$/i;
 
 /** 未命名角色的显示名前缀(只用于卡片展示,不编人名)。 */
 const UNNAMED_CHARACTER = '角色';
@@ -61,7 +64,7 @@ interface DraftCharacter {
 
 /** 去掉末尾充当分隔的标点与空白(tag 字段用;Description 是句子,不走这里)。 */
 function trimSeparators(value: string): string {
-  return value.replace(/[\s;.,]+$/, '').trim();
+  return value.replace(/[\s;.,；，。]+$/, '').trim();
 }
 
 /** 单行化:生图词可能跨行,而提示词里换行没有意义。 */

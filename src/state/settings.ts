@@ -575,6 +575,57 @@ export interface AutoTagSettings {
   jailbreakSource?: JailbreakSource;
 }
 
+/** 世界书链条目的**消息角色**(发给 AI 的 system/user/assistant),与角色卡里的角色无关。 */
+export type WorldbookChainMessageRole = 'system' | 'user' | 'assistant';
+/** always = 无条件发送;trigger = 命中 triggerWords(且 andTriggerWords)才发送。 */
+export type WorldbookChainTriggerMode = 'always' | 'trigger';
+
+/** 世界书链条目:只保留组装请求需要的字段,导入时的 UUID/激活色等元数据不落盘。 */
+export interface WorldbookChainEntry {
+  id: string;
+  name: string;
+  /** 该条消息以什么身份发给 AI(system/user/assistant),保留世界书原值。 */
+  role: WorldbookChainMessageRole;
+  content: string;
+  enabled: boolean;
+  triggerMode: WorldbookChainTriggerMode;
+  /** 逗号/顿号分隔,任一词命中即通过。 */
+  triggerWords: string;
+  /** 逗号/顿号分隔,整组都命中才通过;空串 = 不启用第二组。 */
+  andTriggerWords: string;
+}
+
+export interface WorldbookChainBook {
+  id: string;
+  name: string;
+  importedAt: number;
+  entries: WorldbookChainEntry[];
+}
+
+/**
+ * 世界书链(独立大类):用导入的世界书替代内置思维链与破限词,请求仍走自动 tag 的渠道链。
+ * 开关打开时覆盖「自动生成 tag」与「世界书生图」;单槽重写仍走旧链(整楼链没有槽位概念)。
+ */
+export interface WorldbookChainSettings {
+  enabled: boolean;
+  activeBookId: string;
+  /** 单楼最多取几张;世界书自己要求 4–10,这里只做硬上限。 */
+  maxImages: number;
+  /** 是否在提示词里要求每个 image### 正文不超过 tagLimitChars 字符。 */
+  enforceTagLimit: boolean;
+  /** 单张 image### 正文的字符上限(上游生图模型按约 2000 token 接收)。 */
+  tagLimitChars: number;
+  books: WorldbookChainBook[];
+}
+
+/** 世界书链硬上限;settings 会随每次改动整体落盘,书太多会把保存拖慢。 */
+export const WORLDBOOK_CHAIN_MAX_BOOKS = 5;
+export const WORLDBOOK_CHAIN_MAX_IMAGES = 20;
+export const WORLDBOOK_CHAIN_DEFAULT_MAX_IMAGES = 10;
+export const WORLDBOOK_CHAIN_TAG_LIMIT_MIN = 1;
+export const WORLDBOOK_CHAIN_TAG_LIMIT_MAX = 2000;
+export const WORLDBOOK_CHAIN_TAG_LIMIT_DEFAULT = 2000;
+
 /**
  * 排除设置(镜像共享存储;真身在 extensionSettings['baibai_exclude_settings'])。
  * 与柏宝书共用同一份名单、同一套匹配口径:任一端改动自动同步,双端行为一致。
@@ -1290,7 +1341,6 @@ Example (小雪 is the principal character and has a library profile; 三年级�
  * 没有 source#/target#/mutual#;分级标签写进 Scene。
  *
  * 只搬世界书里「怎么写画面」的部分;输出 <image> 块、配图数量、插入位置由插件自己的协议负责。
- * 世界书里儿童/青少年的身材发育标签与把未成年设定和性内容放在一起的示例**刻意不搬**,
  * 改为下文「年龄与身份」段的硬规则。
  */
 export const DEFAULT_LATENT_API_SPEC = `【Latent 原生 API（Anima）提示词规范】
@@ -1525,6 +1575,8 @@ export interface ImageSettings {
   assignments: { tagGen: string; tagGenFallback: string };
   /** 自动判断并向正文插入生图 tag。 */
   autoTag: AutoTagSettings;
+  /** 世界书链(独立大类;开关打开时覆盖 autoTag / worldbookImages)。 */
+  worldbookChain: WorldbookChainSettings;
   /** 排除设置(镜像共享存储;真身在 extensionSettings['baibai_exclude_settings'])。 */
   excludes: ExcludesSettings;
   /** 落盘存储行为(新图格式)。 */
@@ -1768,6 +1820,15 @@ function defaults(): ImageSettings {
         mode: 'custom',
         presetEntries: [...DEFAULT_JAILBREAK_PRESET_ENTRIES],
       },
+    },
+    // 后加大类:老配置无此键 → 关、空书库,行为与加功能前完全一致。
+    worldbookChain: {
+      enabled: false,
+      activeBookId: '',
+      maxImages: WORLDBOOK_CHAIN_DEFAULT_MAX_IMAGES,
+      enforceTagLimit: true,
+      tagLimitChars: WORLDBOOK_CHAIN_TAG_LIMIT_DEFAULT,
+      books: [],
     },
     excludes: excludesDefaults(),
     storage: { saveAsJpeg: true },
@@ -2386,6 +2447,91 @@ function normalizeJailbreakSource(raw: unknown): JailbreakSource {
   };
 }
 
+const WORLDBOOK_CHAIN_ROLES: ReadonlySet<string> = new Set(['system', 'user', 'assistant']);
+
+/** 老导出里的 blue/green 激活色等价于 always/trigger;缺 triggerMode 时按有没有触发词判断。 */
+function normalizeWorldbookTriggerMode(mode: string, triggerWords: string): WorldbookChainTriggerMode {
+  if (mode === 'always' || mode === 'blue') return 'always';
+  if (mode === 'trigger' || mode === 'green') return 'trigger';
+  return triggerWords.trim() ? 'trigger' : 'always';
+}
+
+/** 单条世界书条目归一化;正文为空直接丢弃(发空消息只会浪费上下文)。 */
+function normalizeWorldbookChainEntry(raw: unknown, index: number): WorldbookChainEntry | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const value = raw as Partial<WorldbookChainEntry>;
+  const content = typeof value.content === 'string' ? value.content : '';
+  if (!content.trim()) return null;
+  const triggerWords = typeof value.triggerWords === 'string' ? value.triggerWords : '';
+  const andTriggerWords = typeof value.andTriggerWords === 'string' ? value.andTriggerWords : '';
+  const mode = typeof value.triggerMode === 'string' ? value.triggerMode : '';
+  return {
+    id: typeof value.id === 'string' && value.id ? value.id : `wb_entry_${index}`,
+    name: typeof value.name === 'string' && value.name.trim() ? value.name.trim() : `条目 ${index + 1}`,
+    role:
+      typeof value.role === 'string' && WORLDBOOK_CHAIN_ROLES.has(value.role)
+        ? (value.role as WorldbookChainMessageRole)
+        : 'system',
+    content,
+    enabled: typeof value.enabled === 'boolean' ? value.enabled : true,
+    triggerMode: normalizeWorldbookTriggerMode(mode, triggerWords),
+    triggerWords,
+    andTriggerWords,
+  };
+}
+
+function normalizeWorldbookChainBook(raw: unknown, index: number): WorldbookChainBook | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const value = raw as Partial<WorldbookChainBook>;
+  if (!Array.isArray(value.entries)) return null;
+  const entries = value.entries
+    .map((entry, entryIndex) => normalizeWorldbookChainEntry(entry, entryIndex))
+    .filter((entry): entry is WorldbookChainEntry => entry !== null);
+  if (!entries.length) return null;
+  return {
+    id: typeof value.id === 'string' && value.id ? value.id : `wb_${Date.now()}_${index}`,
+    name: typeof value.name === 'string' && value.name.trim() ? value.name.trim() : `世界书 ${index + 1}`,
+    importedAt:
+      typeof value.importedAt === 'number' && Number.isFinite(value.importedAt) ? value.importedAt : 0,
+    entries,
+  };
+}
+
+/**
+ * 世界书链归一化:书库最多 WORLDBOOK_CHAIN_MAX_BOOKS 本;activeBookId 指向已删条目时
+ * 回落第一本(悬空 id 会让设置页显示空白、跑链时取不到书)。
+ */
+function normalizeWorldbookChain(raw: unknown): WorldbookChainSettings {
+  const value = (raw ?? {}) as Partial<WorldbookChainSettings>;
+  const books = Array.isArray(value.books)
+    ? value.books
+        .slice(0, WORLDBOOK_CHAIN_MAX_BOOKS)
+        .map((book, index) => normalizeWorldbookChainBook(book, index))
+        .filter((book): book is WorldbookChainBook => book !== null)
+    : [];
+  const activeBookId =
+    typeof value.activeBookId === 'string' && books.some(book => book.id === value.activeBookId)
+      ? value.activeBookId
+      : (books[0]?.id ?? '');
+  return {
+    enabled: typeof value.enabled === 'boolean' ? value.enabled : false,
+    activeBookId,
+    maxImages:
+      typeof value.maxImages === 'number' && Number.isFinite(value.maxImages)
+        ? Math.min(WORLDBOOK_CHAIN_MAX_IMAGES, Math.max(1, Math.floor(value.maxImages)))
+        : WORLDBOOK_CHAIN_DEFAULT_MAX_IMAGES,
+    enforceTagLimit: typeof value.enforceTagLimit === 'boolean' ? value.enforceTagLimit : true,
+    tagLimitChars:
+      typeof value.tagLimitChars === 'number' && Number.isFinite(value.tagLimitChars)
+        ? Math.min(
+            WORLDBOOK_CHAIN_TAG_LIMIT_MAX,
+            Math.max(WORLDBOOK_CHAIN_TAG_LIMIT_MIN, Math.floor(value.tagLimitChars)),
+          )
+        : WORLDBOOK_CHAIN_TAG_LIMIT_DEFAULT,
+    books,
+  };
+}
+
 /** 把任意来源的原始对象并入默认值,容错缺字段/类型不符。 */
 function normalize(raw: unknown): ImageSettings {
   if (!raw || typeof raw !== 'object') return defaults();
@@ -2502,6 +2648,8 @@ function normalize(raw: unknown): ImageSettings {
     })(),
     jailbreakSource: normalizeJailbreakSource(rt.jailbreakSource),
   };
+  // 后加大类:老配置无 worldbookChain 键 → 关、空书库,行为与加功能前一致。
+  merged.worldbookChain = normalizeWorldbookChain(r.worldbookChain);
   merged.excludes = normalizeExcludes(r.excludes);
   // 存储行为:嵌套对象逐字段兜底(老数据无 storage 键 → 默认关)
   const rs = (r.storage ?? {}) as Partial<StoragePrefs>;
@@ -2538,6 +2686,7 @@ function applyInto(target: ImageSettings, src: ImageSettings): void {
   target.channels = src.channels;
   target.assignments = src.assignments;
   target.autoTag = src.autoTag;
+  target.worldbookChain = src.worldbookChain;
   target.excludes = src.excludes;
   target.storage = src.storage;
 }

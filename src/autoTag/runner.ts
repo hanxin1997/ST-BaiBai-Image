@@ -12,6 +12,11 @@ import { rebaseImagePositions, type RebaseReport } from '@/autoTag/rebase';
 import { buildSlotTaskNote } from '@/autoTag/slotPlan';
 import { convertWorldbookImages, hasWorldbookImage } from '@/autoTag/worldbookImage';
 import {
+  activeWorldbook,
+  buildWorldbookChainMessages,
+  parseWorldbookChainPlan,
+} from '@/autoTag/worldbookChain';
+import {
   BBI_CHAR_EXTRA_KEY,
   CHAR_TAG_FIELDS,
   charTagsBeforeFloor,
@@ -219,6 +224,8 @@ interface PlanScope {
   floor: number;
   /** 单槽重写的槽位(0-based);整楼为 null。 */
   slotSeq: number | null;
+  /** 请求历史页的用途标签;缺省 = 自动 tag(存量行为)。 */
+  chain?: 'worldbook';
 }
 
 /**
@@ -230,7 +237,8 @@ function describeSource(scope: PlanScope, attempt: PlanAttempt): string {
   if (scope.slotSeq !== null) parts.push(`第 ${scope.slotSeq + 1} 张`);
   if (attempt.index > 0) parts.push(`备用「${attempt.target.label}」`);
   if (attempt.rounds > 1) parts.push(`第 ${attempt.round} 次`);
-  const head = scope.slotSeq !== null ? '重写提示词' : '自动 tag';
+  const head =
+    scope.slotSeq !== null ? '重写提示词' : scope.chain === 'worldbook' ? '世界书链' : '自动 tag';
   return parts.length ? `${head}(第 ${scope.floor} 楼 · ${parts.join(' ')})` : `${head}(第 ${scope.floor} 楼)`;
 }
 
@@ -402,9 +410,11 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     abort(floor, 'extension-disabled', opts.manual, '柏宝绘已停用，请先在插件设置里开启');
     return;
   }
-  // 世界书生图开着时,自动路径由下面的世界书分支接管(与「自动生成 tag」开关无关),这里先放行
+  // 世界书生图/世界书链开着时,自动路径由对应分支接管(与「自动生成 tag」开关无关),这里先放行
   const worldbookOn = settings.autoTag.worldbookImages;
-  if (!opts.manual && !settings.autoTag.enabled && !worldbookOn) {
+  const chainBook = activeWorldbook(settings.worldbookChain);
+  const chainOn = chainBook !== null;
+  if (!opts.manual && !settings.autoTag.enabled && !worldbookOn && !chainOn) {
     diagnostic('runForFloor:skip', { floor, reason: 'auto-tag-disabled' });
     return;
   }
@@ -454,7 +464,8 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
   }
   // 世界书生图:有生图词就直接转换出图,不请求副 API;开着却没有生图词时,自动路径什么都不做
   // (省请求正是这个开关的目的),手动按钮则照旧走副 API。重新生成(replace)与单槽重写不走这条。
-  if (worldbookOn && !opts.replace && !slot) {
+  // 世界书链开着时由它接管,旧的「世界书生图」整条让位。
+  if (!chainOn && worldbookOn && !opts.replace && !slot) {
     const currentChatId = context.getCurrentChatId?.() ?? '';
     if (currentChatId && (await runWorldbookImages(floor, message, currentChatId, Boolean(opts.manual)))) return;
     if (!opts.manual) {
@@ -511,7 +522,12 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
 
   // 提示开在闸门全过之后、拼提示词之前:世界书扫描也要时间,不能等到发请求才提示。
   // 声明在 try 之外,finally 才收得干净(任何路径退出都撤掉这一段)。
-  const notice = beginTagNotice(floor, slot ? `重写第 ${slot.seq + 1} 张 · 准备提示词…` : '准备提示词…');
+  const noticeText = slot
+    ? `重写第 ${slot.seq + 1} 张 · 准备提示词…`
+    : chainOn
+      ? '世界书链 · 准备提示词…'
+      : '准备提示词…';
+  const notice = beginTagNotice(floor, noticeText);
   const markSwipeId = message.swipe_id ?? 0;
 
   try {
@@ -527,20 +543,41 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
     const promptOptions = slot ? { ...settings.autoTag, minImages: 1, maxImages: 1 } : settings.autoTag;
     // 协议形态开跑时快照一次:写协议、验收与收尾同一份,用户中途拨开关也不会前后不一
     const profile = autoTagProfile();
-    const messages = await buildAutoTagMessages(
-      context,
-      floor,
-      promptOptions,
-      memory,
-      preparedTarget,
-      anchors.text,
-      slot ? buildSlotTaskNote(rawSource, slot.seq) : '',
-      profile,
-    );
+    const messages: ChatMsg[] =
+      chainBook && !slot
+        ? buildWorldbookChainMessages(
+            context,
+            floor,
+            chainBook,
+            {
+              contextMessages: settings.autoTag.contextMessages,
+              enforceTagLimit: settings.worldbookChain.enforceTagLimit,
+              tagLimitChars: settings.worldbookChain.tagLimitChars,
+            },
+            preparedTarget,
+            anchors.text,
+          )
+        : await buildAutoTagMessages(
+            context,
+            floor,
+            promptOptions,
+            memory,
+            preparedTarget,
+            anchors.text,
+            slot ? buildSlotTaskNote(rawSource, slot.seq) : '',
+            profile,
+          );
     // 解析/校验放进 parse 回调:不过则请求历史如实记为失败(而非「HTTP 拿到文本」的
     // 绿色成功),错误原样抛回 requestImagePlan 走下一轮——显示与行为同口径。
     // parseImagePlan 对坏输出抛错,「无画面」则是正常返回空数组。
     const parse = (raw: string): ImagePlan => {
+      if (chainBook && !slot) {
+        return parseWorldbookChainPlan(raw, preparedTarget.segments, {
+          maxImages: settings.worldbookChain.maxImages,
+          enforceTagLimit: settings.worldbookChain.enforceTagLimit,
+          tagLimitChars: settings.worldbookChain.tagLimitChars,
+        });
+      }
       const candidate = parseImagePlan(raw, preparedTarget.segments, promptOptions.minImages, promptOptions.maxImages);
       // 角色项写 nl 的协议(NAI 系 4.5/V5 且开着自然语言)才要求建档带 nl;单槽重写忽略本次
       // changes,不校验——为一份会被丢弃的 changes 白耗重试次数不值。
@@ -553,7 +590,11 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
       }
       return candidate;
     };
-    const scope: PlanScope = { floor, slotSeq: slot ? slot.seq : null };
+    const scope: PlanScope = {
+      floor,
+      slotSeq: slot ? slot.seq : null,
+      chain: chainBook && !slot ? 'worldbook' : undefined,
+    };
     const attempted = await requestImagePlan(scope, messages, parse, controller.signal, notice);
     if (attempted.aborted) {
       processed.delete(identity);

@@ -178,7 +178,7 @@ function backendThinkingPrompt(options: AutoTagSettings, nlOn: boolean, naiCharP
   return expandNlSections(template, nlOn);
 }
 
-function recentFloors(context: STContext, targetFloor: number, count: number): number[] {
+export function recentFloors(context: STContext, targetFloor: number, count: number): number[] {
   const aiFloors: number[] = [];
   for (let floor = 0; floor <= targetFloor; floor += 1) {
     const message = context.chat[floor];
@@ -193,7 +193,7 @@ function recentFloors(context: STContext, targetFloor: number, count: number): n
   return floors;
 }
 
-function roleLabel(context: STContext, floor: number): string {
+export function roleLabel(context: STContext, floor: number): string {
   const message = context.chat[floor];
   if (message.is_user) return `user（${message.name || context.name1 || 'User'}）`;
   return `assistant（${message.name || context.name2 || 'Assistant'}）`;
