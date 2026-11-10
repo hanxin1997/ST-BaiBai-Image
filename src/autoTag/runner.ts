@@ -386,7 +386,9 @@ async function runWorldbookImages(floor: number, message: STMessage, chatId: str
     toastr.success(`已从世界书生图词生成 ${preview.converted} 张图片的提示词${skippedNote}`, '柏宝绘');
     return true;
   }
-  clearAutoGenerateForFloor(chatId, floor);
+  // 并发的另一次写回可能已经成功(正文已有 bbi_image):那些卡片要靠这些标记出图,别清。
+  const latestText = getContext()?.chat?.[floor]?.mes ?? '';
+  if (!hasImageTagTrace(latestText)) clearAutoGenerateForFloor(chatId, floor);
   console.info(`[柏宝绘] 第 ${floor} 楼世界书生图放弃写入：${result}`);
   if (manual || result !== 'build-failed') toastr.warning(ABANDON_REASON[result] ?? '本次没有写入生图 tag', '柏宝绘');
   return true;

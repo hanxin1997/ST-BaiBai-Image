@@ -27,6 +27,21 @@ export class LatentApiError extends Error {
   }
 }
 
+/**
+ * 提示词超过接口上限。与普通故障分开:卡片据此把这一张标成「跳过」并继续下一张,
+ * 而不是把整条自动出图流程按失败处理。
+ */
+export class LatentPromptTooLongError extends LatentApiError {
+  readonly length: number;
+  readonly limit: number;
+  constructor(length: number, limit: number) {
+    super(`提示词 ${length} 字,超过 Latent 上限 ${limit},请在编辑弹窗里删减`);
+    this.name = 'LatentPromptTooLongError';
+    this.length = length;
+    this.limit = limit;
+  }
+}
+
 /** 接口的提示词长度上限(字符)。 */
 export const LATENT_API_PROMPT_LIMIT = 2000;
 /** 显示与随图记录用的模型名(接口不让选模型,固定是这一个)。 */
@@ -218,9 +233,7 @@ export async function generateLatentApiImage(
   if (!values.prompt.trim()) throw new LatentApiError('正向提示词不能为空');
   const prompt = latentApiPrompt(conn, values);
   if (prompt.length > LATENT_API_PROMPT_LIMIT) {
-    throw new LatentApiError(
-      `提示词 ${prompt.length} 字,超过 Latent 上限 ${LATENT_API_PROMPT_LIMIT},请在编辑弹窗里删减`,
-    );
+    throw new LatentPromptTooLongError(prompt.length, LATENT_API_PROMPT_LIMIT);
   }
   const queued = await queueJob(conn, values, prompt, signal);
   const done = await waitForJob(conn, queued, signal);

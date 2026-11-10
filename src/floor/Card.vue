@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue';
 
 import type { ImageCharacterPrompt } from '@/autoTag/protocol';
 import { cancelFloorTags } from '@/autoTag/runner';
+import { LatentPromptTooLongError } from '@/backends/latentApi';
 import { effectiveOrientation, type Orientation } from '@/backends/size';
 import Icon from '@/components/Icon.vue';
 import { confirmDialog } from '@/components/confirm';
@@ -343,6 +344,17 @@ async function generate(): Promise<void> {
     const ctx = getContext();
     if (ctx) hydrateMessage(job.messageId, ctx);
   } catch (e) {
+    // 提示词超限不是故障:跳过这一张,同一楼后面的图照常出。
+    // 历史记「已取消」(中性),清掉运行态让卡片回 pending;用户删减后可手动重出。
+    if (e instanceof LatentPromptTooLongError) {
+      if (historyId !== null) safeHistory(() => failImage(historyId!, '', true));
+      clearGen(slot, token);
+      toastr.info(
+        `第 ${props.seq + 1} 张提示词 ${e.length} 字，超过 Latent 上限 ${e.limit}，已跳过；可在编辑弹窗删减后手动生成`,
+        '柏宝绘',
+      );
+      return;
+    }
     const aborted = e instanceof DOMException && e.name === 'AbortError';
     if (historyId !== null) {
       safeHistory(() => failImage(historyId!, e instanceof Error ? e.message : String(e), aborted));
@@ -464,19 +476,30 @@ function downloadCurrent(): void {
 // props patch 而非重挂,onMounted 不会再跑;tag 一变必须立刻作废旧提示词的任务。
 watch(hash, current => reconcileGen(key.value, current), { immediate: true });
 
-onMounted(() => {
-  // 「写入 tag 后自动生成图片」:本槽位带着标记水合挂载 → 消费标记并直接开始生成。
-  // **标记一律先消费再判断**:留着它会在日后同槽位重现(比如用户删掉旧图)时被新卡片
-  // 误认领,凭空开跑一次用户没点过的生成。判定本身抽成 shouldAutoGenerate 纯函数
-  // (本组件没有单测,留在这儿锁不住),口径见 floor/autoGenerate.ts。
-  // 未配置后端时不跑(卡片维持 pending,显示配置引导);标记同样已消费掉。
+/**
+ * 「写入 tag 后自动生成图片」的握手:消费本槽位的一次性标记。
+ *
+ * onMounted 覆盖「新卡片」;watch(hash) 覆盖「同锚点被 props patch」——重写已有 tag 时
+ * 差分水合不重挂卡片,onMounted 不会重跑,不补这一下标记就没人消费,卡片会停在
+ * 「生成图片」等用户手点。
+ *
+ * **标记一律先消费再判断**:留着它会在日后同槽位重现(比如用户删掉旧图)时被新卡片
+ * 误认领,凭空开跑一次用户没点过的生成。判定本身抽成 shouldAutoGenerate 纯函数
+ * (本组件没有单测,留在这儿锁不住),口径见 floor/autoGenerate.ts。
+ * 未配置后端时不跑(卡片维持 pending,显示配置引导);标记同样已消费掉。
+ */
+function maybeAutoGenerate(): void {
   if (!props.chatId) return;
   const mode = consumeAutoGenerate(props.chatId, props.messageId, props.swipeId, props.seq);
   if (!mode) return;
   if (!shouldAutoGenerate(mode, phase.value)) return;
   if (!configured.value) return;
   void generate();
-});
+}
+
+onMounted(maybeAutoGenerate);
+// 注册顺序要紧:必须排在上面的 reconcileGen watch 之后,tag 一变先作废旧任务再决定开跑。
+watch(hash, () => maybeAutoGenerate());
 </script>
 
 <template>
