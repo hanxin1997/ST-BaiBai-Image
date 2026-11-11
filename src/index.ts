@@ -93,27 +93,49 @@ $(() => {
 });
 
 async function hydrateWhenReady(attempt = 0) {
-  if ((window as unknown as { SillyTavern?: { getContext?: unknown } }).SillyTavern?.getContext) {
-    try {
-      await hydrateSettings();
-      // 全局库必须在 bindCharTagSync 之前初始化:首次重算就要把全局条目合进派生库
-      initGlobalCharTags();
-      bindCharTagSync();
-      ensureImageTagRegexRegistered();
-      bindAutoTagging();
-      bindFloorHydration();
-      bindTagActionButtons();
-      // 公开接口必须排在 hydrateSettings 之后:设置回灌前 getBackendStatus() 读的是
-      // 默认值,会把配好的用户报成「未配置」。排在 bindCharTagSync 之后则是为了让
-      // ready 事件里的 revision 已经对应真实角色库。
-      registerPublicInterface();
-      void checkForUpdate();
-      console.log(`[柏宝绘] 已加载 v${__BBI_VERSION__},设置已同步`);
-    } catch (e) {
-      console.error('[柏宝绘] 设置载入失败', e);
+  if (!(window as unknown as { SillyTavern?: { getContext?: unknown } }).SillyTavern?.getContext) {
+    if (attempt > 40) {
+      console.error('[柏宝绘] 等待 SillyTavern 就绪超时,初始化未执行');
+      return;
     }
+    setTimeout(() => hydrateWhenReady(attempt + 1), 500);
     return;
   }
-  if (attempt > 40) return; // 最多约 20s
-  setTimeout(() => hydrateWhenReady(attempt + 1), 500);
+  // 顺序即依赖:全局库先于角色库同步;公开接口排在设置回灌与角色库同步之后,
+  // 否则 getBackendStatus()/revision 读的是默认值。单步失败不断链——
+  // 历史教训:hydrate 抛错曾把自动 tag、楼层按钮、卡片水合一并带走,
+  // 用户只看到「插件整个没反应」,却不知道是哪一步坏了。
+  const steps: InitStep[] = [
+    ['设置载入', hydrateSettings],
+    ['全局角色库初始化', initGlobalCharTags],
+    ['角色库同步', bindCharTagSync],
+    ['图片标签正则', ensureImageTagRegexRegistered],
+    ['自动 tag 事件', bindAutoTagging],
+    ['楼层水合', bindFloorHydration],
+    ['楼层按钮', bindTagActionButtons],
+    ['公开接口', registerPublicInterface],
+  ];
+  let failed = 0;
+  for (const step of steps) {
+    if (!(await runStep(step))) failed += 1;
+  }
+  void checkForUpdate();
+  if (failed) {
+    toastr.error(`柏宝绘初始化有 ${failed} 项失败,详见控制台`, '柏宝绘');
+    return;
+  }
+  console.log(`[柏宝绘] 已加载 v${__BBI_VERSION__},设置已同步`);
+}
+
+type InitStep = readonly [name: string, run: () => void | Promise<void>];
+
+/** 单步初始化隔离:失败只记录自己,不阻断后续绑定。 */
+async function runStep([name, run]: InitStep): Promise<boolean> {
+  try {
+    await run();
+    return true;
+  } catch (e) {
+    console.error(`[柏宝绘] 初始化步骤「${name}」失败`, e);
+    return false;
+  }
 }

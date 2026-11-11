@@ -245,16 +245,12 @@ async function requestCompletionAtUrl(
   reverseProxy: string,
   opts: RequestOptions = {},
 ): Promise<string> {
-  const ctx = getContext();
-  if (!ctx) throw new ApiError('SillyTavern 上下文不可用');
-  if (!channel.url || !channel.model) throw new ApiError('副 API 渠道未配置完整(缺 url 或 model)');
-
   const stream = channel.stream ?? false;
-  const body = buildRequestBody(channel, messages, reverseProxy, stream);
-
   const timeoutSec = validTimeoutSec(channel.timeoutSec);
 
   // 历史埋点:登记在真正发请求之前,失败/超时也留痕(排查时要看的往往正是失败那次)。
+  // 必须早于配置校验:渠道没配全时请求根本不会发出,而这时历史里若一片空白,
+  // 看起来就像「完全没请求」,和真正的失败无法区分。
   const historyId = safeHistory(() =>
     beginLlm({
       source: opts.source || '未标注',
@@ -266,6 +262,10 @@ async function requestCompletionAtUrl(
   );
 
   try {
+    const ctx = getContext();
+    if (!ctx) throw new ApiError('SillyTavern 上下文不可用');
+    if (!channel.url || !channel.model) throw new ApiError('副 API 渠道未配置完整(缺 url 或 model)');
+    const body = buildRequestBody(channel, messages, reverseProxy, stream);
     const result = await withTimeout(timeoutSec, opts.signal, '副 API 请求', async signal => {
       const resp = await fetch(GENERATE_URL, {
         method: 'POST',
@@ -429,12 +429,9 @@ export function mainApiAvailable(): boolean {
  * (如 Kemini 防截断脚本)仍可能改写它。生成 tag 尽量指派副 API 渠道,走 buildRequestBody 那条路。
  */
 export async function requestViaMainApi(messages: ChatMsg[], opts: RequestOptions = {}): Promise<string> {
-  const ctx = getContext();
-  if (typeof ctx?.generateRaw !== 'function') {
-    throw new ApiError('当前 ST 版本不支持 generateRaw,无法跟随主 API');
-  }
-
   // 历史埋点。跟随主 API 走 ST 内部黑盒,拿不到 usage,token 一律靠估算。
+  // 同 requestCompletionAtUrl:必须早于能力校验,否则旧版 ST 的「不支持 generateRaw」
+  // 只留一条 toast,历史里看不到任何痕迹。
   const historyId = safeHistory(() =>
     beginLlm({
       source: opts.source || '未标注',
@@ -446,6 +443,10 @@ export async function requestViaMainApi(messages: ChatMsg[], opts: RequestOption
   );
 
   try {
+    const ctx = getContext();
+    if (typeof ctx?.generateRaw !== 'function') {
+      throw new ApiError('当前 ST 版本不支持 generateRaw,无法跟随主 API');
+    }
     const content = (await ctx.generateRaw({ prompt: messages, responseLength: MAIN_API_RESPONSE_LENGTH }))?.trim();
     if (!content) throw new ApiError('主 API 返回空内容');
     // 与副 API 同口径:验收不过记失败,不记「成功」
