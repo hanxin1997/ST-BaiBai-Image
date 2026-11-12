@@ -1,0 +1,395 @@
+import { requireResponseCompletion } from '../runtime/response-completion.js';
+import {
+    assertHostChatCompletionsClient,
+    browserHostChatCompletionsClient,
+    buildHostGoogleGeneratePayload,
+    HOST_CHAT_COMPLETIONS_SOURCE_MAKERSUITE,
+} from '../../../shared/host-llm/chat-completions/client.js';
+import {
+    buildEffectiveReasoningConfig,
+    redactRequestSecrets,
+} from './request-inspection.js';
+import { resolveTaskReasoning } from '../reasoning-capabilities.js';
+import { isReasoningOutputVisible } from '../reasoning-config.js';
+
+function cloneJson(value) {
+    if (value === undefined) return undefined;
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch {
+        return undefined;
+    }
+}
+
+function normalizeContent(content) {
+    if (typeof content === 'string') {
+        return {
+            role: 'model',
+            parts: content ? [{ text: content }] : [],
+        };
+    }
+    if (!content || typeof content !== 'object') {
+        return {
+            role: 'model',
+            parts: [],
+        };
+    }
+    const cloned = cloneJson(content) || {};
+    cloned.role = cloned.role || 'model';
+    cloned.parts = Array.isArray(cloned.parts) ? cloned.parts : [];
+    return cloned;
+}
+
+function normalizeGoogleContents(message) {
+    const contents = Array.isArray(message?.providerPayload?.googleContents)
+        ? message.providerPayload.googleContents
+        : [];
+    if (contents.length) {
+        return contents
+            .map((content) => normalizeContent(content))
+            .filter((content) => Array.isArray(content.parts) && content.parts.length);
+    }
+    const content = message?.providerPayload?.googleContent;
+    const normalized = normalizeContent(content);
+    return normalized.parts.length ? [normalized] : [];
+}
+
+function buildMediaPartFromInlineData(inlineData = {}) {
+    const mimeType = String(inlineData?.mimeType || '').trim();
+    const data = String(inlineData?.data || '').trim();
+    if (!mimeType || !data) return null;
+    const dataUrl = `data:${mimeType};base64,${data}`;
+    if (mimeType.startsWith('image/')) {
+        return {
+            type: 'image_url',
+            image_url: {
+                url: dataUrl,
+            },
+        };
+    }
+    if (mimeType.startsWith('video/')) {
+        return {
+            type: 'video_url',
+            video_url: {
+                url: dataUrl,
+            },
+        };
+    }
+    if (mimeType.startsWith('audio/')) {
+        return {
+            type: 'audio_url',
+            audio_url: {
+                url: dataUrl,
+            },
+        };
+    }
+    return null;
+}
+
+function buildHostGoogleMessageFromContent(content = {}, index = 0) {
+    const normalized = normalizeContent(content);
+    if (!normalized.parts.length) return null;
+
+    const hostMessage = {
+        role: normalized.role === 'user' ? 'user' : 'assistant',
+        content: [],
+    };
+    const textSignature = normalized.parts.find((part) => (
+        !part?.thought
+        && typeof part?.text === 'string'
+        && typeof part?.thoughtSignature === 'string'
+        && part.thoughtSignature
+    ))?.thoughtSignature || '';
+    const toolCalls = [];
+
+    normalized.parts.forEach((part) => {
+        if (!part || typeof part !== 'object') return;
+        if (!part.thought && typeof part.text === 'string' && part.text) {
+            hostMessage.content.push({
+                type: 'text',
+                text: part.text,
+            });
+            return;
+        }
+        if (part.functionCall?.name) {
+            toolCalls.push({
+                id: String(part.functionCall.id || `st-google-tool-${index + 1}-${toolCalls.length + 1}`),
+                type: 'function',
+                function: {
+                    name: String(part.functionCall.name || ''),
+                    arguments: JSON.stringify(part.functionCall.args || {}),
+                },
+                ...(typeof part.thoughtSignature === 'string' && part.thoughtSignature
+                    ? { signature: part.thoughtSignature }
+                    : {}),
+            });
+            return;
+        }
+        const mediaPart = buildMediaPartFromInlineData(part.inlineData);
+        if (mediaPart) {
+            hostMessage.content.push(mediaPart);
+        }
+    });
+
+    if (toolCalls.length) {
+        hostMessage.content.push({
+            type: 'tool_calls',
+            tool_calls: toolCalls,
+        });
+    }
+    if (textSignature && hostMessage.content.some((part) => part?.type === 'text')) {
+        hostMessage.signature = textSignature;
+    }
+    if (!hostMessage.content.length) return null;
+    return hostMessage;
+}
+
+function buildHostGoogleMessages(task = {}) {
+    const sourceMessages = Array.isArray(task.messages) ? task.messages : [];
+    const messages = [];
+    sourceMessages.forEach((message) => {
+        if (!message || typeof message !== 'object') return;
+        const preservedContents = normalizeGoogleContents(message);
+        if (message.role === 'assistant' && preservedContents.length) {
+            preservedContents.forEach((content, index) => {
+                const hostMessage = buildHostGoogleMessageFromContent(content, index);
+                if (hostMessage) messages.push(hostMessage);
+            });
+            return;
+        }
+        const cloned = cloneJson(message) || {};
+        delete cloned.providerPayload;
+        messages.push(cloned);
+    });
+    const systemPrompt = typeof task.systemPrompt === 'string' ? task.systemPrompt : '';
+    if (systemPrompt.trim() && !(messages[0]?.role === 'system' && messages[0]?.content === systemPrompt)) {
+        messages.unshift({ role: 'system', content: systemPrompt });
+    }
+    return messages;
+}
+
+function getEventContent(event = {}) {
+    return normalizeContent(event?.responseContent || event?.candidates?.[0]?.content || '');
+}
+
+function extractVisibleText(content = {}) {
+    return (content.parts || [])
+        .filter((part) => !part?.thought && typeof part?.text === 'string' && part.text)
+        .map((part) => part.text)
+        .join('\n');
+}
+
+function extractThoughts(content = {}) {
+    return (content.parts || [])
+        .filter((part) => part?.thought && typeof part.text === 'string' && part.text.trim())
+        .map((part, index) => ({
+            label: `思考块 ${index + 1}`,
+            text: part.text.trim(),
+        }));
+}
+
+function extractFunctionCalls(content = {}) {
+    return (content.parts || [])
+        .map((part) => part?.functionCall || null)
+        .filter((item) => item?.name)
+        .map((item, index) => ({
+            id: item.id || `st-google-tool-${index + 1}`,
+            name: item.name,
+            arguments: JSON.stringify(item.args || {}),
+        }));
+}
+
+function mergeStreamText(previous, incoming) {
+    const next = String(incoming || '');
+    const current = String(previous || '');
+    if (!next) return current;
+    if (!current) return next;
+    if (next.startsWith(current)) return next;
+    if (current.endsWith(next)) return current;
+    return `${current}${next}`;
+}
+
+function mergeToolCalls(existing = [], incoming = []) {
+    const merged = Array.isArray(existing) ? [...existing] : [];
+    incoming.forEach((item) => {
+        const key = [item.id || '', item.name || '', item.arguments || ''].join('\u0000');
+        const found = merged.some((current) => (
+            [current.id || '', current.name || '', current.arguments || ''].join('\u0000') === key
+        ));
+        if (!found) merged.push(item);
+    });
+    return merged;
+}
+
+function buildProviderPayload(content) {
+    const normalized = normalizeContent(content);
+    return normalized.parts.length
+        ? {
+            googleContent: normalized,
+            googleContents: [normalized],
+        }
+        : undefined;
+}
+
+function emitStreamProgress(task, payload) {
+    if (typeof task.onStreamProgress !== 'function') return;
+    task.onStreamProgress({
+        ...(typeof payload.text === 'string' ? { text: payload.text } : {}),
+        ...(Array.isArray(payload.thoughts) ? { thoughts: payload.thoughts } : {}),
+        ...(Array.isArray(payload.toolCalls) ? { toolCalls: payload.toolCalls } : {}),
+        ...(payload.toolCallDraft ? { toolCallDraft: true } : {}),
+    });
+}
+
+function createGoogleStreamAccumulator(task, effectiveReasoning, config = {}, provider = 'sillytavern-google') {
+    let text = '';
+    let toolCalls = [];
+    let thoughts = [];
+    let finishReason;
+    let model = config.model || '';
+    const parts = [];
+
+    return {
+        accept(event = {}) {
+            model = event.model || event.modelVersion || model;
+            finishReason = event?.candidates?.[0]?.finishReason || finishReason;
+            const content = getEventContent(event);
+            if (content.parts.length) {
+                parts.push(...(cloneJson(content.parts) || []));
+            }
+            text = mergeStreamText(text, extractVisibleText(content));
+            toolCalls = mergeToolCalls(toolCalls, extractFunctionCalls(content));
+            const nextThoughts = isReasoningOutputVisible(effectiveReasoning) ? extractThoughts(content) : [];
+            if (nextThoughts.length) {
+                thoughts = nextThoughts;
+            }
+            emitStreamProgress(task, {
+                text,
+                thoughts,
+                ...(toolCalls.length ? { toolCalls, toolCallDraft: true } : {}),
+            });
+        },
+        result() {
+            const content = normalizeContent({
+                role: 'model',
+                parts: parts.length ? parts : (text ? [{ text }] : []),
+            });
+            if (!finishReason) {
+                console.warn('[SillyTavernGoogle] 流式回應未含 finishReason，事件與累積內容如下', {
+                    provider,
+                    model,
+                    text,
+                    partsCount: parts.length,
+                    toolCallsCount: toolCalls.length,
+                    thoughtsCount: thoughts.length,
+                });
+            }
+            return {
+                text,
+                toolCalls,
+                thoughts,
+                finishReason: requireResponseCompletion('google', finishReason, false, text),
+                model,
+                provider,
+                providerPayload: buildProviderPayload(content),
+            };
+        },
+    };
+}
+
+export class SillyTavernGoogleAdapter {
+    provider = 'sillytavern-google';
+    source = HOST_CHAT_COMPLETIONS_SOURCE_MAKERSUITE;
+
+    constructor(config, hostClient = browserHostChatCompletionsClient) {
+        this.config = config;
+        this.hostClient = assertHostChatCompletionsClient(hostClient);
+    }
+
+    buildMessages(task) {
+        return buildHostGoogleMessages(task);
+    }
+
+    buildPayload(
+        task,
+        effectiveReasoning = resolveTaskReasoning(this.provider, this.config, task.reasoning),
+    ) {
+        const reasoning = effectiveReasoning;
+        // SillyTavern's JSON wrapper omits stop reasons; SSE preserves the provider's terminal evidence.
+        const stream = true;
+        const messages = this.buildMessages(task);
+        const payload = buildHostGoogleGeneratePayload(this.config, task, messages, stream, this.source);
+        if (reasoning.mode === 'on') {
+            payload.reasoning_effort = reasoning.effort;
+            payload.include_reasoning = isReasoningOutputVisible(reasoning);
+        } else if (reasoning.mode === 'off') {
+            payload.reasoning_effort = 'min';
+            payload.include_reasoning = false;
+        } else {
+            payload.reasoning_effort = 'auto';
+            payload.include_reasoning = isReasoningOutputVisible(reasoning);
+        }
+        return payload;
+    }
+
+    async inspectRequest(task, options = {}) {
+        const effectiveReasoning = options.effectiveReasoning
+            || resolveTaskReasoning(this.provider, this.config, task.reasoning);
+        const payload = options.payload || this.buildPayload(task, effectiveReasoning);
+        const request = await this.hostClient.buildHostChatCompletionGenerateRequest(
+            payload,
+            true,
+        );
+        return this.buildRequestInspection(request, task, effectiveReasoning);
+    }
+
+    buildRequestInspection(
+        request,
+        task = {},
+        effectiveReasoning = resolveTaskReasoning(this.provider, this.config, task.reasoning),
+    ) {
+        const controlFields = {
+            ...(Object.hasOwn(request?.body || {}, 'reasoning_effort')
+                ? { reasoning_effort: request.body.reasoning_effort }
+                : {}),
+            ...(Object.hasOwn(request?.body || {}, 'include_reasoning')
+                ? { include_reasoning: request.body.include_reasoning }
+                : {}),
+        };
+        return {
+            provider: this.provider,
+            model: this.config.model,
+            transport: 'sillytavern-chat-completions',
+            request: redactRequestSecrets(request),
+            effectiveConfig: buildEffectiveReasoningConfig(task, {
+                reasoning: effectiveReasoning,
+                effort: request?.body?.reasoning_effort,
+                controlFields,
+            }),
+        };
+    }
+
+    async chat(task) {
+        const effectiveReasoning = resolveTaskReasoning(
+            this.provider,
+            this.config,
+            task.reasoning,
+        );
+        const payload = this.buildPayload(task, effectiveReasoning);
+        let requestInspection = null;
+        const onRequest = (request) => {
+            requestInspection = this.buildRequestInspection(request, task, effectiveReasoning);
+        };
+
+        try {
+            const accumulator = createGoogleStreamAccumulator(task, effectiveReasoning, this.config, this.provider);
+            await this.hostClient.streamHostChatCompletion(payload, event => accumulator.accept(event), { signal: task.signal, onRequest });
+            return { ...accumulator.result(), requestInspection };
+        } catch (error) {
+            if (requestInspection && error && typeof error === 'object') {
+                error.requestInspection = requestInspection;
+            }
+            throw error;
+        }
+    }
+}

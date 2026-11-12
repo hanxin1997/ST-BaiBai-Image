@@ -1,0 +1,1975 @@
+// gallery-cache.js
+// 画廊和缓存管理模块
+
+import { getContext } from "../../../../../../extensions.js";
+import { saveBase64AsFile } from "../../../../../../utils.js";
+import { getSharedDrawSettings } from './draw-settings.js';
+import { hasPreviewImage, DRAW_SLOT_COPY, PreviewStatus } from './image-record.js';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 常量
+// ═══════════════════════════════════════════════════════════════════════════
+
+const DB_NAME = 'xb_novel_draw_previews';
+const DB_STORE = 'previews';
+const DB_SELECTIONS_STORE = 'selections';
+const DB_VERSION = 3;
+const CACHE_TTL = 5 * 60 * 1000;
+const PREVIEW_CACHE_LIMIT = 64;
+const PREVIEW_OBJECT_URL_LIMIT = 128;
+const PREVIEW_PRELOAD_LIMIT = 128;
+const CACHE_SYNC_CHANNEL_NAME = 'xb_novel_draw_preview_changes';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 状态
+// ═══════════════════════════════════════════════════════════════════════════
+
+let db = null;
+let dbOpening = null;
+let galleryOverlayCreated = false;
+let currentGalleryData = null;
+
+const previewCache = new Map();
+const previewObjectUrlCache = new Map();
+const previewPreloadCache = new Map();
+const cacheChangeListeners = new Set();
+let cacheSyncChannel = null;
+
+// Tauritavern 等客戶端的 <img> 無法直連根相對 /user 路徑（自定義 origin），
+// 但其 fetch 可能走原生 HTTP 棧可達。監聽捕獲階段的圖片 error，僅對 /user/ 開頭的
+// 來源嘗試 fetch → blob 自救，救活存量已保存圖；不可達則快速失敗，不影響其他圖。
+const savedUrlFallbackInflight = new Set();
+if (typeof document !== 'undefined') {
+    document.addEventListener('error', (event) => {
+        const img = event.target;
+        if (!(img instanceof HTMLImageElement)) return;
+        const src = String(img.currentSrc || img.src || '');
+        if (!src.includes('/user/')) return;
+        if (img.dataset.xbSavedRetried === '1') return;
+        img.dataset.xbSavedRetried = '1';
+        if (savedUrlFallbackInflight.has(src)) return;
+        savedUrlFallbackInflight.add(src);
+        fetch(toAbsoluteMediaUrl(src))
+            .then((resp) => {
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                return resp.blob();
+            })
+            .then((blob) => {
+                img.src = URL.createObjectURL(blob);
+            })
+            .catch(() => {
+                img.classList.add('xb-saved-img-broken');
+            })
+            .finally(() => savedUrlFallbackInflight.delete(src));
+    }, true);
+}
+
+function storageWriteError(tx) { return tx.error || new Error(DRAW_SLOT_COPY.storageWriteFailed); }
+
+// 相對路徑補全為絕對 URL。Tauritavern 把手機 UI 裝在 about:srcdoc 跨域 iframe 內：
+// <img src="/user/..."> 會以 srcdoc 為基準解析成無效地址而裂圖；document.baseURI
+// 在 srcdoc 中繼承父文檔真實 URL，不受跨域限制，故以它為基準；parent.location 僅兜底。
+export function toAbsoluteMediaUrl(path) {
+    let raw = String(path || '').trim();
+    if (!raw || /^[a-z][a-z0-9+.-]*:/i.test(raw)) return raw;
+    // 舊數據可能存成無前導斜杠的 user/images/...，在 iframe 內會被解析成
+    // 相對於擴展目錄的錯誤地址；統一補成站點絕對路徑。
+    raw = raw.replace(/^(?:\.\.[\\/])*(user[\\/])/i, '/$1');
+    let base = '';
+    try {
+        if (typeof document !== 'undefined' && document.baseURI) base = document.baseURI;
+    } catch { /* srcdoc 跨域時 baseURI 仍可讀，極端情況下退化到 parent */ }
+    if (!base) {
+        try { base = String(window.parent?.location?.href || ''); } catch { /* 跨域封鎖 */ }
+    }
+    try {
+        return base ? new URL(raw, base).href : raw;
+    } catch {
+        return raw;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 持久化缩略图
+// ═══════════════════════════════════════════════════════════════════════════
+
+// 画廊分组封面只用 256px 缩略图（对齐 chatu8）：避免把整角色的原图 base64 经
+// postMessage 克隆进 iframe 造成内存峰值。缩略图随记录持久化，旧记录首次被
+// 索引时懒补建。任何失败都返回 null，绝不阻断主流程。
+const THUMB_MAX_DIM = 256;
+
+function normalizeImageDataUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    return raw.startsWith('data:') ? raw : `data:image/jpeg;base64,${raw}`;
+}
+
+export function createThumbnailDataUrl(base64) {
+    if (typeof Image === 'undefined' || typeof document === 'undefined') return Promise.resolve(null);
+    const dataUrl = normalizeImageDataUrl(base64);
+    if (!dataUrl) return Promise.resolve(null);
+    return new Promise((resolve) => {
+        const img = new Image();
+        let settled = false;
+        const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
+        img.onload = () => {
+            try {
+                const w0 = img.naturalWidth || img.width;
+                const h0 = img.naturalHeight || img.height;
+                if (!w0 || !h0) return finish(null);
+                const scale = Math.min(1, THUMB_MAX_DIM / Math.max(w0, h0));
+                const w = Math.max(1, Math.round(w0 * scale));
+                const h = Math.max(1, Math.round(h0 * scale));
+                const canvas = document.createElement('canvas');
+                canvas.width = w;
+                canvas.height = h;
+                const ctx = canvas.getContext('2d');
+                // JPEG 无 alpha 通道，先铺白底防止透明 PNG 变黑
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, w, h);
+                ctx.drawImage(img, 0, 0, w, h);
+                finish(canvas.toDataURL('image/jpeg', 0.7));
+            } catch {
+                finish(null);
+            }
+        };
+        img.onerror = () => finish(null);
+        img.src = dataUrl;
+    });
+}
+
+// JPEG 的 base64 魔數以 /9j/ 開頭。輸入可能帶 data: 前綴，也可能是純 base64
+// （後台任務路徑回傳的 PNG 不帶前綴），因此不能靠前綴判斷格式，直接嗅探內容。
+export function isJpegBase64(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return false;
+    const body = raw.startsWith('data:') ? raw.slice(raw.indexOf(',') + 1) : raw;
+    return body.startsWith('/9j/');
+}
+
+function convertWithDomImage(dataUrl, original, quality) {
+    if (typeof Image === 'undefined') return Promise.resolve(original);
+    return new Promise((resolve) => {
+        const img = new Image();
+        let settled = false;
+        const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
+        img.onload = () => {
+            try {
+                if (!img.naturalWidth && !img.width) return finish(original);
+                const canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth || img.width;
+                canvas.height = img.naturalHeight || img.height;
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return finish(original);
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, 0);
+                canvas.toBlob((blob) => {
+                    if (!blob) return finish(original);
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                        const out = String(reader.result || '');
+                        // 必須校驗真實 JPEG 前綴：iOS WebView 異常時可能回傳「data:,」空串
+                        finish(out.startsWith('data:image/jpeg') ? out : original);
+                    };
+                    reader.onerror = () => finish(original);
+                    reader.readAsDataURL(blob);
+                }, 'image/jpeg', Math.max(0.1, Math.min(1, Number(quality) || 0.8)));
+            } catch { finish(original); }
+        };
+        img.onerror = () => finish(original);
+        img.src = dataUrl;
+    });
+}
+
+// 主路徑用 createImageBitmap → 常規 canvas 2D → canvas.toBlob → FileReader：
+// TT 的 iOS WKWebView 對 OffscreenCanvas.convertToBlob 支持不全，會靜默失敗，
+// ImageBitmap 管線不解碼進 DOM，兼容性更好。
+async function convertViaImageBitmap(rawBase64, quality) {
+    if (typeof createImageBitmap !== 'function' || typeof document === 'undefined') {
+        console.warn('[gallery-cache] ImageBitmap 管線不可用（API 缺失）');
+        return null;
+    }
+    try {
+        const blob = base64ToBlob(rawBase64, 'image/png');
+        console.warn('[gallery-cache] ImageBitmap 管線：blob', blob.size, 'bytes，開始解碼');
+        const bitmap = await createImageBitmap(blob);
+        console.warn('[gallery-cache] ImageBitmap 解碼成功', bitmap.width, 'x', bitmap.height);
+        let out = null;
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = bitmap.width;
+            canvas.height = bitmap.height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return null;
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(bitmap, 0, 0);
+            out = await new Promise((resolve) => {
+                canvas.toBlob((jpegBlob) => {
+                    console.warn('[gallery-cache] toBlob 回調：', jpegBlob ? `${jpegBlob.size} bytes ${jpegBlob.type}` : 'null');
+                    if (!jpegBlob) return resolve(null);
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                        const dataUrl = String(reader.result || '');
+                        resolve(dataUrl.startsWith('data:image/jpeg') ? dataUrl : null);
+                    };
+                    reader.onerror = () => resolve(null);
+                    reader.readAsDataURL(jpegBlob);
+                }, 'image/jpeg', Math.max(0.1, Math.min(1, Number(quality) || 0.8)));
+            });
+        } finally {
+            bitmap.close?.();
+        }
+        return out;
+    } catch (e) {
+        console.warn('[gallery-cache] JPEG 轉換 ImageBitmap 管線失敗：', e?.message);
+        return null;
+    }
+}
+
+/** 將 data URL 重編碼成 JPEG，節省快取與伺服器空間；透明 PNG 先鋪白底。
+ *  已是 JPEG、或轉換失敗時回傳原值。永不 reject、永不掛起（iOS WebView 的
+ *  createImageBitmap/toBlob 回調可能永不觸發，必須加超時兜底）。 */
+export async function convertImageToJpeg(base64, quality = 0.8) {
+    if (typeof document === 'undefined') return base64;
+    const raw = String(base64 || '').trim();
+    // 不能沿用 normalizeImageDataUrl 包裝：它把無前綴數據一律標成 image/jpeg，
+    // 會讓純 base64 的 PNG 被誤判為「已轉換」而靜默跳過；mime 標註不影響解碼（瀏覽器按內容嗅探）。
+    if (!raw || isJpegBase64(raw)) return base64;
+    const CONVERT_TIMEOUT_MS = 10000;
+    try {
+        // 主路徑：createImageBitmap（TT/桌面都可用，且不進 DOM）
+        // 後台回傳的 base64 可能混入引號、URL 前綴、換行等雜質，atob 會拋
+        // InvalidCharacterError，統一剝離 base64 字符集以外的所有字符。
+        const pureBase64 = (raw.startsWith('data:') ? raw.slice(raw.indexOf(',') + 1) : raw)
+            .replace(/[^A-Za-z0-9+/=]/g, '');
+        if (!pureBase64) return base64;
+        const viaBitmap = await Promise.race([
+            convertViaImageBitmap(pureBase64, quality),
+            new Promise(resolve => setTimeout(() => resolve(null), CONVERT_TIMEOUT_MS)),
+        ]);
+        if (viaBitmap) return viaBitmap;
+        // 備援：DOM Image + 2D canvas + toBlob（用清洗後的 base64 重組 data URL）
+        const dataUrl = `data:image/png;base64,${pureBase64}`;
+        const viaDom = await Promise.race([
+            convertWithDomImage(dataUrl, base64, quality),
+            new Promise(resolve => setTimeout(() => resolve(base64), CONVERT_TIMEOUT_MS)),
+        ]);
+        if (viaDom !== base64) return viaDom;
+        console.warn('[gallery-cache] JPEG 轉換兩條管線均失敗，保留 PNG 原圖');
+        return base64;
+    } catch (e) {
+        console.warn('[gallery-cache] JPEG 轉換異常，保留 PNG 原圖：', e?.message);
+        return base64;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 图片显示 URL
+// ═══════════════════════════════════════════════════════════════════════════
+
+function parseBase64Image(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return null;
+    const match = raw.match(/^data:([^;]+);base64,(.*)$/i);
+    return {
+        mime: match?.[1] || 'image/png',
+        data: match ? match[2] : raw,
+    };
+}
+
+export function getBase64ImagePayload(value) {
+    const parsed = parseBase64Image(value);
+    if (!parsed?.data) return { base64: '', format: 'png' };
+    const format = parsed.mime === 'image/jpeg'
+        ? 'jpg'
+        : parsed.mime === 'image/webp'
+            ? 'webp'
+            : 'png';
+    return { base64: parsed.data, format };
+}
+
+function base64ToBlob(base64, mime) {
+    // 剝離 base64 字符集以外的所有雜質（換行、引號、URL 前綴等），atob 遇到即拋錯
+    const clean = String(base64 || '').replace(/[^A-Za-z0-9+/=]/g, '');
+    const binary = atob(clean);
+    const chunkSize = 8192;
+    const chunks = [];
+    for (let offset = 0; offset < binary.length; offset += chunkSize) {
+        const slice = binary.slice(offset, offset + chunkSize);
+        const bytes = new Uint8Array(slice.length);
+        for (let i = 0; i < slice.length; i++) {
+            bytes[i] = slice.charCodeAt(i);
+        }
+        chunks.push(bytes);
+    }
+    return new Blob(chunks, { type: mime });
+}
+
+function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(reader.error || new Error('blob_read_failed'));
+        reader.readAsDataURL(blob);
+    });
+}
+
+async function savedUrlToDataUrl(savedUrl = '') {
+    const url = toAbsoluteMediaUrl(savedUrl);
+    if (!url) return '';
+    if (/^data:[^;]+;base64,/i.test(url)) return url;
+    if (/^blob:/i.test(url)) {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('image_fetch_failed');
+        return blobToDataUrl(await response.blob());
+    }
+    if (/^https?:\/\//i.test(url) || url.startsWith('/')) {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('image_fetch_failed');
+        return blobToDataUrl(await response.blob());
+    }
+    return '';
+}
+
+function getObjectUrlCacheKey(imgId, base64) {
+    return String(imgId || '').trim() || `inline-${String(base64 || '').slice(0, 80)}`;
+}
+
+function isObjectUrlInUse(url) {
+    if (typeof document === 'undefined') return true;
+    return Array.from(document.images || []).some(img => img?.src === url);
+}
+
+function prunePreviewObjectUrls() {
+    if (previewObjectUrlCache.size <= PREVIEW_OBJECT_URL_LIMIT) return;
+    for (const [key, url] of previewObjectUrlCache.entries()) {
+        if (previewObjectUrlCache.size <= PREVIEW_OBJECT_URL_LIMIT) break;
+        if (isObjectUrlInUse(url)) continue;
+        try { URL.revokeObjectURL(url); } catch {}
+        previewObjectUrlCache.delete(key);
+    }
+}
+
+function prunePreviewPreloads() {
+    while (previewPreloadCache.size > PREVIEW_PRELOAD_LIMIT) {
+        const oldestKey = previewPreloadCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        const cached = previewPreloadCache.get(oldestKey);
+        if (cached?.img) {
+            try { cached.img.src = ''; } catch {}
+        }
+        previewPreloadCache.delete(oldestKey);
+    }
+}
+
+export function revokePreviewObjectUrl(imgId) {
+    const key = String(imgId || '').trim();
+    if (!key) return;
+    const url = previewObjectUrlCache.get(key);
+    if (url) {
+        try { URL.revokeObjectURL(url); } catch {}
+        previewObjectUrlCache.delete(key);
+    }
+    const preload = previewPreloadCache.get(key);
+    if (preload?.img) {
+        try { preload.img.src = ''; } catch {}
+    }
+    previewPreloadCache.delete(key);
+}
+
+export function clearPreviewObjectUrls() {
+    for (const url of previewObjectUrlCache.values()) {
+        try { URL.revokeObjectURL(url); } catch {}
+    }
+    previewObjectUrlCache.clear();
+    for (const cached of previewPreloadCache.values()) {
+        if (cached?.img) {
+            try { cached.img.src = ''; } catch {}
+        }
+    }
+    previewPreloadCache.clear();
+}
+
+export function getPreviewDisplayUrl(preview = {}) {
+    // 本地快取是完整原圖，優先使用：blob URL 同源且不受客戶端（如 Tauritavern
+    // 自定義 origin）對 /user 路徑可達性的影響；savedUrl 僅在本地數據缺失時兜底。
+    const parsed = parseBase64Image(preview?.base64);
+    if (!parsed?.data) return toAbsoluteMediaUrl(preview?.savedUrl || '');
+
+    if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function' || typeof atob !== 'function') {
+        return `data:${parsed.mime};base64,${parsed.data}`;
+    }
+
+    const key = getObjectUrlCacheKey(preview?.imgId, parsed.data);
+    const cached = previewObjectUrlCache.get(key);
+    if (cached) return cached;
+
+    try {
+        const url = URL.createObjectURL(base64ToBlob(parsed.data, parsed.mime));
+        previewObjectUrlCache.set(key, url);
+        prunePreviewObjectUrls();
+        return url;
+    } catch {
+        return `data:${parsed.mime};base64,${parsed.data}`;
+    }
+}
+
+function getPreviewPreloadKey(preview = {}, url = '') {
+    return String(preview?.imgId || '').trim() || String(url || '').trim();
+}
+
+export async function preloadPreviewDisplayUrl(preview = {}) {
+    const url = getPreviewDisplayUrl(preview);
+    if (!url || typeof Image === 'undefined') return false;
+
+    const key = getPreviewPreloadKey(preview, url);
+    const cached = previewPreloadCache.get(key);
+    if (cached) return cached.promise;
+
+    const img = new Image();
+    img.decoding = 'async';
+    const promise = new Promise((resolve) => {
+        const done = (ok) => resolve(ok);
+        img.onload = async () => {
+            if (typeof img.decode === 'function') {
+                try { await img.decode(); } catch {}
+            }
+            done(true);
+        };
+        img.onerror = () => {
+            previewPreloadCache.delete(key);
+            done(false);
+        };
+        img.src = url;
+    });
+    previewPreloadCache.set(key, { img, promise, timestamp: Date.now() });
+    prunePreviewPreloads();
+    return promise;
+}
+
+export async function warmSlotPreviewNeighbors(slotId, currentIndex = 0, range = 1) {
+    const previews = await getPreviewsBySlot(slotId).catch(() => []);
+    const successPreviews = previews.filter(hasPreviewImage);
+    if (successPreviews.length <= 1) return;
+
+    const start = Math.max(0, currentIndex - range);
+    const end = Math.min(successPreviews.length - 1, currentIndex + range);
+    for (let index = start; index <= end; index++) {
+        if (index === currentIndex) continue;
+        const preload = () => {
+            void preloadPreviewDisplayUrl(successPreviews[index]).catch(() => {});
+        };
+        if (typeof requestIdleCallback === 'function') {
+            requestIdleCallback(preload, { timeout: 500 });
+        } else {
+            setTimeout(preload, 0);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 内存缓存
+// ═══════════════════════════════════════════════════════════════════════════
+
+function prunePreviewCache() {
+    const now = Date.now();
+    for (const [slotId, cached] of previewCache.entries()) {
+        if (!cached || now - cached.timestamp >= CACHE_TTL) {
+            previewCache.delete(slotId);
+        }
+    }
+    while (previewCache.size > PREVIEW_CACHE_LIMIT) {
+        const oldestKey = previewCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        previewCache.delete(oldestKey);
+    }
+}
+
+function getCachedPreviews(slotId) {
+    prunePreviewCache();
+    const cached = previewCache.get(slotId);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        return cached.data;
+    }
+    return null;
+}
+
+function setCachedPreviews(slotId, data) {
+    prunePreviewCache();
+    previewCache.set(slotId, { data, timestamp: Date.now() });
+    prunePreviewCache();
+}
+
+function invalidateCache(slotId) {
+    if (slotId) {
+        previewCache.delete(slotId);
+    } else {
+        previewCache.clear();
+    }
+}
+
+function normalizeChangedSlotIds(slotIds) {
+    if (slotIds === null) return null;
+    return [...new Set((Array.isArray(slotIds) ? slotIds : [])
+        .map(slotId => String(slotId || '').trim())
+        .filter(Boolean))];
+}
+
+function notifyCacheChangeListeners(slotIds) {
+    for (const listener of cacheChangeListeners) {
+        try {
+            listener({ slotIds });
+        } catch (error) {
+            console.error('[GalleryCache] 处理跨标签页缓存变更失败:', error);
+        }
+    }
+}
+
+function ensureCacheSyncChannel() {
+    if (cacheSyncChannel || typeof globalThis.BroadcastChannel !== 'function') return cacheSyncChannel;
+    try {
+        cacheSyncChannel = new globalThis.BroadcastChannel(CACHE_SYNC_CHANNEL_NAME);
+        cacheSyncChannel.onmessage = (event) => {
+            if (event.data?.type !== 'invalidate') return;
+            const slotIds = normalizeChangedSlotIds(event.data.slotIds);
+            if (slotIds !== null && slotIds.length === 0) return;
+            if (slotIds === null) {
+                invalidateCache();
+            } else {
+                slotIds.forEach(invalidateCache);
+            }
+            notifyCacheChangeListeners(slotIds);
+        };
+    } catch {
+        cacheSyncChannel = null;
+    }
+    return cacheSyncChannel;
+}
+
+function publishCacheChange(slotIds) {
+    const normalized = normalizeChangedSlotIds(slotIds);
+    if (normalized !== null && normalized.length === 0) return;
+    try {
+        ensureCacheSyncChannel()?.postMessage({ type: 'invalidate', slotIds: normalized });
+    } catch {}
+}
+
+export function subscribeGalleryCacheChanges(listener) {
+    if (typeof listener !== 'function') return () => {};
+    cacheChangeListeners.add(listener);
+    ensureCacheSyncChannel();
+    return () => cacheChangeListeners.delete(listener);
+}
+
+function normalizePreviewBase64(value = '') {
+    const parsed = parseBase64Image(value);
+    if (!parsed?.data) return '';
+    return `data:${parsed.mime};base64,${parsed.data}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 工具函数
+// ═══════════════════════════════════════════════════════════════════════════
+
+function getChatCharacterName() {
+    const ctx = getContext();
+    if (ctx.groupId) return String(ctx.groups?.[ctx.groupId]?.id ?? 'group');
+    return String(ctx.characters?.[ctx.characterId]?.name || 'character');
+}
+
+function showToast(message, type = 'success', duration = 2500) {
+    const colors = { success: 'rgba(62,207,142,0.95)', error: 'rgba(248,113,113,0.95)', info: 'rgba(212,165,116,0.95)' };
+    const toast = document.createElement('div');
+    toast.textContent = message;
+    toast.style.cssText = `position:fixed;top:20px;left:50%;transform:translateX(-50%);background:${colors[type] || colors.info};color:#fff;padding:10px 20px;border-radius:8px;font-size:13px;z-index:99999;animation:fadeInOut ${duration/1000}s ease-in-out;max-width:80vw;text-align:center;word-break:break-all`;
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), duration);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// IndexedDB 操作
+// ═══════════════════════════════════════════════════════════════════════════
+
+function isDbValid() {
+    if (!db) return false;
+    try {
+        return db.objectStoreNames.length > 0;
+    } catch {
+        return false;
+    }
+}
+
+export async function openDB() {
+    if (dbOpening) return dbOpening;
+
+    if (isDbValid() && db.objectStoreNames.contains(DB_SELECTIONS_STORE)) {
+        return db;
+    }
+
+    if (db) {
+        try { db.close(); } catch {}
+        db = null;
+    }
+
+    dbOpening = new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+        request.onerror = () => {
+            dbOpening = null;
+            reject(request.error);
+        };
+
+        request.onsuccess = () => {
+            db = request.result;
+            db.onclose = () => { db = null; };
+            db.onversionchange = () => { db.close(); db = null; };
+            dbOpening = null;
+            resolve(db);
+        };
+
+        request.onupgradeneeded = (e) => {
+            const database = e.target.result;
+            if (!database.objectStoreNames.contains(DB_STORE)) {
+                const store = database.createObjectStore(DB_STORE, { keyPath: 'imgId' });
+                ['messageId', 'chatId', 'timestamp', 'slotId', 'characterName'].forEach(idx => store.createIndex(idx, idx));
+            } else {
+                const store = e.target.transaction.objectStore(DB_STORE);
+                ['messageId', 'chatId', 'timestamp', 'slotId', 'characterName'].forEach((idx) => {
+                    if (!store.indexNames.contains(idx)) {
+                        store.createIndex(idx, idx);
+                    }
+                });
+            }
+            if (!database.objectStoreNames.contains(DB_SELECTIONS_STORE)) {
+                database.createObjectStore(DB_SELECTIONS_STORE, { keyPath: 'slotId' });
+            }
+        };
+    });
+
+    return dbOpening;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 选中状态管理
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function setSlotSelection(slotId, imgId) {
+    const database = await openDB();
+    if (!database.objectStoreNames.contains(DB_SELECTIONS_STORE)) return;
+    return new Promise((resolve, reject) => {
+        try {
+            const tx = database.transaction(DB_SELECTIONS_STORE, 'readwrite');
+            tx.objectStore(DB_SELECTIONS_STORE).put({ slotId, selectedImgId: imgId, timestamp: Date.now() });
+            tx.oncomplete = () => {
+                publishCacheChange([slotId]);
+                resolve();
+            };
+            tx.onerror = tx.onabort = () => reject(storageWriteError(tx));
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+export async function getSlotSelection(slotId) {
+    const database = await openDB();
+    if (!database.objectStoreNames.contains(DB_SELECTIONS_STORE)) return null;
+    return new Promise((resolve, reject) => {
+        try {
+            const tx = database.transaction(DB_SELECTIONS_STORE, 'readonly');
+            const request = tx.objectStore(DB_SELECTIONS_STORE).get(slotId);
+            request.onsuccess = () => resolve(request.result?.selectedImgId || null);
+            request.onerror = () => reject(request.error);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+export async function exportPortablePreviewsForSlots(slotIds = []) {
+    const slots = [...new Set((Array.isArray(slotIds) ? slotIds : [])
+        .map((slotId) => String(slotId || '').trim())
+        .filter(Boolean))];
+    const previews = [];
+    const selections = [];
+    const skipped = [];
+    for (const slotId of slots) {
+        const display = await getDisplayPreviewForSlot(slotId).catch(() => null);
+        const preview = display?.preview || null;
+        const imgId = String(preview?.imgId || '').trim();
+        if (!imgId) {
+            skipped.push({ slotId, imgId: '', reason: 'image_preview_missing' });
+            continue;
+        }
+        let base64 = normalizePreviewBase64(preview.base64);
+        if (!base64 && preview.savedUrl) {
+            base64 = await savedUrlToDataUrl(preview.savedUrl).catch(() => '');
+        }
+        if (!base64) {
+            skipped.push({ slotId, imgId, reason: 'image_data_missing' });
+            continue;
+        }
+        previews.push({
+            imgId,
+            slotId,
+            messageId: String(preview.messageId || ''),
+            chatId: String(preview.chatId || ''),
+            characterName: String(preview.characterName || ''),
+            source: String(preview.source || ''),
+            bookId: String(preview.bookId || ''),
+            bookTitle: String(preview.bookTitle || ''),
+            chapterPath: String(preview.chapterPath || ''),
+            chapterTitle: String(preview.chapterTitle || ''),
+            base64,
+            tags: String(preview.tags || ''),
+            title: String(preview.title || ''),
+            positive: String(preview.positive || ''),
+            status: preview.status === 'failed' ? 'failed' : 'success',
+            errorType: preview.errorType || null,
+            errorMessage: preview.errorMessage || null,
+            characterPrompts: preview.characterPrompts || null,
+            negativePrompt: preview.negativePrompt || null,
+            timestamp: Number(preview.timestamp) || Date.now(),
+        });
+        selections.push({ slotId, selectedImgId: imgId });
+    }
+    return { slots, previews, selections, skipped };
+}
+
+export async function importPortablePreviews(previews = [], selections = [], options = {}) {
+    const database = await openDB();
+    const bookId = String(options.bookId || '').trim();
+    const bookTitle = String(options.bookTitle || '').trim();
+    const records = (Array.isArray(previews) ? previews : [])
+        .map((preview) => ({
+            ...preview,
+            imgId: String(preview?.imgId || '').trim(),
+            slotId: String(preview?.slotId || preview?.imgId || '').trim(),
+            bookId: bookId || String(preview?.bookId || ''),
+            bookTitle: bookTitle || String(preview?.bookTitle || ''),
+            base64: normalizePreviewBase64(preview?.base64),
+            timestamp: Number(preview?.timestamp) || Date.now(),
+            savedUrl: null,
+        }))
+        .filter((preview) => preview.imgId && preview.slotId && preview.base64);
+    const selectionRows = (Array.isArray(selections) ? selections : [])
+        .map((selection) => ({
+            slotId: String(selection?.slotId || '').trim(),
+            selectedImgId: String(selection?.selectedImgId || '').trim(),
+            timestamp: Date.now(),
+        }))
+        .filter((selection) => selection.slotId && selection.selectedImgId);
+    if (!records.length && !selectionRows.length) return { importedPreviews: 0, importedSelections: 0 };
+
+    await new Promise((resolve, reject) => {
+        try {
+            const stores = [DB_STORE];
+            if (database.objectStoreNames.contains(DB_SELECTIONS_STORE)) stores.push(DB_SELECTIONS_STORE);
+            const tx = database.transaction(stores, 'readwrite');
+            const previewStore = tx.objectStore(DB_STORE);
+            records.forEach((record) => previewStore.put(record));
+            if (stores.includes(DB_SELECTIONS_STORE)) {
+                const selectionStore = tx.objectStore(DB_SELECTIONS_STORE);
+                selectionRows.forEach((selection) => selectionStore.put(selection));
+            }
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        } catch (error) {
+            reject(error);
+        }
+    });
+    const changedSlotIds = [...new Set([
+        ...records.map(record => record.slotId),
+        ...selectionRows.map(selection => selection.slotId),
+    ])];
+    records.forEach((record) => invalidateCache(record.slotId));
+    publishCacheChange(changedSlotIds);
+    return {
+        importedPreviews: records.length,
+        importedSelections: selectionRows.length,
+    };
+}
+
+export async function clearSlotSelection(slotId) {
+    const database = await openDB();
+    if (!database.objectStoreNames.contains(DB_SELECTIONS_STORE)) return;
+    return new Promise((resolve, reject) => {
+        try {
+            const tx = database.transaction(DB_SELECTIONS_STORE, 'readwrite');
+            tx.objectStore(DB_SELECTIONS_STORE).delete(slotId);
+            tx.oncomplete = () => {
+                publishCacheChange([slotId]);
+                resolve();
+            };
+            tx.onerror = () => reject(tx.error);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 预览存储
+// ═══════════════════════════════════════════════════════════════════════════
+
+export async function storePreview(opts) {
+    const {
+        imgId,
+        slotId,
+        messageId,
+        base64 = null,
+        tags,
+        title = '',
+        positive,
+        savedUrl = null,
+        status = PreviewStatus.SUCCESS,
+        errorType = null,
+        errorMessage = null,
+        characterPrompts = null,
+        negativePrompt = null,
+        source = '',
+        chatId = '',
+        characterName = '',
+        bookId = '',
+        bookTitle = '',
+        chapterPath = '',
+        chapterTitle = '',
+        presetId = '',
+        presetName = '',
+        vibeNames = '',
+        continuityChars = null,
+        swipeIndex = null,
+    } = opts;
+    const database = await openDB();
+    const ctx = getContext();
+    const resolvedChatId = String(chatId || ctx.chatId || (ctx.characterId || 'unknown'));
+    const resolvedCharacterName = String(characterName || getChatCharacterName());
+    const resolvedSlotId = slotId || imgId;
+
+    // 開啟「生成後存成 JPEG」時自動把原圖轉成 JPEG（節省快取/伺服器空間，PNG→JPEG 約縮 80-90%）
+    let workingBase64 = base64;
+    if (workingBase64) {
+        try {
+            const settings = getSharedDrawSettings();
+            if (settings?.saveAsJpeg) {
+                const converted = await convertImageToJpeg(workingBase64, settings.jpegQuality);
+                if (converted && converted !== workingBase64) {
+                    const convertedBody = converted.startsWith('data:') ? converted.split(',')[1] : converted;
+                    const originalBody = workingBase64.startsWith('data:') ? workingBase64.split(',')[1] : workingBase64;
+                    const ratio = Math.round((atob(convertedBody.replace(/[^A-Za-z0-9+/=]/g, '')).length
+                        / atob(originalBody.replace(/[^A-Za-z0-9+/=]/g, '')).length) * 100);
+                    console.debug('[gallery-cache] storePreview JPEG 轉換成功，', ratio, '%');
+                    workingBase64 = converted;
+                } else {
+                    // 解碼失敗／畫布異常時 convertImageToJpeg 會原樣退回，這裡必須顯式提示，
+                    // 否則用戶勾了開關卻靜默拿到 PNG，無從排查。
+                    console.warn('[gallery-cache] storePreview JPEG 轉換未生效，保留 PNG 原圖');
+                    window.dispatchEvent(new CustomEvent('xb-draw-toast', {
+                        detail: { message: 'JPEG 转换失败（两条管线都没出图），本图保留 PNG 原图', type: 'warning' },
+                    }));
+                }
+            }
+        } catch (e) {
+            console.warn('[gallery-cache] JPEG 轉換失敗，保留原圖：', e?.message);
+            window.dispatchEvent(new CustomEvent('xb-draw-toast', {
+                detail: { message: `JPEG 转换异常：${e?.message || e}`, type: 'warning' },
+            }));
+        }
+    }
+
+    // 有新原图时顺手生成持久化缩略图；无原图的状态更新保留旧缩略图
+    let thumbBase64 = workingBase64 ? await createThumbnailDataUrl(workingBase64) : null;
+
+    return new Promise((resolve, reject) => {
+        try {
+            const tx = database.transaction(DB_STORE, 'readwrite');
+            const store = tx.objectStore(DB_STORE);
+            const getReq = store.get(imgId);
+            getReq.onsuccess = () => {
+                const previous = getReq.result;
+                if (!thumbBase64 && previous?.thumbBase64) thumbBase64 = previous.thumbBase64;
+                store.put({
+                    imgId,
+                    slotId: resolvedSlotId,
+                    messageId,
+                    chatId: resolvedChatId,
+                    characterName: resolvedCharacterName,
+                    source,
+                    bookId,
+                    bookTitle,
+                    chapterPath,
+                    chapterTitle,
+                    base64: workingBase64,
+                    thumbBase64,
+                    tags,
+                    title: String(title || ''),
+                    positive,
+                    savedUrl,
+                    status,
+                    errorType,
+                    errorMessage,
+                    characterPrompts,
+                    negativePrompt,
+                    presetId: String(presetId || ''),
+                    presetName: String(presetName || ''),
+                    vibeNames: String(vibeNames || ''),
+                    continuityChars: Array.isArray(continuityChars) ? continuityChars : null,
+                    swipeIndex: Number.isFinite(Number(swipeIndex)) ? Number(swipeIndex) : null,
+                    timestamp: Date.now()
+                });
+            };
+            getReq.onerror = () => reject(getReq.error);
+            tx.oncomplete = () => {
+                invalidateCache(resolvedSlotId);
+                publishCacheChange([resolvedSlotId]);
+                // 回傳最終存儲的 base64（含 JPEG 轉換結果），讓聊天卡的 displayUrl 與快取一致，
+                // 避免消息內嵌原圖 PNG 而快取是 JPEG 的「格式分裂」。
+                resolve(workingBase64);
+            };
+            tx.onerror = tx.onabort = () => reject(storageWriteError(tx));
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+export async function storeFailedPlaceholder(opts) {
+    return storePreview({
+        imgId: opts.imgId || `failed-${opts.slotId}-${Date.now()}`,
+        slotId: opts.slotId,
+        messageId: opts.messageId,
+        source: opts.source || '',
+        chatId: opts.chatId || '',
+        characterName: opts.characterName || '',
+        bookId: opts.bookId || '',
+        bookTitle: opts.bookTitle || '',
+        chapterPath: opts.chapterPath || '',
+        chapterTitle: opts.chapterTitle || '',
+        base64: null,
+        tags: opts.tags,
+        title: opts.title || '',
+        positive: opts.positive,
+        status: 'failed',
+        errorType: opts.errorType,
+        errorMessage: opts.errorMessage,
+        characterPrompts: opts.characterPrompts ?? null,
+        negativePrompt: opts.negativePrompt ?? null,
+        presetId: opts.presetId || '',
+        presetName: opts.presetName || '',
+        vibeNames: opts.vibeNames || '',
+    });
+}
+
+export async function getPreview(imgId) {
+    const database = await openDB();
+    return new Promise((resolve, reject) => {
+        try {
+            const tx = database.transaction(DB_STORE, 'readonly');
+            const request = tx.objectStore(DB_STORE).get(imgId);
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+/** 取所有預覽的輕量版本，用於批量管理網格；對缺 thumbBase64 的舊記錄懶補建 */
+export async function getAllPreviewsLight() {
+    const database = await openDB();
+    const allRaw = await new Promise((resolve, reject) => {
+        try {
+            const tx = database.transaction(DB_STORE, 'readonly');
+            const store = tx.objectStore(DB_STORE);
+            const request = store.getAll();
+            request.onsuccess = () => resolve(request.result || []);
+            request.onerror = () => reject(request.error);
+        } catch (e) { reject(e); }
+    });
+    // 懶補建：舊記錄可能有 base64 但缺 thumbBase64（256px 縮略圖首次訪問時生成）
+    for (const r of allRaw) {
+        if (r && r.imgId && !r.thumbBase64 && r.base64) {
+            const thumb = await createThumbnailDataUrl(r.base64);
+            if (thumb) {
+                await persistThumbnailQuiet(r.imgId, thumb);
+                r.thumbBase64 = thumb;
+            }
+        }
+    }
+    return allRaw
+        .filter((r) => r && r.imgId)
+        .map((r) => ({
+            imgId: String(r.imgId),
+            thumbBase64: r.thumbBase64 || null,
+            savedUrl: r.savedUrl || '',
+            characterName: String(r.characterName || ''),
+            slotId: String(r.slotId || ''),
+            timestamp: Number(r.timestamp) || 0,
+        }))
+        .sort((a, b) => b.timestamp - a.timestamp);
+}
+
+/** 把缓存里仍是 PNG 的旧图批量转成 JPEG。「生成後存 JPEG」开关只管新图，旧图需手动触发。
+ *  每张独立事务逐个写回，失败的保留原图继续下一张；onProgress(done, total) 用于进度提示。 */
+export async function convertLegacyPreviewsToJpeg({ quality = 0.8, onProgress } = {}) {
+    const database = await openDB();
+    const stats = { total: 0, converted: 0, failed: 0, savedBytes: 0 };
+    const allRaw = await new Promise((resolve, reject) => {
+        try {
+            const tx = database.transaction(DB_STORE, 'readonly');
+            const request = tx.objectStore(DB_STORE).getAll();
+            request.onsuccess = () => resolve(request.result || []);
+            request.onerror = () => reject(request.error);
+        } catch (e) { reject(e); }
+    });
+    const targets = allRaw.filter((r) => r?.imgId && r.base64 && !isJpegBase64(r.base64));
+    stats.total = targets.length;
+    let done = 0;
+    for (const record of targets) {
+        try {
+            const originalBody = (record.base64.startsWith('data:') ? record.base64.split(',')[1] : record.base64)
+                .replace(/[^A-Za-z0-9+/=]/g, '');
+            const originalBytes = atob(originalBody).length;
+            const converted = await convertImageToJpeg(record.base64, quality);
+            if (converted && converted !== record.base64) {
+                const convertedBody = (converted.startsWith('data:') ? converted.split(',')[1] : converted)
+                    .replace(/[^A-Za-z0-9+/=]/g, '');
+                const convertedBytes = atob(convertedBody).length;
+                record.base64 = converted;
+                const thumb = await createThumbnailDataUrl(converted);
+                if (thumb) record.thumbBase64 = thumb;
+                await new Promise((resolve, reject) => {
+                    try {
+                        const tx = database.transaction(DB_STORE, 'readwrite');
+                        tx.objectStore(DB_STORE).put(record);
+                        tx.oncomplete = () => {
+                            invalidateCache(record.slotId);
+                            resolve();
+                        };
+                        tx.onerror = tx.onabort = () => reject(storageWriteError(tx));
+                    } catch (e) { reject(e); }
+                });
+                stats.converted++;
+                stats.savedBytes += Math.max(0, originalBytes - convertedBytes);
+            }
+        } catch {
+            stats.failed++;
+        }
+        done++;
+        try { onProgress?.(done, stats.total); } catch { /* 进度回调失败不影响转换 */ }
+    }
+    if (stats.converted) publishCacheChange([]);
+    return stats;
+}
+
+export async function getPreviewsBySlot(slotId) {
+    const cached = getCachedPreviews(slotId);
+    if (cached) return cached;
+
+    const database = await openDB();
+    return new Promise((resolve, reject) => {
+        try {
+            const tx = database.transaction(DB_STORE, 'readonly');
+            const store = tx.objectStore(DB_STORE);
+
+            const processResults = (results) => {
+                results.sort((a, b) => b.timestamp - a.timestamp);
+                setCachedPreviews(slotId, results);
+                resolve(results);
+            };
+
+            if (store.indexNames.contains('slotId')) {
+                const request = store.index('slotId').getAll(slotId);
+                request.onsuccess = () => {
+                    if (request.result?.length) {
+                        processResults(request.result);
+                    } else {
+                        const legacyRequest = store.get(slotId);
+                        legacyRequest.onsuccess = () => {
+                            const legacy = legacyRequest.result;
+                            const results = legacy && (legacy.slotId === slotId || legacy.imgId === slotId || (!legacy.slotId && legacy.imgId === slotId))
+                                ? [legacy]
+                                : [];
+                            processResults(results);
+                        };
+                        legacyRequest.onerror = () => reject(legacyRequest.error);
+                    }
+                };
+                request.onerror = () => reject(request.error);
+            } else {
+                const results = [];
+                store.openCursor().onsuccess = (event) => {
+                    const cursor = event.target.result;
+                    if (!cursor) {
+                        processResults(results);
+                        return;
+                    }
+                    const record = cursor.value;
+                    if (record?.slotId === slotId || record?.imgId === slotId) {
+                        results.push(record);
+                    }
+                    cursor.continue();
+                };
+                tx.onerror = () => reject(tx.error);
+            }
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+export async function getDisplayPreviewForSlot(slotId) {
+    const previews = await getPreviewsBySlot(slotId);
+    const selectedImgId = await getSlotSelection(slotId);
+    if (!previews.length) return { preview: null, selectedImgId, historyCount: 0, hasData: false, isFailed: false };
+
+    const successPreviews = previews.filter(hasPreviewImage);
+    const failedPreviews = previews.filter(p => !hasPreviewImage(p));
+    const asFailure = (preview) => ({
+        preview,
+        selectedImgId,
+        historyCount: successPreviews.length,
+        hasData: false,
+        isFailed: true,
+        isPending: preview?.status === PreviewStatus.PENDING || preview?.status === PreviewStatus.UNKNOWN,
+        failedInfo: {
+            tags: preview?.tags || '',
+            positive: preview?.positive || '',
+            errorType: preview?.errorType,
+            errorMessage: preview?.errorMessage,
+        },
+    });
+
+    if (successPreviews.length === 0) {
+        const manual = previews.find(p => p?.status === PreviewStatus.MANUAL);
+        if (manual) {
+            return { preview: manual, selectedImgId, historyCount: 0, hasData: false,
+                isFailed: false, isManual: true,
+                failedInfo: { tags: manual.tags || '', positive: manual.positive || '' } };
+        }
+        return asFailure(failedPreviews[0]);
+    }
+
+    if (selectedImgId) {
+        const selectedFailure = failedPreviews.find(p => p.imgId === selectedImgId);
+        if (selectedFailure) return asFailure(selectedFailure);
+        const currentIndex = successPreviews.findIndex(p => p.imgId === selectedImgId);
+        if (currentIndex >= 0) {
+            return { preview: successPreviews[currentIndex], selectedImgId, currentIndex, historyCount: successPreviews.length, hasData: true, isFailed: false };
+        }
+    }
+
+    return { preview: successPreviews[0], selectedImgId, currentIndex: 0, historyCount: successPreviews.length, hasData: true, isFailed: false };
+}
+
+// All card editors update the selected record, including interrupted attempts.
+// This transaction preserves fields unrelated to the edit and never reports a
+// successful save after an aborted transaction.
+export async function updatePreviewRecord(imgId, changes) {
+    const database = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = database.transaction(DB_STORE, 'readwrite');
+        const store = tx.objectStore(DB_STORE);
+        let updated;
+        let failure;
+        const request = store.get(imgId);
+        request.onsuccess = () => {
+            if (!request.result) {
+                failure = new Error(DRAW_SLOT_COPY.missingRecord);
+                tx.abort();
+                return;
+            }
+            updated = { ...request.result, ...changes, imgId: request.result.imgId, slotId: request.result.slotId };
+            store.put(updated);
+        };
+        tx.oncomplete = () => {
+            invalidateCache(updated.slotId);
+            publishCacheChange([updated.slotId]);
+            resolve(updated);
+        };
+        tx.onerror = tx.onabort = () => reject(failure || storageWriteError(tx));
+    });
+}
+
+export async function getCardPreview({ imgId, slotId }) {
+    const record = imgId ? await getPreview(imgId) : null;
+    if (record?.slotId === slotId) return record;
+    return (await getDisplayPreviewForSlot(slotId)).preview;
+}
+
+/**
+ * 画面记忆（上镜锚点）数据源：当前聊天、目标楼层之前、当前分支上成功生成的图片记录。
+ * 删楼/切分支后锚点自然失效——记录随图删、跨分支不读取，不再单独维护历史系统。
+ */
+export async function getContinuityImageRecords({ chatId, beforeMessageId, swipeIndex }) {
+    const database = await openDB();
+    const wantedChatId = String(chatId ?? '');
+    const before = Number(beforeMessageId);
+    const wantedSwipe = Number(swipeIndex);
+    return new Promise((resolve, reject) => {
+        try {
+            const records = [];
+            const tx = database.transaction(DB_STORE, 'readonly');
+            const request = tx.objectStore(DB_STORE).openCursor();
+            request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) return;
+                const record = cursor.value;
+                cursor.continue();
+                if (!record || record.status !== 'success') return;
+                if (String(record.chatId || '') !== wantedChatId) return;
+                const messageId = Number(record.messageId);
+                if (!Number.isFinite(messageId) || !Number.isFinite(before) || messageId >= before) return;
+                if (Number.isFinite(wantedSwipe) && Number(record.swipeIndex) !== wantedSwipe) return;
+                if (!Array.isArray(record.continuityChars) || record.continuityChars.length === 0) return;
+                records.push({
+                    messageId,
+                    timestamp: Number(record.timestamp) || 0,
+                    continuityChars: record.continuityChars,
+                });
+            };
+            request.onerror = () => reject(request.error);
+            tx.oncomplete = () => resolve(records.sort((a, b) =>
+                a.messageId - b.messageId || a.timestamp - b.timestamp));
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+export async function getLatestPreviewForSlot(slotId) {
+    const result = await getDisplayPreviewForSlot(slotId);
+    return result.preview;
+}
+
+export async function deletePreview(imgId) {
+    const database = await openDB();
+    const preview = await getPreview(imgId);
+    const slotId = preview?.slotId;
+
+    return new Promise((resolve, reject) => {
+        try {
+            const tx = database.transaction([DB_STORE, DB_SELECTIONS_STORE], 'readwrite');
+            tx.objectStore(DB_STORE).delete(imgId);
+            if (slotId) {
+                const selections = tx.objectStore(DB_SELECTIONS_STORE);
+                const selected = selections.get(slotId);
+                selected.onsuccess = () => {
+                    if (selected.result?.selectedImgId === imgId) selections.delete(slotId);
+                };
+            }
+            tx.oncomplete = () => {
+                revokePreviewObjectUrl(imgId);
+                if (slotId) invalidateCache(slotId);
+                publishCacheChange(slotId ? [slotId] : []);
+                resolve();
+            };
+            tx.onerror = tx.onabort = () => reject(storageWriteError(tx));
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+export async function deleteFailedRecordsForSlot(slotId) {
+    const previews = await getPreviewsBySlot(slotId);
+    const failedRecords = previews.filter(p => p.status === 'failed' || (!p.base64 && !p.savedUrl));
+    for (const record of failedRecords) {
+        await deletePreview(record.imgId);
+    }
+}
+
+export async function updatePreviewSavedUrl(imgId, savedUrl) {
+    const database = await openDB();
+    const preview = await getPreview(imgId);
+    if (!preview) return;
+
+    preview.savedUrl = savedUrl;
+    // 保留本地原圖：Tauritavern 等自定義 origin 客戶端無法用 <img> 直連 /user 路徑，
+    // 清掉 base64 後已存圖在畫廊必裂；空間由快取過期清理負責，不在保存時主動剝離。
+
+    return new Promise((resolve, reject) => {
+        try {
+            const tx = database.transaction(DB_STORE, 'readwrite');
+            tx.objectStore(DB_STORE).put(preview);
+            tx.oncomplete = () => {
+                revokePreviewObjectUrl(imgId);
+                invalidateCache(preview.slotId);
+                publishCacheChange([preview.slotId]);
+                resolve();
+            };
+            tx.onerror = () => reject(tx.error);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+export async function savePreviewImage(imgId, filePrefix = 'draw') {
+    const preview = await getPreview(imgId);
+    if (!preview) throw new Error('图片缓存不存在');
+    if (preview.savedUrl) return preview.savedUrl;
+    if (!preview.base64) throw new Error('图片缓存不存在');
+    const charName = preview.characterName || getChatCharacterName();
+    const image = getBase64ImagePayload(preview.base64);
+    const url = await saveBase64AsFile(image.base64, charName, `${filePrefix}_${imgId}`, image.format);
+    await updatePreviewSavedUrl(imgId, url);
+    return url;
+}
+
+export async function getCacheStats() {
+    const database = await openDB();
+    return new Promise((resolve) => {
+        try {
+            const tx = database.transaction(DB_STORE, 'readonly');
+            const store = tx.objectStore(DB_STORE);
+            const countReq = store.count();
+            let totalSize = 0, successCount = 0, failedCount = 0;
+
+            store.openCursor().onsuccess = (e) => {
+                const cursor = e.target.result;
+                if (cursor) { 
+                    totalSize += (cursor.value.base64?.length || 0) * 0.75;
+                    if (cursor.value.status === 'failed' || (!cursor.value.base64 && !cursor.value.savedUrl)) {
+                        failedCount++;
+                    } else {
+                        successCount++;
+                    }
+                    cursor.continue(); 
+                }
+            };
+            tx.oncomplete = () => resolve({ 
+                count: countReq.result || 0, 
+                successCount,
+                failedCount,
+                sizeBytes: Math.round(totalSize), 
+                sizeMB: (totalSize / 1024 / 1024).toFixed(2) 
+            });
+        } catch {
+            resolve({ count: 0, successCount: 0, failedCount: 0, sizeBytes: 0, sizeMB: '0' });
+        }
+    });
+}
+
+export async function clearExpiredCache(cacheDays = 3) {
+    const cutoff = Date.now() - cacheDays * 24 * 60 * 60 * 1000;
+    const database = await openDB();
+    let cleaned = 0;
+
+    return new Promise((resolve) => {
+        try {
+            const tx = database.transaction(DB_STORE, 'readwrite');
+            const store = tx.objectStore(DB_STORE);
+            store.openCursor().onsuccess = (e) => {
+                const cursor = e.target.result;
+                if (cursor) { 
+                    const record = cursor.value;
+                    const isExpiredUnsaved = record.timestamp < cutoff && !record.savedUrl;
+                    const isFailed = record.status === 'failed' || (!record.base64 && !record.savedUrl);
+                    const shouldTrimSavedBase64 = !!record.savedUrl && !!record.base64;
+
+                    if (isExpiredUnsaved || (isFailed && record.timestamp < cutoff)) { 
+                        revokePreviewObjectUrl(record.imgId);
+                        cursor.delete(); 
+                        cleaned++; 
+                        cursor.continue(); 
+                        return;
+                    }
+
+                    if (shouldTrimSavedBase64) {
+                        record.base64 = null;
+                        revokePreviewObjectUrl(record.imgId);
+                        cursor.update(record);
+                        cleaned++;
+                    }
+
+                    cursor.continue(); 
+                }
+            };
+            tx.oncomplete = () => {
+                invalidateCache();
+                if (cleaned > 0) publishCacheChange(null);
+                resolve(cleaned);
+            };
+        } catch {
+            resolve(0);
+        }
+    });
+}
+
+export async function clearAllCache() {
+    const database = await openDB();
+    return new Promise((resolve, reject) => {
+        try {
+            const stores = [DB_STORE];
+            if (database.objectStoreNames.contains(DB_SELECTIONS_STORE)) {
+                stores.push(DB_SELECTIONS_STORE);
+            }
+            const tx = database.transaction(stores, 'readwrite');
+            tx.objectStore(DB_STORE).clear();
+            if (stores.length > 1) {
+                tx.objectStore(DB_SELECTIONS_STORE).clear();
+            }
+            tx.oncomplete = () => {
+                clearPreviewObjectUrls();
+                invalidateCache();
+                publishCacheChange(null);
+                resolve();
+            };
+            tx.onerror = () => reject(tx.error);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+export async function getGallerySummary() {
+    const database = await openDB();
+    return new Promise((resolve) => {
+        try {
+            const tx = database.transaction(DB_STORE, 'readonly');
+            const store = tx.objectStore(DB_STORE);
+            const summary = {};
+
+            store.openCursor().onsuccess = (event) => {
+                const cursor = event.target.result;
+                if (!cursor) {
+                    resolve(summary);
+                    return;
+                }
+                const item = cursor.value;
+                if (item.status !== 'failed' && (item.base64 || item.savedUrl)) {
+                    const charName = item.characterName || 'Unknown';
+                    if (!summary[charName]) {
+                        summary[charName] = { count: 0, totalSize: 0, slots: {}, latestTimestamp: 0 };
+                    }
+
+                    const slotId = item.slotId || item.imgId;
+                    if (!summary[charName].slots[slotId]) {
+                        summary[charName].slots[slotId] = { count: 0, hasSaved: false, latestTimestamp: 0, latestImgId: null };
+                    }
+
+                    const slot = summary[charName].slots[slotId];
+                    slot.count++;
+                    if (item.savedUrl) slot.hasSaved = true;
+                    if (item.timestamp > slot.latestTimestamp) {
+                        slot.latestTimestamp = item.timestamp;
+                        slot.latestImgId = item.imgId;
+                    }
+
+                    summary[charName].count++;
+                    summary[charName].totalSize += (item.base64?.length || 0) * 0.75;
+                    if (item.timestamp > summary[charName].latestTimestamp) {
+                        summary[charName].latestTimestamp = item.timestamp;
+                    }
+                }
+                cursor.continue();
+            };
+            tx.onerror = () => resolve({});
+        } catch {
+            resolve({});
+        }
+    });
+}
+
+// 预设缩略图候选：一次扫描分出「用该预设生成过的图」与其他成功图，
+// 均按时间倒序。旧记录没有 presetId，只能在 others 里手动认。
+export async function getThumbnailCandidates(presetId = '') {
+    const database = await openDB();
+    return new Promise((resolve, reject) => {
+        const matched = [];
+        const others = [];
+        try {
+            const tx = database.transaction(DB_STORE, 'readonly');
+            const store = tx.objectStore(DB_STORE);
+            const request = store.openCursor();
+            request.onsuccess = (event) => {
+                const cursor = event.target.result;
+                if (!cursor) {
+                    matched.sort((a, b) => b.timestamp - a.timestamp);
+                    others.sort((a, b) => b.timestamp - a.timestamp);
+                    resolve({ matched, others });
+                    return;
+                }
+                const record = cursor.value;
+                if (record && hasPreviewImage(record)) {
+                    (record.presetId === String(presetId || '') && presetId
+                        ? matched
+                        : others).push(record);
+                }
+                cursor.continue();
+            };
+            request.onerror = () => reject(request.error);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+// 畫廊分組輕量索引：圖多時不能把某角色全部原圖 base64 物化進內存（幾百張即數百 MB，
+// 移動端 WebView 會直接 OOM 重載）。統一走 cursor 逐條到達，每個 slot 只保留最新一張
+// 做封面，返回時剝離原圖只帶 256px 縮略圖；slot 的完整歷史在打開燈箱時按需取。
+// 安静地把补建好的缩略图写回记录（不走 updatePreviewRecord，避免逐张触发缓存变更事件）
+async function persistThumbnailQuiet(imgId, thumbBase64) {
+    const database = await openDB();
+    return new Promise((resolve) => {
+        try {
+            const tx = database.transaction(DB_STORE, 'readwrite');
+            const store = tx.objectStore(DB_STORE);
+            const req = store.get(imgId);
+            req.onsuccess = () => {
+                const record = req.result;
+                if (!record) { resolve(false); return; }
+                record.thumbBase64 = thumbBase64;
+                store.put(record);
+            };
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = tx.onabort = () => resolve(false);
+        } catch {
+            resolve(false);
+        }
+    });
+}
+
+// 只返回分组封面所需的轻量索引：256px 缩略图或已保存路径，绝不带原图 base64。
+// 旧记录缺缩略图时在此串行补建并持久化（每个 slot 只处理最新一张）。
+export async function getCharacterGalleryIndex(charName) {
+    const database = await openDB();
+    const latestBySlot = await new Promise((resolve) => {
+        try {
+            const tx = database.transaction(DB_STORE, 'readonly');
+            const store = tx.objectStore(DB_STORE);
+            const slots = new Map();
+            store.openCursor().onsuccess = (event) => {
+                const cursor = event.target.result;
+                if (!cursor) { resolve(slots); return; }
+                const item = cursor.value;
+                if ((item.characterName || 'Unknown') === charName
+                    && item.status !== 'failed' && item.status !== PreviewStatus.MANUAL
+                    && (item.base64 || item.savedUrl)) {
+                    const slotId = item.slotId || item.imgId;
+                    const entry = slots.get(slotId);
+                    if (!entry) slots.set(slotId, { latest: item, count: 1 });
+                    else {
+                        entry.count += 1;
+                        if (Number(item.timestamp) > Number(entry.latest.timestamp)) entry.latest = item;
+                    }
+                }
+                cursor.continue();
+            };
+            tx.onerror = () => resolve(new Map());
+        } catch {
+            resolve(new Map());
+        }
+    });
+
+    // 旧记录懒补建缩略图（串行，单角色 slot 量级，256px 单次约 10ms）
+    for (const entry of latestBySlot.values()) {
+        const record = entry.latest;
+        if (record.base64 && !record.thumbBase64) {
+            const thumb = await createThumbnailDataUrl(record.base64);
+            if (thumb) {
+                await persistThumbnailQuiet(record.imgId, thumb);
+                record.thumbBase64 = thumb;
+            }
+        }
+    }
+
+    // 剥离原图，封面只带缩略图/服务器路径
+    const slots = {};
+    for (const [slotId, entry] of latestBySlot) {
+        const record = entry.latest;
+        slots[slotId] = {
+            count: entry.count,
+            latest: {
+                imgId: record.imgId,
+                timestamp: record.timestamp,
+                savedUrl: record.savedUrl || null,
+                thumbBase64: record.thumbBase64 || null,
+            },
+        };
+    }
+    return slots;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 小画廊 UI
+// ═══════════════════════════════════════════════════════════════════════════
+
+function ensureGalleryStyles() {
+    if (document.getElementById('nd-gallery-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'nd-gallery-styles';
+    style.textContent = `#nd-gallery-overlay{position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:100003;display:none;background:rgba(0,0,0,0.85);backdrop-filter:blur(8px);flex-direction:column}.nd-gallery-overlay.visible{display:flex}.nd-gallery-close{position:absolute;top:calc(env(safe-area-inset-top, 0px) + 16px);right:16px;width:40px;height:40px;border:none;background:rgba(255,255,255,0.1);border-radius:50%;color:#fff;font-size:20px;cursor:pointer;z-index:10}.nd-gallery-close:hover{background:rgba(255,255,255,0.2)}.nd-gallery-main{display:flex;align-items:center;gap:16px;max-width:90vw;max-height:60vh}.nd-gallery-nav{width:48px;height:48px;border:none;background:rgba(255,255,255,0.1);border-radius:50%;color:#fff;font-size:24px;cursor:pointer;flex-shrink:0}.nd-gallery-nav:hover{background:rgba(255,255,255,0.2)}.nd-gallery-nav:disabled{opacity:0.3;cursor:not-allowed}.nd-gallery-img-wrap{position:relative;max-width:calc(90vw - 140px);max-height:60vh}.nd-gallery-img{max-width:100%;max-height:60vh;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.5)}.nd-gallery-saved-badge{position:absolute;top:12px;left:12px;background:rgba(62,207,142,0.9);padding:4px 10px;border-radius:6px;font-size:11px;color:#fff;font-weight:600}.nd-gallery-thumbs{display:flex;gap:8px;margin-top:16px;padding:12px;background:rgba(0,0,0,0.3);border-radius:12px;max-width:90vw;overflow-x:auto}.nd-gallery-thumb{width:64px;height:64px;border-radius:8px;object-fit:cover;cursor:pointer;border:2px solid transparent;opacity:0.6;transition:all 0.15s;flex-shrink:0}.nd-gallery-thumb:hover{opacity:0.9}.nd-gallery-thumb.active{border-color:#d4a574;opacity:1}.nd-gallery-thumb.saved{border-color:rgba(62,207,142,0.8)}.nd-gallery-actions{display:flex;gap:12px;margin-top:12px;align-items:center}.nd-gallery-btn{padding:10px 20px;border:1px solid rgba(255,255,255,0.2);border-radius:8px;background:rgba(255,255,255,0.1);color:#fff;font-size:13px;cursor:pointer;transition:all 0.15s}.nd-gallery-btn:hover{background:rgba(255,255,255,0.2)}.nd-gallery-btn.primary{background:rgba(212,165,116,0.3);border-color:rgba(212,165,116,0.5)}.nd-gallery-btn.danger{color:#f87171;border-color:rgba(248,113,113,0.3)}.nd-gallery-btn.danger:hover{background:rgba(248,113,113,0.15)}.nd-gallery-info{text-align:center;margin-top:8px;font-size:12px;color:rgba(255,255,255,0.6)}.nd-gallery-prompt-wrap{max-width:90vw;margin-top:12px;border-radius:8px;background:rgba(0,0,0,0.4);overflow:hidden}.nd-gallery-prompt-head{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;cursor:pointer;color:rgba(255,255,255,0.85);font-size:12px;user-select:none}.nd-gallery-prompt-head:hover{background:rgba(255,255,255,0.08)}.nd-gallery-prompt-head .arrow{transition:transform 0.15s}.nd-gallery-prompt-wrap.open .nd-gallery-prompt-head .arrow{transform:rotate(180deg)}.nd-gallery-prompt-body{display:none;padding:12px;font-size:12px;color:rgba(255,255,255,0.85);line-height:1.5;max-height:28vh;overflow-y:auto}.nd-gallery-prompt-wrap.open .nd-gallery-prompt-body{display:block}.nd-gallery-prompt-section{margin-bottom:10px}.nd-gallery-prompt-section:last-child{margin-bottom:0}.nd-gallery-prompt-section h4{margin:0 0 4px 0;font-size:11px;color:rgba(212,165,116,0.8);font-weight:600;text-transform:uppercase;letter-spacing:0.05em}.nd-gallery-prompt-section pre{margin:0;white-space:pre-wrap;word-break:break-word;font-family:inherit;color:inherit;background:rgba(0,0,0,0.25);padding:6px 10px;border-radius:4px;max-height:120px;overflow-y:auto}.nd-batch-overlay{position:fixed;inset:0;z-index:100004;background:rgba(0,0,0,0.92);display:none;flex-direction:column;padding:24px}.nd-batch-overlay.visible{display:flex}.nd-batch-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;color:#fff}.nd-batch-head h3{margin:0;font-size:16px;font-weight:600}.nd-batch-actions{display:flex;gap:8px}.nd-batch-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px;overflow-y:auto;flex:1;padding-right:8px}.nd-batch-item{position:relative;border-radius:8px;overflow:hidden;cursor:pointer;border:2px solid transparent;transition:border-color 0.15s;background:#111}.nd-batch-item.checked{border-color:#d4a574}.nd-batch-item img{width:100%;aspect-ratio:1/1;object-fit:cover;display:block}.nd-batch-checkbox{position:absolute;top:6px;left:6px;width:22px;height:22px;background:rgba(0,0,0,0.7);border-radius:4px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px;opacity:0.6;transition:opacity 0.15s}.nd-batch-item.checked .nd-batch-checkbox{opacity:1;background:rgba(212,165,116,0.9)}.nd-batch-count{color:rgba(255,255,255,0.7);font-size:12px;margin-left:12px}`;
+    document.head.appendChild(style);
+}
+
+function createGalleryOverlay() {
+    if (galleryOverlayCreated) return;
+    galleryOverlayCreated = true;
+    ensureGalleryStyles();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'nd-gallery-overlay';
+    // Template-only UI markup.
+    // eslint-disable-next-line no-unsanitized/property
+    overlay.innerHTML = `<button class="nd-gallery-close" id="nd-gallery-close">✕</button><div class="nd-gallery-main"><button class="nd-gallery-nav" id="nd-gallery-prev">‹</button><div class="nd-gallery-img-wrap"><img class="nd-gallery-img" id="nd-gallery-img" src="" alt=""><div class="nd-gallery-saved-badge" id="nd-gallery-saved-badge" style="display:none">已保存</div></div><button class="nd-gallery-nav" id="nd-gallery-next">›</button></div><div class="nd-gallery-thumbs" id="nd-gallery-thumbs"></div><div class="nd-gallery-actions" id="nd-gallery-actions"><button class="nd-gallery-btn primary" id="nd-gallery-use">使用此图</button><button class="nd-gallery-btn" id="nd-gallery-save">💾 保存到服务器</button><button class="nd-gallery-btn danger" id="nd-gallery-delete">🗑️ 删除</button></div><div class="nd-gallery-info" id="nd-gallery-info"></div><div class="nd-gallery-prompt-wrap" id="nd-gallery-prompt-wrap" hidden><div class="nd-gallery-prompt-head" id="nd-gallery-prompt-head"><span>完整提示词</span><span class="arrow">▾</span></div><div class="nd-gallery-prompt-body" id="nd-gallery-prompt-body"><div class="nd-gallery-prompt-section"><h4>Tags</h4><pre id="nd-gallery-prompt-tags"></pre></div><div class="nd-gallery-prompt-section"><h4>正向 (Positive)</h4><pre id="nd-gallery-prompt-positive"></pre></div><div class="nd-gallery-prompt-section"><h4>角色 (Character)</h4><pre id="nd-gallery-prompt-char"></pre></div><div class="nd-gallery-prompt-section"><h4>負向 (Negative)</h4><pre id="nd-gallery-prompt-negative"></pre></div></div></div>`;
+    document.body.appendChild(overlay);
+
+    document.getElementById('nd-gallery-close').addEventListener('click', closeGallery);
+    document.getElementById('nd-gallery-prev').addEventListener('click', () => navigateGallery(-1));
+    document.getElementById('nd-gallery-next').addEventListener('click', () => navigateGallery(1));
+    document.getElementById('nd-gallery-use').addEventListener('click', useCurrentGalleryImage);
+    document.getElementById('nd-gallery-save').addEventListener('click', saveCurrentGalleryImage);
+    document.getElementById('nd-gallery-delete').addEventListener('click', deleteCurrentGalleryImage);
+    document.getElementById('nd-gallery-prompt-head').addEventListener('click', () => {
+        document.getElementById('nd-gallery-prompt-wrap').classList.toggle('open');
+    });
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) closeGallery(); });
+}
+
+export async function openGallery(slotId, messageId, callbacks = {}) {
+    createGalleryOverlay();
+
+    const previews = await getPreviewsBySlot(slotId);
+    const validPreviews = previews.filter(hasPreviewImage);
+
+    if (!validPreviews.length) {
+        showToast('没有找到图片历史', 'error');
+        return;
+    }
+
+    const selectedImgId = await getSlotSelection(slotId);
+    let startIndex = 0;
+    if (selectedImgId) {
+        const idx = validPreviews.findIndex(p => p.imgId === selectedImgId);
+        if (idx >= 0) startIndex = idx;
+    }
+
+    currentGalleryData = { slotId, messageId, previews: validPreviews, currentIndex: startIndex, callbacks };
+    renderGalleryThumbs();
+    renderGallery();
+    document.getElementById('nd-gallery-overlay').classList.add('visible');
+}
+
+export function closeGallery() {
+    const el = document.getElementById('nd-gallery-overlay');
+    if (el) el.classList.remove('visible');
+    currentGalleryData = null;
+}
+
+function renderGalleryThumbs() {
+    if (!currentGalleryData) return;
+    const { previews } = currentGalleryData;
+    const reversedPreviews = previews.slice().reverse();
+    const thumbsContainer = document.getElementById('nd-gallery-thumbs');
+
+    // Generated from local preview data only.
+    // eslint-disable-next-line no-unsanitized/property
+    thumbsContainer.innerHTML = reversedPreviews.map((p, i) => {
+        const src = getPreviewDisplayUrl(p);
+        const originalIndex = previews.length - 1 - i;
+        const classes = ['nd-gallery-thumb'];
+        if (p.savedUrl) classes.push('saved');
+        return `<img class="${classes.join(' ')}" src="${src}" data-index="${originalIndex}" alt="" loading="lazy">`;
+    }).join('');
+
+    thumbsContainer.querySelectorAll('.nd-gallery-thumb').forEach(thumb => {
+        thumb.addEventListener('click', () => {
+            currentGalleryData.currentIndex = parseInt(thumb.dataset.index);
+            renderGallery();
+        });
+    });
+}
+
+function updateGalleryThumbState() {
+    if (!currentGalleryData) return;
+    const { currentIndex } = currentGalleryData;
+    const thumbsContainer = document.getElementById('nd-gallery-thumbs');
+    thumbsContainer.querySelectorAll('.nd-gallery-thumb').forEach((thumb) => {
+        const isActive = parseInt(thumb.dataset.index) === currentIndex;
+        thumb.classList.toggle('active', isActive);
+        if (isActive) {
+            thumb.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        }
+    });
+}
+
+function renderGallery() {
+    if (!currentGalleryData) return;
+
+    const { previews, currentIndex } = currentGalleryData;
+    const current = previews[currentIndex];
+    if (!current) return;
+
+    document.getElementById('nd-gallery-img').src = getPreviewDisplayUrl(current);
+    document.getElementById('nd-gallery-saved-badge').style.display = current.savedUrl ? 'block' : 'none';
+    updateGalleryThumbState();
+
+    document.getElementById('nd-gallery-prev').disabled = currentIndex >= previews.length - 1;
+    document.getElementById('nd-gallery-next').disabled = currentIndex <= 0;
+
+    const saveBtn = document.getElementById('nd-gallery-save');
+    if (current.savedUrl) {
+        saveBtn.textContent = '✓ 已保存';
+        saveBtn.disabled = true;
+    } else {
+        saveBtn.textContent = '💾 保存到服务器';
+        saveBtn.disabled = false;
+    }
+
+    const displayVersion = previews.length - currentIndex;
+    const date = new Date(current.timestamp).toLocaleString();
+    document.getElementById('nd-gallery-info').textContent = `版本 ${displayVersion} / ${previews.length} · ${date}`;
+
+    // 填入提示詞
+    const promptWrap = document.getElementById('nd-gallery-prompt-wrap');
+    const hasPrompt = current.tags || current.positive || current.negativePrompt || current.characterPrompts;
+    if (promptWrap) promptWrap.hidden = !hasPrompt;
+    const setPre = (id, value) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const text = (typeof value === 'string' && value.trim()) ? value : '（無）';
+        // 已被 escapeText 過的資料直接顯示即可；未 escape 的這裡也不需處理，因為是用戶自己看的 prompt 原文
+        // eslint-disable-next-line no-unsanitized/property
+        el.textContent = text;
+    };
+    setPre('nd-gallery-prompt-tags', current.tags);
+    setPre('nd-gallery-prompt-positive', current.positive);
+    setPre('nd-gallery-prompt-char', current.characterPrompts);
+    setPre('nd-gallery-prompt-negative', current.negativePrompt);
+}
+
+function navigateGallery(delta) {
+    if (!currentGalleryData) return;
+    const newIndex = currentGalleryData.currentIndex - delta;
+    if (newIndex >= 0 && newIndex < currentGalleryData.previews.length) {
+        currentGalleryData.currentIndex = newIndex;
+        renderGallery();
+    }
+}
+
+async function useCurrentGalleryImage() {
+    if (!currentGalleryData) return;
+
+    const { slotId, messageId, previews, currentIndex, callbacks } = currentGalleryData;
+    const selected = previews[currentIndex];
+    if (!selected) return;
+
+    await setSlotSelection(slotId, selected.imgId);
+    if (callbacks.onUse) callbacks.onUse(slotId, messageId, selected, previews.length);
+    closeGallery();
+    showToast('已切换显示图片');
+}
+
+async function saveCurrentGalleryImage() {
+    if (!currentGalleryData) return;
+
+    const { slotId, previews, currentIndex, callbacks } = currentGalleryData;
+    const current = previews[currentIndex];
+    if (!current || current.savedUrl) return;
+
+    try {
+        const charName = current.characterName || getChatCharacterName();
+        const image = getBase64ImagePayload(current.base64);
+        const url = await saveBase64AsFile(image.base64, charName, `novel_${current.imgId}`, image.format);
+        await updatePreviewSavedUrl(current.imgId, url);
+        current.savedUrl = url;
+        await setSlotSelection(slotId, current.imgId);
+        showToast(`已保存: ${url}`, 'success', 4000);
+        renderGalleryThumbs();
+        renderGallery();
+        if (callbacks.onSave) callbacks.onSave(current.imgId, url);
+    } catch (e) {
+        console.error('[GalleryCache] save failed:', e);
+        showToast(`保存失败: ${e.message}`, 'error');
+    }
+}
+
+async function deleteCurrentGalleryImage() {
+    if (!currentGalleryData) return;
+
+    const { slotId, messageId, previews, currentIndex, callbacks } = currentGalleryData;
+    const current = previews[currentIndex];
+    if (!current) return;
+
+    const msg = current.savedUrl ? '确定删除这条记录吗？服务器上的图片文件不会被删除。' : '确定删除这张图片吗？';
+    if (!confirm(msg)) return;
+
+    try {
+        await deletePreview(current.imgId);
+
+        const selectedId = await getSlotSelection(slotId);
+        if (selectedId === current.imgId) {
+            await clearSlotSelection(slotId);
+        }
+
+        previews.splice(currentIndex, 1);
+
+        if (previews.length === 0) {
+            closeGallery();
+            if (callbacks.onBecameEmpty) {
+                callbacks.onBecameEmpty(slotId, messageId, { tags: current.tags || '', title: current.title || '', positive: current.positive || '' });
+            }
+            showToast('图片已删除，可点击重试重新生成');
+        } else {
+            if (currentGalleryData.currentIndex >= previews.length) {
+                currentGalleryData.currentIndex = previews.length - 1;
+            }
+            renderGalleryThumbs();
+            renderGallery();
+            if (callbacks.onDelete) callbacks.onDelete(slotId, current.imgId, previews);
+            showToast('图片已删除');
+        }
+    } catch (e) {
+        console.error('[GalleryCache] delete failed:', e);
+        showToast(`删除失败: ${e.message}`, 'error');
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 清理
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function destroyGalleryCache() {
+    closeGallery();
+    invalidateCache();
+    clearPreviewObjectUrls();
+
+    document.getElementById('nd-gallery-overlay')?.remove();
+    document.getElementById('nd-gallery-styles')?.remove();
+    galleryOverlayCreated = false;
+
+    if (db) {
+        try { db.close(); } catch {}
+        db = null;
+    }
+    dbOpening = null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 批量管理 UI
+// ═══════════════════════════════════════════════════════════════════════════
+
+let batchOverlayCreated = false;
+let batchState = null;
+
+function createBatchOverlay() {
+    if (batchOverlayCreated) return;
+    batchOverlayCreated = true;
+    ensureGalleryStyles();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'nd-batch-overlay';
+    // eslint-disable-next-line no-unsanitized/property
+    overlay.innerHTML = `<div class="nd-batch-head"><h3 id="nd-batch-title">批量管理</h3><div class="nd-batch-actions"><button class="nd-gallery-btn" id="nd-batch-select-all">全選</button><button class="nd-gallery-btn" id="nd-batch-select-none">取消全選</button><button class="nd-gallery-btn" id="nd-batch-download">⬇️ 下載</button><button class="nd-gallery-btn danger" id="nd-batch-delete">🗑️ 批量刪除</button><button class="nd-gallery-btn" id="nd-batch-close">完成</button></div></div><div class="nd-batch-grid" id="nd-batch-grid"></div><div class="nd-batch-count" id="nd-batch-count"></div>`;
+    document.body.appendChild(overlay);
+
+    document.getElementById('nd-batch-close').addEventListener('click', closeBatchManage);
+    document.getElementById('nd-batch-select-all').addEventListener('click', () => setBatchChecked(true));
+    document.getElementById('nd-batch-select-none').addEventListener('click', () => setBatchChecked(false));
+    document.getElementById('nd-batch-delete').addEventListener('click', async () => {
+        const ids = getBatchSelectedIds();
+        if (!ids.length) return showToast('未選圖片', 'error');
+        if (!confirm(`確認刪除 ${ids.length} 張圖片？此操作不可撤銷。`)) return;
+        try {
+            for (const id of ids) await deletePreview(id);
+            showToast(`已刪除 ${ids.length} 張`);
+            await openGalleryBatchManage(batchState.slotId); // 刷新
+            publishCacheChange([batchState.slotId]);
+        } catch (e) {
+            showToast(`刪除失敗：${e?.message || e}`, 'error');
+        }
+    });
+    document.getElementById('nd-batch-download').addEventListener('click', async () => {
+        const ids = getBatchSelectedIds();
+        if (!ids.length) return showToast('未選圖片', 'error');
+        try {
+            let saved = 0, failed = 0;
+            for (const id of ids) {
+                const p = batchState.previews.find((x) => x.imgId === id);
+                const url = p ? getPreviewDisplayUrl(p) : null;
+                if (!url) { failed++; continue; }
+                const ts = new Date(p.timestamp || Date.now()).toISOString().replace(/[:.]/g, '-');
+                const isJpeg = isJpegBase64(p.base64);
+                await saveBase64AsFile(url, `image-${p.imgId}-${ts}.${isJpeg ? 'jpg' : 'png'}`);
+                saved++;
+            }
+            showToast(`已下載 ${saved} 張${failed ? `，${failed} 張失敗` : ''}`);
+        } catch (e) {
+            showToast(`下載失敗：${e?.message || e}`, 'error');
+        }
+    });
+}
+
+function setBatchChecked(checked) {
+    const grid = document.getElementById('nd-batch-grid');
+    if (!grid) return;
+    grid.querySelectorAll('.nd-batch-item').forEach((el) => el.classList.toggle('checked', checked));
+    updateBatchCount();
+}
+
+function getBatchSelectedIds() {
+    const grid = document.getElementById('nd-batch-grid');
+    if (!grid) return [];
+    return [...grid.querySelectorAll('.nd-batch-item.checked')]
+        .map((el) => el.dataset.imgid)
+        .filter(Boolean);
+}
+
+function updateBatchCount() {
+    const count = getBatchSelectedIds().length;
+    const el = document.getElementById('nd-batch-count');
+    if (el) el.textContent = count ? `已選 ${count} 張` : '點選圖片開始挑選';
+}
+
+export async function openGalleryBatchManage(slotId) {
+    createBatchOverlay();
+    let previews;
+    if (slotId) {
+        previews = (await getPreviewsBySlot(slotId)).filter(hasPreviewImage);
+    } else {
+        // 全體批量管理：抓所有 slot 的最新圖
+        previews = [];
+        const summary = await getGallerySummary();
+        for (const [sid, entry] of Object.entries(summary)) {
+            if (entry?.latest) {
+                const full = await getPreview(entry.latest.imgId);
+                if (hasPreviewImage(full)) previews.push(full);
+            }
+        }
+        // 再補上有歷史的 slot 的所有圖
+        const allPreviews = await Object.keys(summary).reduce(async (acc, sid) => {
+            const list = await getPreviewsBySlot(sid);
+            return [...(await acc), ...list.filter(hasPreviewImage)];
+        }, Promise.resolve([]));
+        // 去重
+        const seen = new Set();
+        previews = allPreviews.filter((p) => { if (seen.has(p.imgId)) return false; seen.add(p.imgId); return true; });
+    }
+    const reversed = previews.slice().reverse();
+    batchState = { slotId, previews };
+
+    const grid = document.getElementById('nd-batch-grid');
+    grid.innerHTML = reversed.map((p) => {
+        const src = getPreviewDisplayUrl(p);
+        return `<div class="nd-batch-item" data-imgid="${p.imgId}"><div class="nd-batch-checkbox">✓</div><img src="${src}" alt="" loading="lazy"></div>`;
+    }).join('');
+    grid.querySelectorAll('.nd-batch-item').forEach((el) => {
+        el.addEventListener('click', () => {
+            el.classList.toggle('checked');
+            updateBatchCount();
+        });
+    });
+
+    document.getElementById('nd-batch-title').textContent = `批量管理（共 ${previews.length} 張）`;
+    updateBatchCount();
+    document.getElementById('nd-batch-overlay').classList.add('visible');
+}
+
+export function closeBatchManage() {
+    const el = document.getElementById('nd-batch-overlay');
+    if (el) el.classList.remove('visible');
+}

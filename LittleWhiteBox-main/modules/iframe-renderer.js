@@ -1,0 +1,960 @@
+import { extension_settings, getContext } from "../../../../extensions.js";
+import { createModuleEvents, event_types } from "../core/event-manager.js";
+import { EXT_ID } from "../core/constants.js";
+import { xbLog, CacheRegistry } from "../core/debug-core.js";
+import { replaceXbGetVarInString } from "./variables/var-commands.js";
+import { executeSlashCommand } from "../core/slash-command.js";
+import { default_user_avatar, default_avatar } from "../../../../../script.js";
+import { getIframeBaseScript, getWrapperScript } from "../core/wrapper-inline.js";
+import { postToIframe, getIframeTargetOrigin, getTrustedOrigin } from "../core/iframe-messaging.js";
+const MODULE_ID = 'iframeRenderer';
+const events = createModuleEvents(MODULE_ID);
+
+let isGenerating = false;
+const winMap = new Map();
+let lastHeights = new WeakMap();
+const blobUrls = new WeakMap();
+const hashToBlobUrl = new Map();
+const hashToBlobBytes = new Map();
+const blobLRU = [];
+const BLOB_CACHE_LIMIT = 32;
+let lastApplyTs = 0;
+let pendingHeight = null;
+let pendingRec = null;
+let messageListenerBound = false;
+let leasedRuntimeCount = 0;
+
+CacheRegistry.register(MODULE_ID, {
+    name: 'Blob URL 缓存',
+    getSize: () => hashToBlobUrl.size,
+    getBytes: () => {
+        let bytes = 0;
+        hashToBlobBytes.forEach(v => { bytes += Number(v) || 0; });
+        return bytes;
+    },
+    clear: () => {
+        clearBlobCaches();
+        hashToBlobBytes.clear();
+    },
+    getDetail: () => Array.from(hashToBlobUrl.keys()),
+});
+
+function getSettings() {
+    return extension_settings[EXT_ID] || {};
+}
+
+function ensureHideCodeStyle(enable) {
+    const id = 'xiaobaix-hide-code';
+    const old = document.getElementById(id);
+    if (!enable) {
+        old?.remove();
+        return;
+    }
+    if (old) return;
+    const hideCodeStyle = document.createElement('style');
+    hideCodeStyle.id = id;
+    hideCodeStyle.textContent = `
+        .xiaobaix-active .mes_text pre { display: none !important; }
+        .xiaobaix-active .mes_text pre.xb-show { display: block !important; }
+    `;
+    document.head.appendChild(hideCodeStyle);
+}
+
+function setActiveClass(enable) {
+    document.body.classList.toggle('xiaobaix-active', !!enable);
+}
+
+function djb2(str) {
+    let h = 5381;
+    for (let i = 0; i < str.length; i++) {
+        h = ((h << 5) + h) ^ str.charCodeAt(i);
+    }
+    return (h >>> 0).toString(16);
+}
+
+export function shouldRenderCodeBlock(codeBlock) {
+    if (!codeBlock) return false;
+    const content = (codeBlock.textContent || '').trim();
+    if (!content) return false;
+    if (extractExternalUrl(content)) return true;
+    const lower = content.toLowerCase();
+    if (lower.includes('<!doctype') || lower.includes('<html') || lower.includes('<script')) return true;
+
+    // 支持直接输出的 HTML 片段，而不要求必须是完整的 <html> 文档。
+    // 这样像 <div>...</div>、<style>...</style><div>...</div>、<svg>...</svg> 也能进入 iframe 渲染。
+    const fragmentStartPattern = /^\s*(?:<!--[\s\S]*?-->\s*)*<(?:style|link|meta|svg|iframe|canvas|img|video|audio|picture|div|section|main|article|header|footer|nav|aside|p|span|button|input|textarea|select|label|ul|ol|li|table|thead|tbody|tr|td|th|form|figure|figcaption|details|summary|dialog|h[1-6])\b/i;
+    return fragmentStartPattern.test(content);
+}
+
+function generateUniqueId() {
+    return `xiaobaix-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+}
+
+function setIframeBlobHTML(iframe, fullHTML, codeHash) {
+    const existing = hashToBlobUrl.get(codeHash);
+    if (existing) {
+        iframe.src = existing;
+        blobUrls.set(iframe, existing);
+        return;
+    }
+    const blob = new Blob([fullHTML], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    iframe.src = url;
+    blobUrls.set(iframe, url);
+    hashToBlobUrl.set(codeHash, url);
+    try { hashToBlobBytes.set(codeHash, blob.size || 0); } catch {}
+    blobLRU.push(codeHash);
+    while (blobLRU.length > BLOB_CACHE_LIMIT) {
+        const old = blobLRU.shift();
+        const u = hashToBlobUrl.get(old);
+        hashToBlobUrl.delete(old);
+        hashToBlobBytes.delete(old);
+        try { URL.revokeObjectURL(u); } catch (e) {}
+    }
+}
+
+function releaseIframeBlob(iframe) {
+    try {
+        blobUrls.delete(iframe);
+    } catch (e) {}
+}
+
+export function clearBlobCaches() {
+    try { xbLog.info(MODULE_ID, '清空 Blob 缓存'); } catch {}
+    hashToBlobUrl.forEach(u => { try { URL.revokeObjectURL(u); } catch {} });
+    hashToBlobUrl.clear();
+    hashToBlobBytes.clear();
+    blobLRU.length = 0;
+}
+
+function buildResourceHints(html) {
+    const urls = Array.from(new Set((html.match(/https?:\/\/[^"'()\s]+/gi) || [])
+        .map(u => { try { return new URL(u).origin; } catch { return null; } })
+        .filter(Boolean)));
+    let hints = "";
+    const maxHosts = 6;
+    for (let i = 0; i < Math.min(urls.length, maxHosts); i++) {
+        const origin = urls[i];
+        hints += `<link rel="dns-prefetch" href="${origin}">`;
+        hints += `<link rel="preconnect" href="${origin}" crossorigin>`;
+    }
+    let preload = "";
+    const font = (html.match(/https?:\/\/[^"'()\s]+\.(?:woff2|woff|ttf|otf)/i) || [])[0];
+    if (font) {
+        const type = font.endsWith(".woff2") ? "font/woff2" : font.endsWith(".woff") ? "font/woff" : font.endsWith(".ttf") ? "font/ttf" : "font/otf";
+        preload += `<link rel="preload" as="font" href="${font}" type="${type}" crossorigin fetchpriority="high">`;
+    }
+    const css = (html.match(/https?:\/\/[^"'()\s]+\.css/i) || [])[0];
+    if (css) {
+        preload += `<link rel="preload" as="style" href="${css}" crossorigin fetchpriority="high">`;
+    }
+    const img = (html.match(/https?:\/\/[^"'()\s]+\.(?:png|jpg|jpeg|webp|gif|svg)/i) || [])[0];
+    if (img) {
+        preload += `<link rel="preload" as="image" href="${img}" crossorigin fetchpriority="high">`;
+    }
+    return hints + preload;
+}
+
+function extractExternalUrl(content) {
+    const trimmed = (content || '').trim();
+    if (!trimmed) return null;
+    if (/^https?:\/\/[^\s]+$/i.test(trimmed)) return trimmed;
+    const match = trimmed.match(/<!--\s*xb-src:\s*(https?:\/\/[^\s>]+)\s*-->/i);
+    if (match) return match[1];
+    return null;
+}
+
+async function fetchExternalHtml(url, signal) {
+    try {
+        const r = await fetch(url, { mode: 'cors', signal });
+        if (r.ok) return await r.text();
+    } catch (_) {}
+    return null;
+}
+
+async function loadExternalUrl(iframe, url, settings, { signal, scheduleTimeout = setTimeout } = {}) {
+    try {
+        iframe.srcdoc = '<!DOCTYPE html><html><body style="display:flex;justify-content:center;align-items:center;height:100px;color:#888;font-family:sans-serif;background:transparent">加载中...</body></html>';
+
+        let html = await fetchExternalHtml(url, signal);
+        if (signal?.aborted) return;
+
+        if (html && settings.variablesCore?.enabled && typeof replaceXbGetVarInString === 'function') {
+            try {
+                html = replaceXbGetVarInString(html);
+            } catch (e) {
+                console.warn('xbgetvar 宏替换失败:', e);
+            }
+        }
+
+        if (html) {
+            setIframeContent(iframe, html, settings);
+            scheduleTimeout(() => {
+                try {
+                    const targetOrigin = getIframeTargetOrigin(iframe);
+                    postToIframe(iframe, { type: 'probe' }, null, targetOrigin);
+                } catch (e) {}
+            }, 100);
+        } else {
+            iframe.removeAttribute('srcdoc');
+            iframe.src = url;
+            iframe.style.minHeight = '800px';
+            iframe.setAttribute('scrolling', 'auto');
+        }
+    } catch (err) {
+        if (signal?.aborted) return;
+        console.error('[iframeRenderer] 外部URL加载失败:', err);
+        iframe.removeAttribute('srcdoc');
+        iframe.src = url;
+        iframe.style.minHeight = '800px';
+        iframe.setAttribute('scrolling', 'auto');
+    }
+}
+
+function buildWrappedHtml(html) {
+    const settings = getSettings();
+    const origin = typeof location !== 'undefined' && location.origin ? location.origin : '';
+    const baseTag = settings.useBlob ? `<base href="${origin}/">` : "";
+    const headHints = buildResourceHints(html);
+    const vhFix = `<style>html,body{height:auto!important;min-height:0!important;max-height:none!important}.profile-container,[style*="100vh"]{height:auto!important;min-height:600px!important}[style*="height:100%"]{height:auto!important;min-height:100%!important}</style>`;
+    
+    // 内联脚本，按顺序：wrapper(callGenerate) -> base(高度+STscript)
+    const scripts = `<script>${getWrapperScript()}${getIframeBaseScript()}</script>`;
+    
+    if (html.includes('<html') && html.includes('</html')) {
+        if (html.includes('<head>')) 
+            return html.replace('<head>', `<head>${scripts}${baseTag}${headHints}${vhFix}`);
+        if (html.includes('</head>')) 
+            return html.replace('</head>', `${scripts}${baseTag}${headHints}${vhFix}</head>`);
+        return html.replace('<body', `<head>${scripts}${baseTag}${headHints}${vhFix}</head><body`);
+    }
+    
+    return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+${scripts}
+${baseTag}
+${headHints}
+${vhFix}
+<style>html,body{margin:0;padding:0;background:transparent}</style>
+</head>
+<body>${html}</body></html>`;
+}
+
+function acquireLeasedRuntimeMessageListener() {
+    if (!messageListenerBound) {
+        // eslint-disable-next-line no-restricted-syntax -- messages require an exact live iframe winMap entry.
+        window.addEventListener('message', handleIframeMessage);
+        messageListenerBound = true;
+    }
+    leasedRuntimeCount += 1;
+}
+
+function releaseLeasedRuntimeMessageListener() {
+    leasedRuntimeCount -= 1;
+    if (leasedRuntimeCount === 0 && messageListenerBound) {
+        window.removeEventListener('message', handleIframeMessage);
+        messageListenerBound = false;
+    }
+}
+
+function createRenderIframe() {
+    const iframe = document.createElement('iframe');
+    iframe.id = generateUniqueId();
+    iframe.className = 'xiaobaix-iframe';
+    iframe.style.cssText = 'width:100%;border:none;background:transparent;overflow:hidden;height:0;margin:0;padding:0;display:block;contain:layout paint style;will-change:height;min-height:50px';
+    iframe.setAttribute('frameborder', '0');
+    iframe.setAttribute('scrolling', 'no');
+    iframe.loading = 'eager';
+    return iframe;
+}
+
+function holdRuntimePlaceholder(wrapper, iframe) {
+    const existingHeight = Number(wrapper.dataset.ttRuntimePlaceholderHeight);
+    if (existingHeight > 0) return true;
+    if (!(iframe instanceof HTMLIFrameElement)) return false;
+
+    const wrapperHeight = Math.ceil(wrapper.getBoundingClientRect().height);
+    const iframeHeight = Math.ceil(iframe.getBoundingClientRect().height);
+    if (wrapperHeight <= 0 || iframeHeight <= 0) return false;
+
+    wrapper.dataset.ttRuntimePlaceholderHeight = String(wrapperHeight);
+    wrapper.dataset.ttRuntimeIframeHeight = String(iframeHeight);
+    wrapper.style.height = `${wrapperHeight}px`;
+    wrapper.style.visibility = 'hidden';
+    wrapper.setAttribute('inert', '');
+    wrapper.setAttribute('aria-hidden', 'true');
+    return true;
+}
+
+function releaseRuntimePlaceholder(wrapper, iframe) {
+    const wrapperHeight = Number(wrapper.dataset.ttRuntimePlaceholderHeight);
+    const iframeHeight = Number(wrapper.dataset.ttRuntimeIframeHeight);
+    if (!(wrapperHeight > 0) || !(iframeHeight > 0)) return;
+
+    iframe.style.height = `${iframeHeight}px`;
+    delete wrapper.dataset.ttRuntimePlaceholderHeight;
+    delete wrapper.dataset.ttRuntimeIframeHeight;
+    wrapper.style.removeProperty('height');
+    wrapper.style.removeProperty('visibility');
+    wrapper.removeAttribute('inert');
+    wrapper.removeAttribute('aria-hidden');
+}
+
+function setIframeContent(iframe, html, settings) {
+    const full = buildWrappedHtml(html);
+    if (settings.useBlob) {
+        setIframeBlobHTML(iframe, full, djb2(html));
+    } else {
+        iframe.srcdoc = full;
+    }
+}
+
+export function mountLeasedIframeRuntime({ source, signal }) {
+    if (!(source instanceof HTMLPreElement) || !source.isConnected || !source.parentNode) {
+        throw new Error('LittleWhiteBox leased runtime source is not a live <pre>');
+    }
+
+    const settings = getSettings();
+    const code = source.querySelector(':scope > code');
+    if (!code) throw new Error('LittleWhiteBox leased runtime source lost its <code>');
+    const html = code.textContent || '';
+    const externalUrl = extractExternalUrl(html);
+    const controller = new AbortController();
+    const timeouts = new Set();
+    const animationFrames = new Set();
+    const previousDisplay = source.style.display;
+    const wrapper = getOrCreateWrapper(source);
+    const hadPlaceholder = Number(wrapper.dataset.ttRuntimePlaceholderHeight) > 0;
+    const iframe = createRenderIframe();
+    let mappedWindow = null;
+    let mappedRecord = null;
+    let disposed = false;
+    let pendingRuntimeHeight = 0;
+    let heightFrame = null;
+    let hostAbortBound = false;
+    let messageListenerAcquired = false;
+
+    const scheduleTimeout = (callback, delay) => {
+        const id = setTimeout(() => {
+            timeouts.delete(id);
+            if (!controller.signal.aborted) callback();
+        }, delay);
+        timeouts.add(id);
+        return id;
+    };
+    const scheduleHeight = (height) => {
+        pendingRuntimeHeight = height;
+        if (heightFrame !== null) return;
+        heightFrame = requestAnimationFrame(() => {
+            animationFrames.delete(heightFrame);
+            heightFrame = null;
+            if (!controller.signal.aborted) iframe.style.height = `${pendingRuntimeHeight}px`;
+        });
+        animationFrames.add(heightFrame);
+    };
+    const abort = () => controller.abort(signal.reason);
+
+    const dispose = (preservePlaceholder) => {
+        if (disposed) return;
+        disposed = true;
+        const placeholderHeld = preservePlaceholder && holdRuntimePlaceholder(wrapper, iframe);
+        let firstError;
+        const run = callback => {
+            try { callback(); } catch (error) { firstError ??= error; }
+        };
+
+        run(() => controller.abort('runtime disposed'));
+        if (hostAbortBound) run(() => signal.removeEventListener('abort', abort));
+        timeouts.forEach(id => run(() => clearTimeout(id)));
+        timeouts.clear();
+        animationFrames.forEach(id => run(() => cancelAnimationFrame(id)));
+        animationFrames.clear();
+        heightFrame = null;
+        if (mappedWindow && winMap.get(mappedWindow) === mappedRecord) {
+            run(() => winMap.delete(mappedWindow));
+        }
+        run(() => { iframe.src = 'about:blank'; });
+        run(() => iframe.removeAttribute('srcdoc'));
+        // The extension-scoped 32-entry hash cache, not one runtime, owns URL revocation.
+        run(() => releaseIframeBlob(iframe));
+        run(() => iframe.remove());
+        if (placeholderHeld) {
+            run(() => { source.style.display = 'none'; });
+        } else {
+            run(() => wrapper.remove());
+            run(() => { source.style.display = previousDisplay; });
+        }
+        if (messageListenerAcquired) run(releaseLeasedRuntimeMessageListener);
+
+        if (firstError !== undefined) throw firstError;
+    };
+
+    try {
+        signal.addEventListener('abort', abort, { once: true });
+        hostAbortBound = true;
+        acquireLeasedRuntimeMessageListener();
+        messageListenerAcquired = true;
+        wrapper.replaceChildren(iframe);
+        mappedWindow = iframe.contentWindow;
+        if (!mappedWindow) throw new Error('LittleWhiteBox leased iframe has no contentWindow');
+        mappedRecord = { iframe, wrapper, scheduleHeight };
+        winMap.set(mappedWindow, mappedRecord);
+
+        if (externalUrl) {
+            void loadExternalUrl(iframe, externalUrl, settings, {
+                signal: controller.signal,
+                scheduleTimeout,
+            });
+        } else {
+            let renderedHtml = html;
+            if (settings.variablesCore?.enabled && typeof replaceXbGetVarInString === 'function') {
+                try { renderedHtml = replaceXbGetVarInString(renderedHtml); } catch (error) {
+                    console.warn('xbgetvar 宏替换失败:', error);
+                }
+            }
+            setIframeContent(iframe, renderedHtml, settings);
+            scheduleTimeout(() => {
+                try {
+                    const targetOrigin = getIframeTargetOrigin(iframe);
+                    postToIframe(iframe, { type: 'probe' }, null, targetOrigin);
+                } catch {}
+            }, 0);
+        }
+
+        source.style.display = 'none';
+        releaseRuntimePlaceholder(wrapper, iframe);
+        return () => dispose(true);
+    } catch (error) {
+        try { dispose(hadPlaceholder); } catch (cleanupError) {
+            const failure = new Error('LittleWhiteBox leased runtime activation and cleanup failed');
+            failure.cause = error;
+            failure.cleanupError = cleanupError;
+            throw failure;
+        }
+        throw error;
+    }
+}
+
+function getOrCreateWrapper(preEl) {
+    let wrapper = preEl.previousElementSibling;
+    if (!wrapper || !wrapper.classList.contains('xiaobaix-iframe-wrapper')) {
+        wrapper = document.createElement('div');
+        wrapper.className = 'xiaobaix-iframe-wrapper';
+        wrapper.style.cssText = 'margin:0;';
+        preEl.parentNode.insertBefore(wrapper, preEl);
+    }
+    return wrapper;
+}
+
+function registerIframeMapping(iframe, wrapper) {
+    const tryMap = () => {
+        try {
+            if (iframe && iframe.contentWindow) {
+                winMap.set(iframe.contentWindow, { iframe, wrapper });
+                return true;
+            }
+        } catch (e) {}
+        return false;
+    };
+    if (tryMap()) return;
+    let tries = 0;
+    const t = setInterval(() => {
+        tries++;
+        if (tryMap() || tries > 20) clearInterval(t);
+    }, 25);
+}
+
+function resolveAvatarUrls() {
+    const origin = typeof location !== 'undefined' && location.origin ? location.origin : '';
+    const toAbsUrl = (relOrUrl) => {
+        if (!relOrUrl) return '';
+        const s = String(relOrUrl);
+        if (/^(data:|blob:|https?:)/i.test(s)) return s;
+        if (s.startsWith('User Avatars/')) {
+            return `${origin}/${s}`;
+        }
+        const encoded = s.split('/').map(seg => encodeURIComponent(seg)).join('/');
+        return `${origin}/${encoded.replace(/^\/+/, '')}`;
+    };
+    const pickSrc = (selectors) => {
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el) {
+                const highRes = el.getAttribute('data-izoomify-url');
+                if (highRes) return highRes;
+                if (el.src) return el.src;
+            }
+        }
+        return '';
+    };
+    let user = pickSrc([
+        '#user_avatar_block img',
+        '#avatar_user img',
+        '.user_avatar img',
+        'img#avatar_user',
+        '.st-user-avatar img'
+    ]) || default_user_avatar;
+    const m = String(user).match(/\/thumbnail\?type=persona&file=([^&]+)/i);
+    if (m) {
+        user = `User Avatars/${decodeURIComponent(m[1])}`;
+    }
+    const ctx = getContext?.() || {};
+    const chId = ctx.characterId ?? ctx.this_chid;
+    const ch = Array.isArray(ctx.characters) ? ctx.characters[chId] : null;
+    let char = ch?.avatar || default_avatar;
+    if (char && !/^(data:|blob:|https?:)/i.test(char)) {
+        char = String(char).includes('/') ? char.replace(/^\/+/, '') : `characters/${char}`;
+    }
+    return { user: toAbsUrl(user), char: toAbsUrl(char) };
+}
+
+function handleIframeMessage(event) {
+    const data = event.data || {};
+    let rec = winMap.get(event.source);
+    
+    if (!rec || !rec.iframe) {
+        const iframes = document.querySelectorAll('iframe.xiaobaix-iframe');
+        for (const iframe of iframes) {
+            if (iframe.contentWindow === event.source) {
+                rec = { iframe, wrapper: iframe.parentElement };
+                winMap.set(event.source, rec);
+                break;
+            }
+        }
+    }
+    if (!rec?.iframe) return;
+    
+    if (typeof data.height === 'number') {
+        const next = Math.max(0, Number(data.height) || 0);
+        if (next < 1) return;
+        if (rec.scheduleHeight) {
+            rec.scheduleHeight(next);
+            return;
+        }
+        const prev = lastHeights.get(rec.iframe) || 0;
+        if (!data.force && Math.abs(next - prev) < 1) return;
+        if (data.force) {
+            lastHeights.set(rec.iframe, next);
+            requestAnimationFrame(() => { rec.iframe.style.height = `${next}px`; });
+            return;
+        }
+        pendingHeight = next;
+        pendingRec = rec;
+        const now = performance.now();
+        const dt = now - lastApplyTs;
+        if (dt >= 50) {
+            lastApplyTs = now;
+            const h = pendingHeight, r = pendingRec;
+            pendingHeight = null;
+            pendingRec = null;
+            lastHeights.set(r.iframe, h);
+            requestAnimationFrame(() => { r.iframe.style.height = `${h}px`; });
+        } else {
+            setTimeout(() => {
+                if (pendingRec && pendingHeight != null) {
+                    lastApplyTs = performance.now();
+                    const h = pendingHeight, r = pendingRec;
+                    pendingHeight = null;
+                    pendingRec = null;
+                    lastHeights.set(r.iframe, h);
+                    requestAnimationFrame(() => { r.iframe.style.height = `${h}px`; });
+                }
+            }, Math.max(0, 50 - dt));
+        }
+        return;
+    }
+    
+    if (data && data.type === 'runCommand') {
+        const replyOrigin = (typeof event.origin === 'string' && event.origin) ? event.origin : getTrustedOrigin();
+        executeSlashCommand(data.command)
+            .then(result => event.source.postMessage({
+                source: 'xiaobaix-host',
+                type: 'commandResult',
+                id: data.id,
+                result
+            }, replyOrigin))
+            .catch(err => event.source.postMessage({
+                source: 'xiaobaix-host',
+                type: 'commandError',
+                id: data.id,
+                error: err.message || String(err)
+            }, replyOrigin));
+        return;
+    }
+    
+    if (data && data.type === 'getAvatars') {
+        const replyOrigin = (typeof event.origin === 'string' && event.origin) ? event.origin : getTrustedOrigin();
+        try {
+            const urls = resolveAvatarUrls();
+            event.source?.postMessage({ source: 'xiaobaix-host', type: 'avatars', urls }, replyOrigin);
+        } catch (e) {
+            event.source?.postMessage({ source: 'xiaobaix-host', type: 'avatars', urls: { user: '', char: '' } }, replyOrigin);
+        }
+        return;
+    }
+}
+
+export function renderHtmlInIframe(htmlContent, container, preElement) {
+    const settings = getSettings();
+    try {
+        const originalHash = djb2(htmlContent);
+        const externalUrl = extractExternalUrl(htmlContent);
+        const iframe = createRenderIframe();
+        
+        const wrapper = getOrCreateWrapper(preElement);
+        wrapper.querySelectorAll('.xiaobaix-iframe').forEach(old => {
+            try { old.src = 'about:blank'; } catch (e) {}
+            releaseIframeBlob(old);
+            old.remove();
+        });
+
+        wrapper.appendChild(iframe);
+        preElement.classList.remove('xb-show');
+        preElement.style.display = 'none';
+        registerIframeMapping(iframe, wrapper);
+
+        if (externalUrl) {
+            loadExternalUrl(iframe, externalUrl, settings);
+        } else {
+            if (settings.variablesCore?.enabled && typeof replaceXbGetVarInString === 'function') {
+                try {
+                    htmlContent = replaceXbGetVarInString(htmlContent);
+                } catch (e) {
+                    console.warn('xbgetvar 宏替换失败:', e);
+                }
+            }
+
+            setIframeContent(iframe, htmlContent, settings);
+
+            try {
+                const targetOrigin = getIframeTargetOrigin(iframe);
+                postToIframe(iframe, { type: 'probe' }, null, targetOrigin);
+            } catch (e) {}
+        }
+
+        preElement.dataset.xbFinal = 'true';
+        preElement.dataset.xbHash = originalHash;
+
+        return iframe;
+    } catch (err) {
+        console.error('[iframeRenderer] 渲染失败:', err);
+        return null;
+    }
+}
+
+export function processCodeBlocks(messageElement, forceFinal = true) {
+    const settings = getSettings();
+    if (!settings.enabled) return;
+    if (settings.renderEnabled === false) return;
+    
+    try {
+        const codeBlocks = messageElement.querySelectorAll('pre > code');
+        const ctx = getContext();
+        const lastId = ctx.chat?.length - 1;
+        const mesEl = messageElement.closest('.mes');
+        const mesId = mesEl ? Number(mesEl.getAttribute('mesid')) : null;
+        
+        if (isGenerating && mesId === lastId && !forceFinal) return;
+        
+        codeBlocks.forEach(codeBlock => {
+            const preElement = codeBlock.parentElement;
+            const should = shouldRenderCodeBlock(codeBlock);
+            const html = codeBlock.textContent || '';
+            const hash = djb2(html);
+            const externalUrl = extractExternalUrl(html);
+            const isFinal = preElement.dataset.xbFinal === 'true';
+            const same = preElement.dataset.xbHash === hash;
+
+            if (!externalUrl && isFinal && same) return;
+            
+            if (should) {
+                renderHtmlInIframe(html, preElement.parentNode, preElement);
+            } else {
+                preElement.classList.add('xb-show');
+                preElement.removeAttribute('data-xbfinal');
+                preElement.removeAttribute('data-xbhash');
+                preElement.style.display = '';
+            }
+            preElement.dataset.xiaobaixBound = 'true';
+        });
+    } catch (err) {
+        console.error('[iframeRenderer] processCodeBlocks 失败:', err);
+    }
+}
+
+export function processExistingMessages() {
+    const settings = getSettings();
+    if (!settings.enabled) return;
+    document.querySelectorAll('.mes_text').forEach(el => processCodeBlocks(el, true));
+    try { shrinkRenderedWindowFull(); } catch (e) {}
+}
+
+export function processMessageById(messageId, forceFinal = true) {
+    const messageElement = document.querySelector(`div.mes[mesid="${messageId}"] .mes_text`);
+    if (!messageElement) return;
+    processCodeBlocks(messageElement, forceFinal);
+    try { shrinkRenderedWindowForLastMessage(); } catch (e) {}
+}
+
+export function invalidateMessage(messageId) {
+    const el = document.querySelector(`div.mes[mesid="${messageId}"] .mes_text`);
+    if (!el) return;
+    el.querySelectorAll('.xiaobaix-iframe-wrapper').forEach(w => {
+        w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => {
+            try { ifr.src = 'about:blank'; } catch (e) {}
+            releaseIframeBlob(ifr);
+        });
+        w.remove();
+    });
+    el.querySelectorAll('pre').forEach(pre => {
+        pre.classList.remove('xb-show');
+        pre.removeAttribute('data-xbfinal');
+        pre.removeAttribute('data-xbhash');
+        delete pre.dataset.xbFinal;
+        delete pre.dataset.xbHash;
+        pre.style.display = '';
+        delete pre.dataset.xiaobaixBound;
+    });
+}
+
+export function invalidateAll() {
+    document.querySelectorAll('.xiaobaix-iframe-wrapper').forEach(w => {
+        w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => {
+            try { ifr.src = 'about:blank'; } catch (e) {}
+            releaseIframeBlob(ifr);
+        });
+        w.remove();
+    });
+    document.querySelectorAll('.mes_text pre').forEach(pre => {
+        pre.classList.remove('xb-show');
+        pre.removeAttribute('data-xbfinal');
+        pre.removeAttribute('data-xbhash');
+        delete pre.dataset.xbFinal;
+        delete pre.dataset.xbHash;
+        delete pre.dataset.xiaobaixBound;
+        pre.style.display = '';
+    });
+    clearBlobCaches();
+    winMap.clear();
+    lastHeights = new WeakMap();
+}
+
+function shrinkRenderedWindowForLastMessage() {
+    const settings = getSettings();
+    if (!settings.enabled) return;
+    if (settings.renderEnabled === false) return;
+    const max = Number.isFinite(settings.maxRenderedMessages) && settings.maxRenderedMessages > 0
+        ? settings.maxRenderedMessages
+        : 0;
+    if (max <= 0) return;
+    const ctx = getContext?.();
+    const chatArr = ctx?.chat;
+    if (!Array.isArray(chatArr) || chatArr.length === 0) return;
+    const lastId = chatArr.length - 1;
+    if (lastId < 0) return;
+    const keepFrom = Math.max(0, lastId - max + 1);
+    const mesList = document.querySelectorAll('div.mes');
+    for (const mes of mesList) {
+        const mesIdAttr = mes.getAttribute('mesid');
+        if (mesIdAttr == null) continue;
+        const mesId = Number(mesIdAttr);
+        if (!Number.isFinite(mesId)) continue;
+        if (mesId >= keepFrom) break;
+        const mesText = mes.querySelector('.mes_text');
+        if (!mesText) continue;
+        mesText.querySelectorAll('.xiaobaix-iframe-wrapper').forEach(w => {
+            w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => {
+                try { ifr.src = 'about:blank'; } catch (e) {}
+                releaseIframeBlob(ifr);
+            });
+            w.remove();
+        });
+        mesText.querySelectorAll('pre[data-xiaobaix-bound="true"]').forEach(pre => {
+            pre.classList.remove('xb-show');
+            pre.removeAttribute('data-xbfinal');
+            pre.removeAttribute('data-xbhash');
+            delete pre.dataset.xbFinal;
+            delete pre.dataset.xbHash;
+            delete pre.dataset.xiaobaixBound;
+            pre.style.display = '';
+        });
+    }
+}
+
+function shrinkRenderedWindowFull() {
+    const settings = getSettings();
+    if (!settings.enabled) return;
+    if (settings.renderEnabled === false) return;
+    const max = Number.isFinite(settings.maxRenderedMessages) && settings.maxRenderedMessages > 0
+        ? settings.maxRenderedMessages
+        : 0;
+    if (max <= 0) return;
+    const ctx = getContext?.();
+    const chatArr = ctx?.chat;
+    if (!Array.isArray(chatArr) || chatArr.length === 0) return;
+    const lastId = chatArr.length - 1;
+    const keepFrom = Math.max(0, lastId - max + 1);
+    const mesList = document.querySelectorAll('div.mes');
+    for (const mes of mesList) {
+        const mesIdAttr = mes.getAttribute('mesid');
+        if (mesIdAttr == null) continue;
+        const mesId = Number(mesIdAttr);
+        if (!Number.isFinite(mesId)) continue;
+        if (mesId >= keepFrom) continue;
+        const mesText = mes.querySelector('.mes_text');
+        if (!mesText) continue;
+        mesText.querySelectorAll('.xiaobaix-iframe-wrapper').forEach(w => {
+            w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => {
+                try { ifr.src = 'about:blank'; } catch (e) {}
+                releaseIframeBlob(ifr);
+            });
+            w.remove();
+        });
+        mesText.querySelectorAll('pre[data-xiaobaix-bound="true"]').forEach(pre => {
+            pre.classList.remove('xb-show');
+            pre.removeAttribute('data-xbfinal');
+            pre.removeAttribute('data-xbhash');
+            delete pre.dataset.xbFinal;
+            delete pre.dataset.xbHash;
+            delete pre.dataset.xiaobaixBound;
+            pre.style.display = '';
+        });
+    }
+}
+
+export function initRenderer() {
+    const settings = getSettings();
+    if (!settings.enabled) return;
+    
+    try { xbLog.info(MODULE_ID, 'initRenderer'); } catch {}
+    
+    if (settings.renderEnabled !== false) {
+        ensureHideCodeStyle(true);
+        setActiveClass(true);
+    }
+    
+    events.on(event_types.GENERATION_STARTED, () => {
+        isGenerating = true;
+    });
+    
+    events.on(event_types.GENERATION_ENDED, () => {
+        isGenerating = false;
+        const ctx = getContext();
+        const lastId = ctx.chat?.length - 1;
+        if (lastId != null && lastId >= 0) {
+            setTimeout(() => {
+                processMessageById(lastId, true);
+            }, 60);
+        }
+    });
+    
+    events.on(event_types.MESSAGE_RECEIVED, (data) => {
+        setTimeout(() => {
+            const messageId = typeof data === 'object' ? data.messageId : data;
+            if (messageId != null) {
+                processMessageById(messageId, true);
+            }
+        }, 300);
+    });
+    
+    events.on(event_types.MESSAGE_UPDATED, (data) => {
+        const messageId = typeof data === 'object' ? data.messageId : data;
+        if (messageId != null) {
+            processMessageById(messageId, true);
+        }
+    });
+    
+    events.on(event_types.MESSAGE_EDITED, (data) => {
+        const messageId = typeof data === 'object' ? data.messageId : data;
+        if (messageId != null) {
+            processMessageById(messageId, true);
+        }
+    });
+    
+    events.on(event_types.MESSAGE_DELETED, (data) => {
+        const messageId = typeof data === 'object' ? data.messageId : data;
+        if (messageId != null) {
+            invalidateMessage(messageId);
+        }
+    });
+    
+    events.on(event_types.MESSAGE_SWIPED, (data) => {
+        setTimeout(() => {
+            const messageId = typeof data === 'object' ? data.messageId : data;
+            if (messageId != null) {
+                processMessageById(messageId, true);
+            }
+        }, 10);
+    });
+    
+    events.on(event_types.USER_MESSAGE_RENDERED, (data) => {
+        setTimeout(() => {
+            const messageId = typeof data === 'object' ? data.messageId : data;
+            if (messageId != null) {
+                processMessageById(messageId, true);
+            }
+        }, 10);
+    });
+    
+    events.on(event_types.CHARACTER_MESSAGE_RENDERED, (data) => {
+        setTimeout(() => {
+            const messageId = typeof data === 'object' ? data.messageId : data;
+            if (messageId != null) {
+                processMessageById(messageId, true);
+            }
+        }, 10);
+    });
+    
+    events.on(event_types.CHAT_CHANGED, () => {
+        isGenerating = false;
+        invalidateAll();
+        setTimeout(() => {
+            processExistingMessages();
+        }, 100);
+    });
+    
+    if (!messageListenerBound) {
+        // eslint-disable-next-line no-restricted-syntax -- message bridge for iframe renderers.
+        window.addEventListener('message', handleIframeMessage);
+        messageListenerBound = true;
+    }
+    
+    setTimeout(processExistingMessages, 100);
+}
+
+export function cleanupRenderer() {
+    try { xbLog.info(MODULE_ID, 'cleanupRenderer'); } catch {}
+    events.cleanup();
+    if (messageListenerBound) {
+        window.removeEventListener('message', handleIframeMessage);
+        messageListenerBound = false;
+    }
+    
+    ensureHideCodeStyle(false);
+    setActiveClass(false);
+    
+    document.querySelectorAll('pre[data-xiaobaix-bound="true"]').forEach(pre => {
+        pre.classList.remove('xb-show');
+        pre.removeAttribute('data-xbfinal');
+        pre.removeAttribute('data-xbhash');
+        delete pre.dataset.xbFinal;
+        delete pre.dataset.xbHash;
+        pre.style.display = '';
+        delete pre.dataset.xiaobaixBound;
+    });
+    
+    invalidateAll();
+    isGenerating = false;
+    pendingHeight = null;
+    pendingRec = null;
+    lastApplyTs = 0;
+}
+
+export function isCurrentlyGenerating() {
+    return isGenerating;
+}
+
+export { shrinkRenderedWindowFull, shrinkRenderedWindowForLastMessage };

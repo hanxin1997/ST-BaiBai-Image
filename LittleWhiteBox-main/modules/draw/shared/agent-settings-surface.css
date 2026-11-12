@@ -1,0 +1,40 @@
+@import url("../../agent-core/ui/settings-surface.css");
+
+.draw-agent-settings-surface {
+    max-width: 920px;
+}
+
+.draw-agent-settings-state {
+    min-height: 180px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 28px;
+    color: var(--text-secondary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+}
+
+.draw-agent-settings-state.is-error {
+    color: var(--danger);
+}
+
+.draw-agent-settings-state button {
+    min-height: 34px;
+    padding: 0 12px;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: inherit;
+    cursor: pointer;
+}
+
+.draw-agent-settings-state button:hover,
+.draw-agent-settings-state button:focus-visible {
+    color: var(--accent);
+    border-color: var(--border-focus);
+    outline: none;
+}

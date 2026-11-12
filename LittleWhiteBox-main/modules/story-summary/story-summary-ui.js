@@ -1,0 +1,3157 @@
+﻿// story-summary-ui.js
+// iframe 内 UI 逻辑
+
+import { EVENT_MEMORY_ROLES, projectEditedSummaryEvents } from './data/events.js';
+import { DEFAULT_SUMMARY_DELAY_FLOORS, normalizeSummaryDelayFloors } from './data/summary-delay.js';
+import { RELATION_TRENDS } from './data/fact-predicates.js';
+import { createMemoryMaintenancePage } from './maintenance/ui.js';
+import { MEMORY_COPY } from './maintenance/copy.js';
+import { DEFAULT_MEMORY_MAINTENANCE_ENABLED } from './maintenance/settings.js';
+import { SUMMARY_FEEDBACK_COPY } from './feedback-copy.js';
+import { SUMMARY_CONFIG_LOCAL_STORAGE_KEY, writeSummaryConfigLocalCache } from './data/config-local-cache.js';
+
+const UNANNOTATED_LABEL = '未标注';
+
+(function () {
+    'use strict';
+    let memoryMaintenancePage;
+
+    function formatVectorPackageCounts(result) {
+        return `${result.stateVectorCount} 锚点向量、${result.chunkCount} 片段向量、${result.eventCount} 事件向量`;
+    }
+
+    function normalizeApiBaseUrl(url) {
+        return String(url || '').trim().replace(/\/+$/, '');
+    }
+
+    function normalizeApiPrefix(prefix) {
+        const raw = String(prefix || '').trim();
+        if (!raw) return '';
+        return `/${raw.replace(/^\/+/, '').replace(/\/+$/, '')}`;
+    }
+
+    function hasExplicitApiVersion(url) {
+        const baseUrl = normalizeApiBaseUrl(url);
+        return /\/v\d[\w.-]*$/i.test(baseUrl);
+    }
+
+    function getDefaultApiPrefix(provider) {
+        const key = String(provider || '').trim().toLowerCase();
+        if (key === 'google' || key === 'gemini') return '/v1beta';
+        return '/v1';
+    }
+
+    function resolveApiBaseUrl(url, defaultPrefix = '') {
+        const baseUrl = normalizeApiBaseUrl(url);
+        const prefix = normalizeApiPrefix(defaultPrefix);
+        if (!baseUrl || !prefix || hasExplicitApiVersion(baseUrl)) return baseUrl;
+        if (baseUrl.toLowerCase().endsWith(prefix.toLowerCase())) return baseUrl;
+        return `${baseUrl}${prefix}`;
+    }
+
+    function joinApiUrl(baseUrl, path) {
+        const normalizedBase = normalizeApiBaseUrl(baseUrl);
+        const normalizedPath = String(path || '').startsWith('/') ? String(path || '') : `/${String(path || '')}`;
+        return normalizedBase ? `${normalizedBase}${normalizedPath}` : normalizedPath;
+    }
+
+    function getModelListCandidateUrls(url, defaultPrefix = '') {
+        const baseUrl = normalizeApiBaseUrl(url);
+        if (!baseUrl) return [];
+
+        const candidates = [joinApiUrl(baseUrl, '/models')];
+        const resolvedBase = resolveApiBaseUrl(baseUrl, defaultPrefix);
+        if (resolvedBase && resolvedBase !== baseUrl) {
+            candidates.push(joinApiUrl(resolvedBase, '/models'));
+        }
+
+        return [...new Set(candidates)];
+    }
+
+    async function tryParseModelIds(url, fetchOptions = {}) {
+        try {
+            const res = await fetch(url, fetchOptions);
+            if (!res.ok) return null;
+            const data = await res.json();
+            return data?.data?.map(m => m?.id).filter(Boolean) || null;
+        } catch {
+            return null;
+        }
+    }
+
+    const DEFAULT_MEMORY_PROMPT_TEMPLATE = `以上是还留在眼前的对话
+以下是脑海里的记忆：
+• [定了的事] 已确立的事实，以后续明确发生的变化为准
+• [其他人的事] 别人的经历，当前角色可能不知晓
+• 其余部分是过往经历的回忆碎片
+
+请内化这些记忆：剧情中已确立的事实与关系发展，优先于初始设定中的旧状态。
+{$剧情记忆}
+这些记忆是真实的，请自然地记住它们，并结合当前剧情理解事件距今多久。`;
+
+    const EMPTY_BUILTIN_SUMMARY_PROMPTS = Object.freeze({
+        summarySystemPrompt: '',
+        summaryAssistantDocPrompt: '',
+        summaryAssistantAskSummaryPrompt: '',
+        summaryAssistantAskContentPrompt: '',
+        summaryMetaProtocolStartPrompt: '',
+        summaryUserJsonFormatPrompt: '',
+        summaryAssistantCheckPrompt: '',
+        summaryUserConfirmPrompt: '',
+        summaryUserGeneratePrompt: '',
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // DOM Helpers
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const $ = id => document.getElementById(id);
+    const $$ = sel => document.querySelectorAll(sel);
+    const h = v => String(v ?? '').replace(/[&<>"']/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]
+    );
+    const setHtml = (el, html) => {
+        if (!el) return;
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        // eslint-disable-next-line no-unsanitized/method
+        const fragment = range.createContextualFragment(String(html ?? ''));
+        el.replaceChildren(fragment);
+    };
+    const setSelectOptions = (select, items, placeholderText) => {
+        if (!select) return;
+        select.replaceChildren();
+        if (placeholderText != null) {
+            const option = document.createElement('option');
+            option.value = '';
+            option.textContent = placeholderText;
+            select.appendChild(option);
+        }
+        (items || []).forEach(item => {
+            const option = document.createElement('option');
+            option.value = item;
+            option.textContent = item;
+            select.appendChild(option);
+        });
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Constants
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const PARENT_ORIGIN = (() => {
+        try { return new URL(document.referrer).origin; }
+        catch { return window.location.origin; }
+    })();
+
+    const PROVIDER_DEFAULTS = {
+        st: { url: '', needKey: false, canFetch: false },
+        openai: { url: 'https://api.openai.com', needKey: true, canFetch: true },
+        google: { url: 'https://generativelanguage.googleapis.com', needKey: true, canFetch: false },
+        claude: { url: 'https://api.anthropic.com', needKey: true, canFetch: false }
+    };
+    const VECTOR_PROVIDER_DEFAULTS = {
+        siliconflow: { url: 'https://api.siliconflow.cn/v1', needKey: true, canFetch: true },
+        openrouter: { url: 'https://openrouter.ai/api/v1', needKey: true, canFetch: true },
+        custom: { url: '', needKey: true, canFetch: true }
+    };
+
+    const VECTOR_API_SUPPORTED_PROVIDERS = {
+        l0: ['siliconflow', 'openrouter', 'custom'],
+        embedding: ['siliconflow', 'custom'],
+        rerank: ['siliconflow', 'custom'],
+    };
+
+    const VECTOR_API_DEFAULT_MODELS = {
+        l0: 'Qwen/Qwen3-8B',
+        embedding: 'BAAI/bge-m3',
+        rerank: 'BAAI/bge-reranker-v2-m3',
+    };
+
+    const VECTOR_MODEL_FILTERS = {
+        embedding: {
+            include: [
+                'embedding', 'embed', 'bge-m3', 'bge-large', 'bge-base', 'e5-', 'multilingual-e5',
+                'jina-embeddings', 'text-embedding', 'voyage', 'gte-', 'gte_', 'gte.'
+            ],
+            exclude: [
+                'rerank', 'reranker', 'chat', 'instruct', 'reasoner', 'vl', 'vision',
+                'tts', 'speech', 'audio', 'whisper', 'transcription', 'image', 'sdxl', 'moderation'
+            ],
+        },
+        rerank: {
+            include: [
+                'rerank', 'reranker', 'bge-reranker', 'jina-reranker', 'cohere-rerank'
+            ],
+            exclude: [
+                'embedding', 'embed', 'chat', 'instruct', 'reasoner', 'vl', 'vision',
+                'tts', 'speech', 'audio', 'whisper', 'transcription', 'image', 'sdxl', 'moderation'
+            ],
+        },
+        l0: {
+            include: [],
+            exclude: [
+                'embedding', 'embed', 'rerank', 'reranker', 'tts', 'speech', 'audio',
+                'whisper', 'transcription', 'stt', 'image', 'sdxl', 'flux', 'wanx',
+                'midjourney', 'moderation'
+            ],
+        },
+    };
+
+    function setStatusText(el, message, kind = '') {
+        if (!el) return;
+        el.textContent = message || '';
+        el.style.color = kind === 'error'
+            ? '#ef4444'
+            : kind === 'success'
+                ? '#22c55e'
+                : kind === 'loading'
+                    ? '#f59e0b'
+                    : '';
+    }
+
+    function filterVectorModelsByPurpose(prefix, models) {
+        const rule = VECTOR_MODEL_FILTERS[prefix];
+        if (!rule || !Array.isArray(models)) return [];
+
+        const normalized = [...new Set(models.filter(Boolean).map(m => String(m).trim()).filter(Boolean))];
+        const matched = normalized.filter(modelId => {
+            const lower = modelId.toLowerCase();
+            if (rule.exclude.some(keyword => lower.includes(keyword))) return false;
+            if (!rule.include.length) return true;
+            return rule.include.some(keyword => lower.includes(keyword));
+        });
+
+        return matched.length ? matched : normalized;
+    }
+
+    function createDefaultProviderProfile(provider, model = '') {
+        const pv = VECTOR_PROVIDER_DEFAULTS[provider] || VECTOR_PROVIDER_DEFAULTS.custom;
+        return {
+            url: pv.url || '',
+            key: '',
+            model: model || '',
+            modelCache: [],
+        };
+    }
+
+    function normalizeProviderProfiles(prefix, apiCfg = {}) {
+        const supported = VECTOR_API_SUPPORTED_PROVIDERS[prefix] || ['custom'];
+        const model = apiCfg.model || VECTOR_API_DEFAULT_MODELS[prefix] || '';
+        const out = {};
+        supported.forEach(provider => {
+            const raw = apiCfg.providers?.[provider] || {};
+            const defaults = createDefaultProviderProfile(provider, model);
+            out[provider] = {
+                url: String(raw.url || defaults.url || '').trim(),
+                key: String(raw.key || '').trim(),
+                model: String(raw.model || defaults.model || '').trim(),
+                modelCache: Array.isArray(raw.modelCache) ? raw.modelCache.filter(Boolean) : [],
+            };
+        });
+
+        const currentProvider = String(apiCfg.provider || supported[0] || 'custom').toLowerCase();
+        if (out[currentProvider]) {
+            if (apiCfg.url && !out[currentProvider].url) out[currentProvider].url = String(apiCfg.url).trim();
+            if (apiCfg.key && !out[currentProvider].key) out[currentProvider].key = String(apiCfg.key).trim();
+            if (apiCfg.model && !out[currentProvider].model) out[currentProvider].model = String(apiCfg.model).trim();
+            if (Array.isArray(apiCfg.modelCache) && !out[currentProvider].modelCache.length) {
+                out[currentProvider].modelCache = apiCfg.modelCache.filter(Boolean);
+            }
+        }
+
+        return out;
+    }
+
+    const SECTION_META = {
+        keywords: { title: '编辑关键词', hint: '每行一个关键词，格式：关键词|权重（核心/重要/一般）' },
+        events: { title: '编辑事件时间线', hint: '编辑时，每个事件要素都应完整' },
+        characters: { title: '编辑人物关系', hint: '编辑时，每个要素都应完整' },
+        arcs: { title: '编辑角色弧光', hint: '编辑时，每个要素都应完整' },
+        facts: { title: '编辑事实图谱', hint: '每行一条：主体|谓词|值|趋势(可选)。删除用：主体|谓词|（留空值）' },
+        aliases: { title: '编辑别名映射', hint: '别名与角色主名必须不同；确认依据可留空' }
+    };
+
+    const TREND_COLORS = {
+        '破裂': '#444444', '厌恶': '#8b0000', '反感': '#cd5c5c',
+        '陌生': '#888888', '投缘': '#4a9a7e', '亲密': '#d87a7a', '交融': '#c71585'
+    };
+
+    const TREND_CLASS = {
+        '破裂': 'trend-broken', '厌恶': 'trend-hate', '反感': 'trend-dislike',
+        '陌生': 'trend-stranger', '投缘': 'trend-click', '亲密': 'trend-close', '交融': 'trend-merge'
+    };
+
+    const DEFAULT_FILTER_RULES = [
+        { start: '<think>', end: '</think>' },
+        { start: '<thinking>', end: '</thinking>' },
+        { start: '```', end: '```' },
+    ];
+    const VALID_TRIGGER_TIMINGS = new Set(['after_ai', 'before_user']);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // State
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const config = {
+        memoryMaintenanceEnabled: DEFAULT_MEMORY_MAINTENANCE_ENABLED,
+        api: { provider: 'st', url: '', key: '', model: '', modelCache: [] },
+        gen: { temperature: null, top_p: null, top_k: null, presence_penalty: null, frequency_penalty: null },
+        trigger: { enabled: false, interval: 20, delayFloors: DEFAULT_SUMMARY_DELAY_FLOORS, timing: 'before_user', role: 'system', useStream: true, maxPerRun: 100, wrapperHead: '', wrapperTail: '', forceInsertAtEnd: false },
+        ui: { hideSummarized: true, keepVisibleCount: 6, useVectorBoundary: true },
+        prompts: {
+            memoryTemplate: '',
+        },
+        textFilterRules: [...DEFAULT_FILTER_RULES],
+        vector: {
+            enabled: false,
+            engine: 'online',
+            l0Concurrency: 10,
+            l0Api: {
+                provider: 'siliconflow', url: 'https://api.siliconflow.cn/v1', key: '', model: 'Qwen/Qwen3-8B', modelCache: [],
+                providers: {
+                    siliconflow: createDefaultProviderProfile('siliconflow', 'Qwen/Qwen3-8B'),
+                    openrouter: createDefaultProviderProfile('openrouter', 'Qwen/Qwen3-8B'),
+                    custom: createDefaultProviderProfile('custom', 'Qwen/Qwen3-8B'),
+                }
+            },
+            embeddingApi: {
+                provider: 'siliconflow', url: 'https://api.siliconflow.cn/v1', key: '', model: 'BAAI/bge-m3', modelCache: [],
+                providers: {
+                    siliconflow: createDefaultProviderProfile('siliconflow', 'BAAI/bge-m3'),
+                    custom: createDefaultProviderProfile('custom', 'BAAI/bge-m3'),
+                }
+            },
+            rerankApi: {
+                provider: 'siliconflow', url: 'https://api.siliconflow.cn/v1', key: '', model: 'BAAI/bge-reranker-v2-m3', modelCache: [],
+                providers: {
+                    siliconflow: createDefaultProviderProfile('siliconflow', 'BAAI/bge-reranker-v2-m3'),
+                    custom: createDefaultProviderProfile('custom', 'BAAI/bge-reranker-v2-m3'),
+                }
+            }
+        }
+    };
+
+    let summaryData = { keywords: [], events: [], characters: { main: [], relationships: [] }, arcs: [], facts: [], characterAliases: [] };
+    let builtInSummaryPrompts = { ...EMPTY_BUILTIN_SUMMARY_PROMPTS };
+    let localGenerating = false;
+    let vectorGenerating = false;
+    let anchorGenerating = false;
+    let cleanActionState = {
+        canRollback: false,
+        rollbackTargetSummarizedUpTo: 0,
+        rollbackWillResetBoundary: false,
+        summarizedUpTo: 0,
+    };
+    let relationChart = null;
+    let relationChartFullscreen = null;
+    let currentEditSection = null;
+    let currentCharacterId = null;
+    let allNodes = [];
+    let allLinks = [];
+    let activeRelationTooltip = null;
+    let lastRecallLogText = '';
+    let modelListFetchedThisIframe = false;
+    let configSaveSeq = 0;
+    let summaryModelFetchSeq = 0;
+    let pendingSummaryModelFetchRequestId = '';
+    let summaryModelFetchTimeoutId = null;
+    let timelineHasRenderedEvents = false;
+    let currentTimelineChatId = '';
+    const TL_PAGE_SIZE = 20;
+    const TL_PAGING_KEY = 'xb-tl-paging';
+    const TL_PAGE_KEY = 'xb-tl-page';
+    let tlPagingEnabled = false;
+    let tlCurrentPage = -1;
+    let settingsSaveTimeoutId = null;
+    let currentChatSummaryEnabled = true;
+    let currentChatSummaryPending = true;
+    let panelConfigLoad = { status: 'loading', error: '' };
+    let settingsOpenedWithServerConfig = false;
+    const pendingConfigSaveRequests = new Map();
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Messaging
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function postMsg(type, data = {}) {
+        window.parent.postMessage({ source: 'LittleWhiteBox-StoryFrame', type, ...data }, PARENT_ORIGIN);
+    }
+
+    function isBusyLike() {
+        return !!(localGenerating || vectorGenerating || anchorGenerating);
+    }
+
+    function nextConfigSaveRequestId() {
+        configSaveSeq += 1;
+        return `summary-config-save-${Date.now()}-${configSaveSeq}`;
+    }
+
+    function nextSummaryModelFetchRequestId() {
+        summaryModelFetchSeq += 1;
+        return `summary-model-fetch-${Date.now()}-${summaryModelFetchSeq}`;
+    }
+
+    function resetSummaryModelFetchUi() {
+        if (summaryModelFetchTimeoutId) {
+            clearTimeout(summaryModelFetchTimeoutId);
+            summaryModelFetchTimeoutId = null;
+        }
+        $('btn-connect').disabled = false;
+        $('btn-connect').textContent = '连接 / 拉取模型列表';
+    }
+
+    function resetSettingsSaveUi() {
+        if (settingsSaveTimeoutId) {
+            clearTimeout(settingsSaveTimeoutId);
+            settingsSaveTimeoutId = null;
+        }
+        const btn = $('settings-save');
+        if (btn) {
+            btn.disabled = panelConfigLoad.status !== 'ready';
+            btn.textContent = panelConfigLoad.status === 'loading' ? SUMMARY_FEEDBACK_COPY.configLoad.waiting : MEMORY_COPY.settingsSave;
+        }
+    }
+
+    function showPanelConfigLoadState(status, error = '') {
+        panelConfigLoad = { status, error };
+        const notice = $('settings-config-status');
+        notice.hidden = status === 'ready';
+        notice.dataset.state = status;
+        $('settings-config-message').textContent = status === 'error'
+            ? `${SUMMARY_FEEDBACK_COPY.configLoad.failed} ${error}`.trim()
+            : SUMMARY_FEEDBACK_COPY.configLoad.loading;
+        const retry = $('settings-config-retry');
+        retry.textContent = SUMMARY_FEEDBACK_COPY.configLoad.retry;
+        retry.hidden = status !== 'error';
+        for (const prefix of ['l0', 'embedding', 'rerank']) {
+            $(`${prefix}-btn-save`).disabled = status !== 'ready';
+        }
+        resetSettingsSaveUi();
+    }
+
+    function retryPanelConfigLoad() {
+        if (panelConfigLoad.status !== 'error') return;
+        showPanelConfigLoadState('loading');
+        postMsg('REQUEST_PANEL_CONFIG');
+    }
+
+    function normalizeVectorConfigUI(raw = null) {
+        const base = JSON.parse(JSON.stringify(config.vector));
+        const legacyOnline = raw?.online || {};
+        const sharedKey = String(legacyOnline.key || '').trim();
+        const sharedUrl = String(legacyOnline.url || '').trim();
+
+        if (raw) {
+            base.enabled = !!raw.enabled;
+            base.engine = 'online';
+            base.l0Concurrency = Math.max(1, Math.min(50, Number(raw.l0Concurrency) || 10));
+            Object.assign(base.l0Api, {
+                provider: raw.l0Api?.provider || legacyOnline.provider || base.l0Api.provider,
+                url: raw.l0Api?.url || sharedUrl || base.l0Api.url,
+                key: raw.l0Api?.key || sharedKey || base.l0Api.key,
+                model: raw.l0Api?.model || base.l0Api.model,
+                modelCache: Array.isArray(raw.l0Api?.modelCache) ? raw.l0Api.modelCache : [],
+                providers: normalizeProviderProfiles('l0', raw.l0Api || {}),
+            });
+            Object.assign(base.embeddingApi, {
+                provider: raw.embeddingApi?.provider || base.embeddingApi.provider,
+                url: raw.embeddingApi?.url || sharedUrl || base.embeddingApi.url,
+                key: raw.embeddingApi?.key || sharedKey || base.embeddingApi.key,
+                model: raw.embeddingApi?.model || legacyOnline.model || base.embeddingApi.model,
+                modelCache: Array.isArray(raw.embeddingApi?.modelCache) ? raw.embeddingApi.modelCache : [],
+                providers: normalizeProviderProfiles('embedding', raw.embeddingApi || {}),
+            });
+            Object.assign(base.rerankApi, {
+                provider: raw.rerankApi?.provider || base.rerankApi.provider,
+                url: raw.rerankApi?.url || sharedUrl || base.rerankApi.url,
+                key: raw.rerankApi?.key || sharedKey || base.rerankApi.key,
+                model: raw.rerankApi?.model || base.rerankApi.model,
+                modelCache: Array.isArray(raw.rerankApi?.modelCache) ? raw.rerankApi.modelCache : [],
+                providers: normalizeProviderProfiles('rerank', raw.rerankApi || {}),
+            });
+        }
+
+        return base;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Config Management
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function normalizeTriggerTiming(value) {
+        return VALID_TRIGGER_TIMINGS.has(value) ? value : 'before_user';
+    }
+
+    function normalizeTriggerConfig() {
+        if (config.trigger.timing === 'manual') {
+            config.trigger.timing = 'before_user';
+            config.trigger.enabled = false;
+        } else {
+            config.trigger.timing = normalizeTriggerTiming(config.trigger.timing);
+        }
+    }
+
+    function syncCurrentChatSummaryControls(
+        enabled = currentChatSummaryEnabled,
+        effectiveEnabled = enabled,
+        consumable = effectiveEnabled,
+    ) {
+        currentChatSummaryEnabled = enabled !== false;
+        const controlsEnabled = effectiveEnabled && consumable && !currentChatSummaryPending;
+        const toggle = $('current-chat-enabled');
+        if (toggle) {
+            toggle.checked = currentChatSummaryEnabled;
+            toggle.disabled = currentChatSummaryPending;
+        }
+
+        const generateButton = $('btn-generate');
+        if (generateButton) {
+            generateButton.disabled = !controlsEnabled;
+            generateButton.title = currentChatSummaryPending
+                ? '正在同步当前聊天状态'
+                : !effectiveEnabled
+                    ? '请先启用当前聊天的剧情总结'
+                    : !consumable
+                        ? '总结历史无法安全回滚；请导出并修正后重新导入，或清空总结数据'
+                        : '';
+        }
+
+        for (const id of ['hide-summarized', 'keep-visible-count', 'use-vector-boundary']) {
+            const control = $(id);
+            if (control) control.disabled = !controlsEnabled;
+        }
+        syncVectorBoundaryControl(config.vector?.enabled, controlsEnabled && config.ui.hideSummarized);
+    }
+
+    function syncAutoSummaryControls() {
+        const en = $('trigger-enabled');
+        const timing = $('trigger-timing');
+        const autoSummaryOptions = $('auto-summary-options');
+        if (!en || !timing) return;
+
+        timing.value = normalizeTriggerTiming(timing.value || config.trigger.timing);
+        en.disabled = false;
+        en.parentElement.style.opacity = '1';
+        if (autoSummaryOptions) {
+            autoSummaryOptions.classList.toggle('hidden', !en.checked);
+        }
+    }
+
+    function syncVectorBoundaryControl(vectorEnabled = config.vector?.enabled, hideEnabled = config.ui.hideSummarized) {
+        const input = $('use-vector-boundary');
+        const label = $('lbl-vector-boundary');
+        const info = $('vector-boundary-info');
+        const container = $('container-vector-boundary');
+        if (!input || !label || !container) return;
+
+        const enabled = !!vectorEnabled && !!hideEnabled;
+        input.checked = config.ui.useVectorBoundary !== false;
+        input.disabled = !enabled;
+        container.classList.toggle('is-disabled', !enabled);
+        label.classList.toggle('is-disabled', !enabled);
+
+        const title = !vectorEnabled
+            ? '需先启用向量功能'
+            : !hideEnabled
+                ? '需先开启“隐藏已总结”'
+                : '开：按最新向量楼层作为隐藏计算锚点\n关：按最新的大总结楼层作为隐藏计算锚点\n提示：若您的第三方模型 API 支持 Context Caching（上下文缓存），关闭此项可提高缓存命中率；开启此项则影响命中，但语义和上下文更自然';
+        label.title = title;
+        if (info) {
+            info.title = title;
+            info.onclick = e => {
+                e.preventDefault();
+                e.stopPropagation();
+                alert(title);
+            };
+        }
+    }
+
+    function loadConfig() {
+        try {
+            const s = localStorage.getItem(SUMMARY_CONFIG_LOCAL_STORAGE_KEY);
+            if (s) {
+                const p = JSON.parse(s);
+                config.memoryMaintenanceEnabled = p.memoryMaintenanceEnabled === true;
+                Object.assign(config.api, p.api || {});
+                normalizeSummaryApiConfigUI(config.api);
+                config.api.modelCache = [];
+                Object.assign(config.gen, p.gen || {});
+                Object.assign(config.trigger, p.trigger || {});
+                Object.assign(config.ui, p.ui || {});
+                config.ui.useVectorBoundary = p.ui?.useVectorBoundary !== false;
+                config.prompts.memoryTemplate = String(p.prompts?.memoryTemplate || config.prompts.memoryTemplate || '').trim();
+                config.textFilterRules = Array.isArray(p.textFilterRules)
+                    ? p.textFilterRules
+                    : (Array.isArray(p.vector?.textFilterRules) ? p.vector.textFilterRules : [...DEFAULT_FILTER_RULES]);
+                if (p.vector) config.vector = normalizeVectorConfigUI(p.vector);
+                normalizeTriggerConfig();
+            }
+        } catch { }
+    }
+
+    function applyConfig(cfg) {
+        if (!cfg) return;
+        config.memoryMaintenanceEnabled = cfg.memoryMaintenanceEnabled === true;
+        memoryMaintenancePage?.setEnabled(config.memoryMaintenanceEnabled);
+        const currentApiKey = String(config.api?.key || '').trim();
+        const currentInputKey = String($('api-key')?.value || '').trim();
+        Object.assign(config.api, cfg.api || {});
+        normalizeSummaryApiConfigUI(config.api);
+        if (!String(config.api.key || '').trim() && (currentInputKey || currentApiKey)) {
+            config.api.key = currentInputKey || currentApiKey;
+        }
+        config.api.modelCache = [];
+        Object.assign(config.gen, cfg.gen || {});
+        Object.assign(config.trigger, cfg.trigger || {});
+        Object.assign(config.ui, cfg.ui || {});
+        config.ui.useVectorBoundary = cfg.ui?.useVectorBoundary !== false;
+        config.prompts.memoryTemplate = String(cfg.prompts?.memoryTemplate || config.prompts.memoryTemplate || '').trim();
+        config.textFilterRules = Array.isArray(cfg.textFilterRules)
+            ? cfg.textFilterRules
+            : (Array.isArray(cfg.vector?.textFilterRules)
+                ? cfg.vector.textFilterRules
+                : (Array.isArray(config.textFilterRules) ? config.textFilterRules : [...DEFAULT_FILTER_RULES]));
+        if (cfg.vector) config.vector = normalizeVectorConfigUI(cfg.vector);
+        normalizeTriggerConfig();
+        syncVectorBoundaryControl(config.vector?.enabled, config.ui.hideSummarized);
+        writeSummaryConfigLocalCache(config, (message, errorName) => console.warn(message, errorName));
+    }
+
+    function normalizeSummaryApiConfigUI(apiCfg = {}) {
+        if (String(apiCfg.provider || '').toLowerCase() === 'custom') {
+            apiCfg.provider = 'openai';
+        }
+        if (!PROVIDER_DEFAULTS[apiCfg.provider]) {
+            apiCfg.provider = 'st';
+        }
+        return apiCfg;
+    }
+
+    function applyBuiltInSummaryPrompts(prompts) {
+        const next = prompts && typeof prompts === 'object' ? prompts : {};
+        builtInSummaryPrompts = {
+            ...EMPTY_BUILTIN_SUMMARY_PROMPTS,
+            ...next,
+        };
+    }
+
+    function saveConfig(options = {}) {
+        if (panelConfigLoad.status !== 'ready') return Promise.resolve(false);
+        try {
+            const settingsOpen = $('settings-modal')?.classList.contains('active');
+            if (settingsOpen) {
+                config.vector = getVectorConfig();
+                config.textFilterRules = collectFilterRules();
+            }
+            if (!config.vector) {
+                config.vector = {
+                    enabled: false,
+                    engine: 'online',
+                    l0Concurrency: 10,
+                    l0Api: { provider: 'siliconflow', url: 'https://api.siliconflow.cn/v1', key: '', model: 'Qwen/Qwen3-8B', modelCache: [] },
+                    embeddingApi: { provider: 'siliconflow', url: 'https://api.siliconflow.cn/v1', key: '', model: 'BAAI/bge-m3', modelCache: [] },
+                    rerankApi: { provider: 'siliconflow', url: 'https://api.siliconflow.cn/v1', key: '', model: 'BAAI/bge-reranker-v2-m3', modelCache: [] }
+                };
+            }
+            const requestId = nextConfigSaveRequestId();
+            const statusId = options.statusId || 'api-connect-status';
+            const statusEl = $(statusId);
+            const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 0;
+            if (statusEl && options.loadingMessage) {
+                setStatusText(statusEl, options.loadingMessage, 'loading');
+            }
+
+            return new Promise(resolve => {
+                let timeoutId = null;
+                if (timeoutMs > 0) {
+                    timeoutId = setTimeout(() => {
+                        pendingConfigSaveRequests.delete(requestId);
+                        setStatusText(statusEl, `${options.errorPrefix || '保存失败：'}请求超时（>${Math.round(timeoutMs / 1000)}s）`, 'error');
+                        resolve(false);
+                    }, timeoutMs);
+                }
+                pendingConfigSaveRequests.set(requestId, {
+                    resolve,
+                    statusId,
+                    successMessage: options.successMessage || '配置已保存',
+                    errorPrefix: options.errorPrefix || '保存失败：',
+                    timeoutId,
+                });
+                postMsg('SAVE_PANEL_CONFIG', { config, requestId });
+            });
+        } catch (e) {
+            console.error('saveConfig error:', e);
+            return Promise.resolve(false);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Vector Config UI
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function getVectorApiConfig(prefix) {
+        const provider = $(`${prefix}-api-provider`)?.value || 'siliconflow';
+        const providers = normalizeProviderProfiles(prefix, config.vector?.[`${prefix}Api`] || {});
+        providers[provider] = {
+            url: $(`${prefix}-api-url`)?.value?.trim() || '',
+            key: $(`${prefix}-api-key`)?.value?.trim() || '',
+            model: $(`${prefix}-api-model-text`)?.value?.trim() || '',
+            modelCache: Array.isArray(config.vector?.[`${prefix}Api`]?.providers?.[provider]?.modelCache)
+                ? [...config.vector[`${prefix}Api`].providers[provider].modelCache]
+                : [],
+        };
+        return {
+            provider,
+            url: providers[provider]?.url || '',
+            key: providers[provider]?.key || '',
+            model: providers[provider]?.model || '',
+            modelCache: Array.isArray(providers[provider]?.modelCache) ? [...providers[provider].modelCache] : [],
+            providers,
+        };
+    }
+
+    function loadVectorApiConfig(prefix, cfg) {
+        const next = cfg || {};
+        const provider = next.provider || 'siliconflow';
+        const profiles = normalizeProviderProfiles(prefix, next);
+        const profile = profiles[provider] || createDefaultProviderProfile(provider, VECTOR_API_DEFAULT_MODELS[prefix]);
+        $(`${prefix}-api-provider`).value = provider;
+        $(`${prefix}-api-url`).value = profile.url || '';
+        $(`${prefix}-api-key`).value = profile.key || '';
+        $(`${prefix}-api-model-text`).value = profile.model || '';
+
+        const cache = Array.isArray(profile.modelCache) ? profile.modelCache : [];
+        setSelectOptions($(`${prefix}-api-model-select`), cache, '请选择');
+        $(`${prefix}-api-model-select`).value = cache.includes(profile.model) ? profile.model : '';
+        updateVectorProviderUI(prefix, provider);
+    }
+
+    function saveCurrentVectorApiProfile(prefix, providerOverride = null) {
+        const apiCfg = config.vector[`${prefix}Api`] ||= {};
+        const provider = providerOverride || $(`${prefix}-api-provider`)?.value || apiCfg.provider || 'siliconflow';
+        apiCfg.providers = normalizeProviderProfiles(prefix, apiCfg);
+        apiCfg.providers[provider] = {
+            url: $(`${prefix}-api-url`)?.value?.trim() || '',
+            key: $(`${prefix}-api-key`)?.value?.trim() || '',
+            model: $(`${prefix}-api-model-text`)?.value?.trim() || '',
+            modelCache: Array.isArray(apiCfg.providers?.[provider]?.modelCache) ? [...apiCfg.providers[provider].modelCache] : [],
+        };
+        apiCfg.provider = provider;
+        apiCfg.url = apiCfg.providers[provider].url;
+        apiCfg.key = apiCfg.providers[provider].key;
+        apiCfg.model = apiCfg.providers[provider].model;
+        apiCfg.modelCache = [...apiCfg.providers[provider].modelCache];
+    }
+
+    function updateVectorProviderUI(prefix, provider) {
+        const pv = VECTOR_PROVIDER_DEFAULTS[provider] || VECTOR_PROVIDER_DEFAULTS.custom;
+        const apiCfg = config.vector?.[`${prefix}Api`] || {};
+        apiCfg.providers = normalizeProviderProfiles(prefix, apiCfg);
+        const profile = apiCfg.providers[provider] || createDefaultProviderProfile(provider, VECTOR_API_DEFAULT_MODELS[prefix]);
+        const cache = Array.isArray(profile.modelCache) ? profile.modelCache : [];
+        const hasModelCache = cache.length > 0;
+
+        $(`${prefix}-api-url-row`).classList.toggle('hidden', false);
+        $(`${prefix}-api-key-row`).classList.toggle('hidden', !pv.needKey);
+        $(`${prefix}-api-model-manual-row`).classList.toggle('hidden', false);
+        $(`${prefix}-api-model-select-row`).classList.toggle('hidden', !hasModelCache);
+        $(`${prefix}-api-connect-row`).classList.toggle('hidden', !pv.canFetch);
+        $(`${prefix}-api-connect-status`).classList.toggle('hidden', !pv.canFetch);
+
+        const urlInput = $(`${prefix}-api-url`);
+        if (urlInput) {
+            if (provider === 'custom') {
+                urlInput.readOnly = false;
+                urlInput.placeholder = 'https://your-openai-compatible-api/v1';
+                urlInput.value = profile.url || '';
+            } else {
+                urlInput.value = pv.url || '';
+                urlInput.readOnly = true;
+                urlInput.placeholder = pv.url || '';
+            }
+        }
+        $(`${prefix}-api-key`).value = profile.key || '';
+        $(`${prefix}-api-model-text`).value = profile.model || '';
+        setSelectOptions($(`${prefix}-api-model-select`), cache, '请选择');
+        $(`${prefix}-api-model-select`).value = cache.includes(profile.model) ? profile.model : '';
+    }
+
+    async function saveVectorApiSection(prefix) {
+        saveCurrentVectorApiProfile(prefix);
+        await saveConfig({
+            statusId: `${prefix}-api-connect-status`,
+            loadingMessage: '保存中...',
+            successMessage: '此组配置已保存',
+        });
+    }
+
+    async function fetchVectorModels(prefix) {
+        const provider = $(`${prefix}-api-provider`).value;
+        const pv = VECTOR_PROVIDER_DEFAULTS[provider] || VECTOR_PROVIDER_DEFAULTS.custom;
+        const statusEl = $(`${prefix}-api-connect-status`);
+        const btn = $(`${prefix}-btn-connect`);
+        if (!pv.canFetch) {
+            statusEl.textContent = '当前渠道不支持自动拉取模型';
+            return;
+        }
+
+        const baseUrl = $(`${prefix}-api-url`).value.trim();
+        const apiKey = $(`${prefix}-api-key`).value.trim();
+        if (!apiKey) {
+            statusEl.textContent = '请先填写 API KEY';
+            return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = '连接中...';
+        statusEl.textContent = '连接中...';
+
+        try {
+            let models = null;
+            for (const url of getModelListCandidateUrls(baseUrl, getDefaultApiPrefix(provider))) {
+                models = await tryParseModelIds(url, {
+                    headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }
+                });
+                if (models?.length) break;
+            }
+            if (!models?.length) throw new Error('未获取到模型列表');
+
+            const allModels = [...new Set(models)];
+            const filteredModels = filterVectorModelsByPurpose(prefix, allModels);
+
+            const apiCfg = config.vector[`${prefix}Api`] ||= {};
+            apiCfg.providers = normalizeProviderProfiles(prefix, apiCfg);
+            apiCfg.providers[provider] ||= createDefaultProviderProfile(provider, VECTOR_API_DEFAULT_MODELS[prefix]);
+            apiCfg.providers[provider].modelCache = filteredModels;
+            setSelectOptions($(`${prefix}-api-model-select`), apiCfg.providers[provider].modelCache, '请选择');
+            $(`${prefix}-api-model-select-row`).classList.remove('hidden');
+            if (!$(`${prefix}-api-model-text`).value.trim()) {
+                $(`${prefix}-api-model-text`).value = filteredModels[0];
+                $(`${prefix}-api-model-select`).value = filteredModels[0];
+            }
+            statusEl.textContent = filteredModels.length === allModels.length
+                ? `拉取成功：${filteredModels.length} 个模型`
+                : `拉取成功：共 ${allModels.length} 个，已筛出 ${filteredModels.length} 个适合当前用途的模型`;
+        } catch (e) {
+            statusEl.textContent = '拉取失败：' + (e.message || '请检查 URL 和 KEY');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '连接 / 拉取模型列表';
+        }
+    }
+
+    function getVectorConfig() {
+        return {
+            enabled: $('vector-enabled')?.checked || false,
+            engine: 'online',
+            l0Concurrency: Math.max(1, Math.min(50, Number($('vector-l0-concurrency')?.value) || 10)),
+            l0Api: getVectorApiConfig('l0'),
+            embeddingApi: getVectorApiConfig('embedding'),
+            rerankApi: getVectorApiConfig('rerank'),
+        };
+    }
+
+    function loadVectorConfig(cfg) {
+        if (!cfg) return;
+        $('vector-enabled').checked = !!cfg.enabled;
+        $('vector-config-area').classList.toggle('hidden', !cfg.enabled);
+        syncVectorBoundaryControl(cfg.enabled, config.ui.hideSummarized);
+        $('vector-l0-concurrency').value = String(Math.max(1, Math.min(50, Number(cfg.l0Concurrency) || 10)));
+        loadVectorApiConfig('l0', cfg.l0Api || {});
+        loadVectorApiConfig('embedding', cfg.embeddingApi || {});
+        loadVectorApiConfig('rerank', cfg.rerankApi || {});
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Filter Rules UI
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function renderFilterRules(rules) {
+        const list = $('filter-rules-list');
+        if (!list) return;
+
+        const items = rules?.length ? rules : [];
+
+        setHtml(list, items.map((r, i) => `
+            <div class="filter-rule-item" data-idx="${i}">
+                <div class="filter-rule-inputs">
+                    <input type="text" class="filter-rule-start" placeholder="起始（可空）" value="${h(r.start || '')}">
+                    <span class="rule-arrow">⬇</span>
+                    <input type="text" class="filter-rule-end" placeholder="结束（可空）" value="${h(r.end || '')}">
+                </div>
+                <button class="btn-del-rule">✕</button>
+            </div>
+        `).join(''));
+
+        // 绑定删除
+        list.querySelectorAll('.btn-del-rule').forEach(btn => {
+            btn.onclick = () => {
+                btn.closest('.filter-rule-item')?.remove();
+                updateFilterRulesCount();
+            };
+        });
+
+        updateFilterRulesCount();
+    }
+
+    function collectFilterRules() {
+        const list = $('filter-rules-list');
+        if (!list) return [];
+
+        const rules = [];
+        list.querySelectorAll('.filter-rule-item').forEach(item => {
+            const start = item.querySelector('.filter-rule-start')?.value?.trim() || '';
+            const end = item.querySelector('.filter-rule-end')?.value?.trim() || '';
+            if (start || end) {
+                rules.push({ start, end });
+            }
+        });
+        return rules;
+    }
+
+    function addFilterRule() {
+        const list = $('filter-rules-list');
+        if (!list) return;
+
+        const idx = list.querySelectorAll('.filter-rule-item').length;
+        const div = document.createElement('div');
+        div.className = 'filter-rule-item';
+        div.dataset.idx = idx;
+        setHtml(div, `
+            <div class="filter-rule-inputs">
+                <input type="text" class="filter-rule-start" placeholder="起始（可空）" value="">
+                <span class="rule-arrow">⬇</span>
+                <input type="text" class="filter-rule-end" placeholder="结束（可空）" value="">
+            </div>
+            <button class="btn-del-rule">✕</button>
+        `);
+        div.querySelector('.btn-del-rule').onclick = () => {
+            div.remove();
+            updateFilterRulesCount();
+        };
+        list.appendChild(div);
+        updateFilterRulesCount();
+    }
+
+    function updateFilterRulesCount() {
+        const el = $('filter-rules-count');
+        if (!el) return;
+        const count = $('filter-rules-list')?.querySelectorAll('.filter-rule-item')?.length || 0;
+        el.textContent = count;
+    }
+
+    function updateVectorStats(stats) {
+        $('vector-atom-count').textContent = stats.stateVectors || 0;
+        $('vector-chunk-count').textContent = stats.chunkCount || 0;
+        $('vector-event-count').textContent = stats.eventVectors || 0;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 记忆锚点（L0）UI
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function updateAnchorStats(stats) {
+        const extracted = stats.extracted || 0;
+        const total = stats.total || 0;
+        const pending = stats.pending || 0;
+        const empty = stats.empty || 0;
+        const fail = stats.fail || 0;
+        const atomsCount = stats.atomsCount || 0;
+
+        $('anchor-extracted').textContent = extracted;
+        $('anchor-total').textContent = total;
+        $('anchor-pending').textContent = pending;
+        $('anchor-atoms-count').textContent = atomsCount;
+
+        const pendingWrap = $('anchor-pending-wrap');
+        if (pendingWrap) {
+            pendingWrap.classList.toggle('hidden', pending === 0);
+        }
+
+        // 显示 empty/fail 信息
+        const extraWrap = $('anchor-extra-wrap');
+        const extraSep = $('anchor-extra-sep');
+        const extra = $('anchor-extra');
+        if (extraWrap && extra) {
+            if (empty > 0 || fail > 0) {
+                const parts = [];
+                if (empty > 0) parts.push(`空 ${empty}`);
+                if (fail > 0) parts.push(`失败 ${fail}`);
+                extra.textContent = parts.join(' · ');
+                extraWrap.style.display = '';
+                if (extraSep) extraSep.style.display = '';
+            } else {
+                extraWrap.style.display = 'none';
+                if (extraSep) extraSep.style.display = 'none';
+            }
+        }
+
+        const emptyWarning = $('vector-empty-l0-warning');
+        if (emptyWarning) {
+            emptyWarning.classList.toggle('hidden', extracted > 0);
+        }
+    }
+
+    function updateAnchorProgress(current, total, message) {
+        const progress = $('anchor-progress');
+        const btnGen = $('btn-anchor-generate');
+        const btnClear = $('btn-anchor-clear');
+        const btnCancel = $('btn-anchor-cancel');
+
+        if (current < 0) {
+            progress.classList.add('hidden');
+            btnGen.classList.remove('hidden');
+            btnClear.classList.remove('hidden');
+            btnCancel.classList.add('hidden');
+            anchorGenerating = false;
+            btnCancel.disabled = false;
+            btnCancel.textContent = '取消';
+        } else {
+            anchorGenerating = true;
+            progress.classList.remove('hidden');
+            btnGen.classList.add('hidden');
+            btnClear.classList.add('hidden');
+            btnCancel.classList.remove('hidden');
+
+            const percent = total > 0 ? Math.round(current / total * 100) : 0;
+            progress.querySelector('.progress-inner').style.width = percent + '%';
+            progress.querySelector('.progress-text').textContent = message || `${current}/${total}`;
+        }
+        syncMemoryActionButtons();
+    }
+
+    function syncMemoryActionButtons() {
+        const busy = anchorGenerating || vectorGenerating;
+        for (const id of ['btn-anchor-generate', 'btn-anchor-clear', 'btn-repair-vectors', 'btn-gen-vectors', 'btn-clear-vectors']) {
+            $(id).disabled = busy;
+        }
+    }
+
+    function updateVectorProgress({ current, total, phase, message }) {
+        const progress = $('vector-gen-progress');
+        vectorGenerating = current >= 0;
+        progress.classList.toggle('hidden', !vectorGenerating);
+        for (const id of ['btn-repair-vectors', 'btn-gen-vectors', 'btn-clear-vectors']) {
+            $(id).classList.toggle('hidden', vectorGenerating);
+        }
+        const cancel = $('btn-cancel-vectors');
+        cancel.classList.toggle('hidden', !vectorGenerating);
+        if (!vectorGenerating) {
+            cancel.disabled = false;
+            cancel.textContent = '取消';
+        } else {
+            progress.querySelector('.progress-inner').style.width = (total > 0 ? Math.round(current / total * 100) : 0) + '%';
+            progress.querySelector('.progress-text').textContent = message || `${phase || ''}: ${current}/${total}`;
+        }
+        syncMemoryActionButtons();
+    }
+
+    function initAnchorUI() {
+        $('btn-anchor-generate').onclick = () => {
+            if (anchorGenerating || vectorGenerating) return;
+            updateAnchorProgress(0, 0, '检查锚点缺漏...');
+            postMsg('ANCHOR_GENERATE');
+        };
+
+        $('btn-anchor-clear').onclick = async () => {
+            if (anchorGenerating || vectorGenerating) return;
+            if (await showConfirm('清空锚点', '清空所有记忆锚点？（L0 向量也会一并清除）')) {
+                postMsg('ANCHOR_CLEAR');
+            }
+        };
+
+        $('btn-anchor-cancel').onclick = () => {
+            $('btn-anchor-cancel').disabled = true;
+            $('btn-anchor-cancel').textContent = '停止中...';
+            postMsg('ANCHOR_CANCEL');
+        };
+    }
+
+    function initVectorUI() {
+        $('vector-enabled').onchange = e => {
+            $('vector-config-area').classList.toggle('hidden', !e.target.checked);
+            syncVectorBoundaryControl(e.target.checked, config.ui.hideSummarized);
+        };
+        syncVectorBoundaryControl(config.vector?.enabled, config.ui.hideSummarized);
+
+        ['l0', 'embedding', 'rerank'].forEach(prefix => {
+            $(`${prefix}-api-key-toggle`).onclick = () => {
+                const input = $(`${prefix}-api-key`);
+                const btn = $(`${prefix}-api-key-toggle`);
+                if (!input || !btn) return;
+                const show = input.type === 'password';
+                input.type = show ? 'text' : 'password';
+                btn.textContent = show ? '隐藏' : '显示';
+            };
+
+            $(`${prefix}-api-provider`).onchange = e => {
+                const target = config.vector[`${prefix}Api`] ||= {};
+                const previousProvider = target.provider || 'siliconflow';
+                saveCurrentVectorApiProfile(prefix, previousProvider);
+                target.providers = normalizeProviderProfiles(prefix, target);
+                target.provider = e.target.value;
+                target.providers[e.target.value] ||= createDefaultProviderProfile(e.target.value, VECTOR_API_DEFAULT_MODELS[prefix]);
+                updateVectorProviderUI(prefix, e.target.value);
+            };
+
+            $(`${prefix}-api-model-select`).onchange = e => {
+                if (e.target.value) $(`${prefix}-api-model-text`).value = e.target.value;
+            };
+
+            $(`${prefix}-btn-connect`).onclick = () => fetchVectorModels(prefix);
+            for (const field of ['provider', 'url', 'key', 'model-text', 'model-select']) {
+                $(`${prefix}-api-${field}`).addEventListener(field === 'provider' || field === 'model-select' ? 'change' : 'input', () => {
+                    postMsg('VECTOR_CANCEL_TEST', { target: prefix });
+                    updateVectorOnlineStatus(prefix, 'idle', '');
+                });
+            }
+            $(`${prefix}-btn-save`).onclick = () => saveVectorApiSection(prefix);
+            $(`${prefix}-btn-test`).onclick = () => {
+                const btn = $(`${prefix}-btn-test`);
+                if (btn) btn.disabled = true;
+                setStatusText($(`${prefix}-api-connect-status`), SUMMARY_FEEDBACK_COPY.connectionChecking, 'loading');
+                const cfg = getVectorConfig();
+                postMsg('VECTOR_TEST_ONLINE', {
+                    target: prefix,
+                    config: cfg[`${prefix}Api`],
+                });
+            };
+        });
+
+        $('btn-add-filter-rule').onclick = addFilterRule;
+
+        $('btn-gen-vectors').onclick = () => {
+            if (vectorGenerating || anchorGenerating) return;
+            updateVectorProgress({ current: 0, total: 0, message: '准备重建向量...' });
+            postMsg('VECTOR_GENERATE', { config: getVectorConfig() });
+        };
+
+        $('btn-repair-vectors').onclick = () => {
+            if (vectorGenerating || anchorGenerating) return;
+            updateVectorProgress({ current: 0, total: 0, message: '检查向量缺漏...' });
+            postMsg('VECTOR_REPAIR', { config: getVectorConfig() });
+        };
+
+        $('btn-clear-vectors').onclick = async () => {
+            if (vectorGenerating || anchorGenerating) return;
+            if (await showConfirm('清空向量', '确定清空所有向量数据？')) {
+                postMsg('VECTOR_CLEAR');
+            }
+        };
+
+        $('btn-cancel-vectors').onclick = () => {
+            $('btn-cancel-vectors').disabled = true;
+            $('btn-cancel-vectors').textContent = '停止中...';
+            postMsg('VECTOR_CANCEL_GENERATE');
+        };
+
+        $('btn-export-vectors').onclick = () => {
+            $('btn-export-vectors').disabled = true;
+            $('vector-io-status').textContent = '导出中...';
+            postMsg('VECTOR_EXPORT');
+        };
+
+        $('btn-import-vectors').onclick = () => {
+            $('btn-import-vectors').disabled = true;
+            $('vector-io-status').textContent = '导入中...';
+            postMsg('VECTOR_IMPORT_PICK');
+        };
+        $('btn-backup-server').onclick = () => {
+            $('btn-backup-server').disabled = true;
+            $('server-io-status').textContent = '备份中...';
+            postMsg('VECTOR_BACKUP_SERVER');
+        };
+
+        $('btn-restore-server').onclick = () => {
+            $('btn-restore-server').disabled = true;
+            $('server-io-status').textContent = '恢复中...';
+            postMsg('VECTOR_RESTORE_SERVER');
+        };
+
+        $('btn-manage-backups').onclick = () => postMsg('VECTOR_LIST_BACKUPS');
+
+        initAnchorUI();
+        postMsg('REQUEST_ANCHOR_STATS');
+    }
+
+    function updateVectorOnlineStatus(target, status, message) {
+        const prefix = target || 'embedding';
+        const btn = $(`${prefix}-btn-test`);
+        if (btn) btn.disabled = status === 'downloading';
+        setStatusText(
+            $(`${prefix}-api-connect-status`),
+            message || '',
+            status === 'error' ? 'error' : status === 'success' ? 'success' : 'loading'
+        );
+    }
+
+    function initSummaryIOUI() {
+        $('btn-copy-summary').onclick = () => {
+            $('btn-copy-summary').disabled = true;
+            $('summary-io-status').textContent = '复制中...';
+            postMsg('SUMMARY_COPY');
+        };
+
+        $('btn-import-summary').onclick = async () => {
+            const text = await showConfirmInput(
+                '覆盖导入记忆包',
+                '导入会覆盖当前聊天已有的总结资料，并立即清空向量、锚点、总结边界。请把记忆包粘贴到下面。',
+                '继续导入',
+                '取消',
+                '在这里粘贴记忆包 JSON'
+            );
+            if (text == null) return;
+            if (!String(text).trim()) {
+                $('summary-io-status').textContent = '导入失败: 记忆包内容为空';
+                return;
+            }
+            $('btn-import-summary').disabled = true;
+            $('summary-io-status').textContent = '导入中...';
+            postMsg('SUMMARY_IMPORT_TEXT', { text });
+        };
+    }
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Settings Modal
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function updateProviderUI(provider) {
+        const pv = PROVIDER_DEFAULTS[provider] || PROVIDER_DEFAULTS.openai;
+        const isSt = provider === 'st';
+        const hasModelCache = modelListFetchedThisIframe && Array.isArray(config.api.modelCache) && config.api.modelCache.length > 0;
+
+        $('api-url-row').classList.toggle('hidden', isSt);
+        $('api-key-row').classList.toggle('hidden', !pv.needKey);
+        $('api-model-manual-row').classList.toggle('hidden', isSt);
+        $('api-model-select-row').classList.toggle('hidden', isSt || !hasModelCache);
+        $('api-connect-row').classList.toggle('hidden', isSt || !pv.canFetch);
+        $('api-connect-status').classList.toggle('hidden', isSt || !pv.canFetch);
+
+        const urlInput = $('api-url');
+        if (!urlInput.value && pv.url) urlInput.value = pv.url;
+    }
+
+    function openSettings({ preserveTab = false } = {}) {
+        memoryMaintenancePage.setEnabled(config.memoryMaintenanceEnabled);
+        $('api-provider').value = config.api.provider;
+        $('api-url').value = config.api.url;
+        $('api-key').value = config.api.key;
+        $('api-model-text').value = config.api.model;
+        $('gen-temp').value = config.gen.temperature ?? '';
+        $('gen-top-p').value = config.gen.top_p ?? '';
+        $('gen-top-k').value = config.gen.top_k ?? '';
+        $('gen-presence').value = config.gen.presence_penalty ?? '';
+        $('gen-frequency').value = config.gen.frequency_penalty ?? '';
+        $('trigger-enabled').checked = config.trigger.enabled;
+        $('trigger-interval').value = config.trigger.interval;
+        $('trigger-delay-floors').value = normalizeSummaryDelayFloors(config.trigger.delayFloors);
+        $('trigger-timing').value = config.trigger.timing;
+        $('trigger-role').value = config.trigger.role || 'system';
+        $('trigger-stream').checked = config.trigger.useStream !== false;
+        $('trigger-max-per-run').value = config.trigger.maxPerRun || 100;
+        $('trigger-wrapper-head').value = config.trigger.wrapperHead || '';
+        $('trigger-wrapper-tail').value = config.trigger.wrapperTail || '';
+        $('trigger-insert-at-end').checked = !!config.trigger.forceInsertAtEnd;
+        fillBuiltInSummaryPromptFields();
+        $('memory-prompt-template').value = config.prompts.memoryTemplate || '';
+        $('api-connect-status').textContent = '';
+
+        syncAutoSummaryControls();
+
+        if (config.api.modelCache.length) {
+            setSelectOptions($('api-model-select'), config.api.modelCache, '请选择');
+            $('api-model-select').value = config.api.modelCache.includes(config.api.model) ? config.api.model : '';
+        } else {
+            setSelectOptions($('api-model-select'), [], '请选择');
+        }
+
+        updateProviderUI(config.api.provider);
+        if (config.vector) loadVectorConfig(config.vector);
+        renderFilterRules(Array.isArray(config.textFilterRules) ? config.textFilterRules : DEFAULT_FILTER_RULES);
+        settingsOpenedWithServerConfig = panelConfigLoad.status === 'ready';
+        showPanelConfigLoadState(panelConfigLoad.status, panelConfigLoad.error);
+
+        // Initialize sub-options visibility
+        const autoSummaryOptions = $('auto-summary-options');
+        if (autoSummaryOptions) {
+            autoSummaryOptions.classList.toggle('hidden', !config.trigger.enabled);
+        }
+        const insertWrapperOptions = $('insert-wrapper-options');
+        if (insertWrapperOptions) {
+            insertWrapperOptions.classList.toggle('hidden', !config.trigger.forceInsertAtEnd);
+        }
+
+        $('settings-modal').classList.add('active');
+
+        // Opening starts on Summary; recovery preserves the user's current tab.
+        if (!preserveTab) {
+            $$('.settings-tab').forEach(t => t.classList.remove('active'));
+            $$('.settings-tab[data-tab="tab-summary"]').forEach(t => t.classList.add('active'));
+            $$('.tab-pane').forEach(p => p.classList.remove('active'));
+            $('tab-summary').classList.add('active');
+        }
+
+        postMsg('SETTINGS_OPENED');
+    }
+
+    function collectSettingsFormToConfig() {
+        config.memoryMaintenanceEnabled = memoryMaintenancePage.getEnabled();
+        const pn = id => { const v = $(id).value; return v === '' ? null : parseFloat(v); };
+        const provider = $('api-provider').value;
+
+        config.api.provider = provider;
+        config.api.url = $('api-url').value;
+        config.api.key = $('api-key').value;
+        config.api.model = provider === 'st' ? '' : $('api-model-text').value.trim();
+        config.api.modelCache = [];
+
+        config.gen.temperature = pn('gen-temp');
+        config.gen.top_p = pn('gen-top-p');
+        config.gen.top_k = pn('gen-top-k');
+        config.gen.presence_penalty = pn('gen-presence');
+        config.gen.frequency_penalty = pn('gen-frequency');
+
+        const timing = $('trigger-timing').value;
+        config.trigger.timing = normalizeTriggerTiming(timing);
+        config.trigger.role = $('trigger-role').value || 'system';
+        config.trigger.enabled = $('trigger-enabled').checked;
+        config.trigger.interval = Math.max(1, Math.min(30, parseInt($('trigger-interval').value) || 20));
+        config.trigger.delayFloors = normalizeSummaryDelayFloors($('trigger-delay-floors').value);
+        config.trigger.useStream = $('trigger-stream').checked;
+        config.trigger.maxPerRun = parseInt($('trigger-max-per-run').value) || 100;
+        config.trigger.wrapperHead = $('trigger-wrapper-head').value;
+        config.trigger.wrapperTail = $('trigger-wrapper-tail').value;
+        config.trigger.forceInsertAtEnd = $('trigger-insert-at-end').checked;
+        config.prompts.memoryTemplate = $('memory-prompt-template').value;
+        config.textFilterRules = collectFilterRules();
+        config.vector = getVectorConfig();
+    }
+
+    function fillBuiltInSummaryPromptFields() {
+        $('summary-system-prompt').value = builtInSummaryPrompts.summarySystemPrompt;
+        $('summary-assistant-doc-prompt').value = builtInSummaryPrompts.summaryAssistantDocPrompt;
+        $('summary-assistant-ask-summary-prompt').value = builtInSummaryPrompts.summaryAssistantAskSummaryPrompt;
+        $('summary-assistant-ask-content-prompt').value = builtInSummaryPrompts.summaryAssistantAskContentPrompt;
+        $('summary-meta-protocol-start-prompt').value = builtInSummaryPrompts.summaryMetaProtocolStartPrompt;
+        $('summary-user-json-format-prompt').value = builtInSummaryPrompts.summaryUserJsonFormatPrompt;
+        $('summary-assistant-check-prompt').value = builtInSummaryPrompts.summaryAssistantCheckPrompt;
+        $('summary-user-confirm-prompt').value = builtInSummaryPrompts.summaryUserConfirmPrompt;
+        $('summary-user-generate-prompt').value = builtInSummaryPrompts.summaryUserGeneratePrompt;
+    }
+
+    async function saveSettings() {
+        if (!settingsOpenedWithServerConfig) {
+            retryPanelConfigLoad();
+            return false;
+        }
+        collectSettingsFormToConfig();
+        const btn = $('settings-save');
+        const statusEl = $('api-connect-status');
+        resetSettingsSaveUi();
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = '保存中...';
+        }
+        if (statusEl) setStatusText(statusEl, '保存中...', 'loading');
+        const savePromise = saveConfig({
+            statusId: 'api-connect-status',
+            loadingMessage: '保存中...',
+            successMessage: '配置已保存',
+            timeoutMs: 5000,
+        });
+        const saved = await savePromise;
+        resetSettingsSaveUi();
+        return saved;
+    }
+
+    function closeSettings() {
+        memoryMaintenancePage.close();
+        resetSettingsSaveUi();
+        settingsOpenedWithServerConfig = false;
+        $('settings-modal').classList.remove('active');
+        postMsg('SETTINGS_CLOSED');
+    }
+
+    async function fetchModels() {
+        const btn = $('btn-connect');
+        const statusEl = $('api-connect-status');
+        const provider = $('api-provider').value;
+
+        if (!PROVIDER_DEFAULTS[provider]?.canFetch) {
+            statusEl.textContent = '当前渠道不支持自动拉取模型';
+            return;
+        }
+
+        const baseUrl = $('api-url').value.trim();
+        const apiKey = $('api-key').value.trim();
+
+        if (!apiKey) {
+            statusEl.textContent = '请先填写 API KEY';
+            return;
+        }
+
+        const requestId = nextSummaryModelFetchRequestId();
+        pendingSummaryModelFetchRequestId = requestId;
+        btn.disabled = true;
+        btn.textContent = '连接中...';
+        statusEl.textContent = '连接中...';
+        if (summaryModelFetchTimeoutId) {
+            clearTimeout(summaryModelFetchTimeoutId);
+        }
+        summaryModelFetchTimeoutId = setTimeout(() => {
+            if (pendingSummaryModelFetchRequestId !== requestId) return;
+            pendingSummaryModelFetchRequestId = '';
+            resetSummaryModelFetchUi();
+            setStatusText(statusEl, '拉取失败：请求超时（>5s）', 'error');
+        }, 5000);
+
+        postMsg('FETCH_SUMMARY_MODELS', {
+            requestId,
+            provider,
+            url: baseUrl,
+            apiKey,
+            timeoutMs: 5000,
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Rendering Functions
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function renderKeywords(kw) {
+        summaryData.keywords = kw || [];
+        const wc = { '核心': 'p', '重要': 's', high: 'p', medium: 's' };
+        setHtml($('keywords-cloud'), kw.length
+            ? kw.map(k => `<span class="tag ${wc[k.weight] || wc[k.level] || ''}">${h(k.text)}</span>`).join('')
+            : '<div class="empty">暂无关键词</div>');
+    }
+
+    function getTimelineScrollState() {
+        const el = $('timeline-list');
+        if (!el) return { scrollTop: 0, scrollHeight: 0, clientHeight: 0, wasAtBottom: true };
+        const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+        return {
+            scrollTop: el.scrollTop,
+            scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight,
+            wasAtBottom: distanceToBottom <= 24,
+        };
+    }
+
+    function restoreTimelineScroll(state, mode = 'auto') {
+        const el = $('timeline-list');
+        if (!el) return;
+        requestAnimationFrame(() => {
+            const preserve = () => {
+                const delta = el.scrollHeight - state.scrollHeight;
+                el.scrollTop = Math.max(0, state.scrollTop + delta);
+            };
+            if (mode === 'preserve') {
+                preserve();
+                return;
+            }
+            if (!timelineHasRenderedEvents || state.wasAtBottom) {
+                el.scrollTop = el.scrollHeight;
+                return;
+            }
+            preserve();
+        });
+    }
+
+    function getCssVar(name, fallback) {
+        const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        return value || fallback;
+    }
+
+    function getRelationTheme() {
+        const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+        return {
+            text: getCssVar('--txt', isDark ? '#e0e0e0' : '#333'),
+            textMuted: getCssVar('--txt3', isDark ? '#9a9a9a' : '#888'),
+            panel: getCssVar('--bg2', isDark ? '#1e1e1e' : '#fff'),
+            border: getCssVar('--bdr', isDark ? '#3a3a3a' : '#ddd'),
+            line: getCssVar('--bdr', isDark ? 'rgba(224,224,224,.32)' : '#d8d8d8'),
+            lineFocus: getCssVar('--txt3', isDark ? 'rgba(224,224,224,.58)' : '#aaa'),
+            nodeBorder: isDark ? getCssVar('--bg', '#121212') : '#fff',
+            nodeShadow: isDark ? 'rgba(0,0,0,.38)' : 'rgba(0,0,0,.1)',
+            tooltipShadow: isDark ? '0 8px 22px rgba(0,0,0,.38)' : '0 4px 12px rgba(0,0,0,.15)',
+        };
+    }
+
+    function tlTotalPages() {
+        return Math.max(1, Math.ceil((summaryData.events || []).length / TL_PAGE_SIZE));
+    }
+
+    function clampTlPage(page) {
+        return Math.min(Math.max(0, Math.trunc(page)), tlTotalPages() - 1);
+    }
+
+    function tlLoadPage() {
+        const v = JSON.parse(localStorage.getItem(TL_PAGE_KEY))?.[currentTimelineChatId];
+        return Number.isFinite(v) ? v : -1;
+    }
+
+    function tlSavePage() {
+        if (!currentTimelineChatId) return;
+        const pages = JSON.parse(localStorage.getItem(TL_PAGE_KEY)) || {};
+        if (tlCurrentPage < 0) {
+            if (!Object.hasOwn(pages, currentTimelineChatId)) return;
+            delete pages[currentTimelineChatId];
+        } else {
+            if (pages[currentTimelineChatId] === tlCurrentPage) return;
+            pages[currentTimelineChatId] = tlCurrentPage;
+        }
+        localStorage.setItem(TL_PAGE_KEY, JSON.stringify(pages));
+    }
+
+    function tlItemHtml(e) {
+        const participants = (e.participants || e.characters || []).map(h).join('、');
+        return `<div class="tl-item">
+                <div class="tl-dot"></div>
+                <div class="tl-head">
+                    <div class="tl-title">${h(e.title || '')}</div>
+                    <div class="tl-time">${h(e.timeLabel || '')}</div>
+                </div>
+                <div class="tl-brief">${h(e.summary || e.brief || '')}</div>
+                <div class="tl-meta">
+                    <span>人物：${participants || '—'}</span>
+                    <span class="imp">${h(e.memoryRole || '未标注')}</span>
+                </div>
+            </div>`;
+    }
+
+    function revealTlCurrentPage() {
+        const strip = $('tl-pg-strip');
+        const cur = strip.querySelector('[aria-current="page"]');
+        if (!cur || !strip.clientWidth) return;
+        const left = cur.offsetLeft;
+        if (left < strip.scrollLeft || left + cur.offsetWidth > strip.scrollLeft + strip.clientWidth) {
+            strip.scrollLeft = left - (strip.clientWidth - cur.offsetWidth) / 2;
+        }
+    }
+
+    function updateTlPager(visible, syncPageNumber = false) {
+        const pager = $('tl-pager');
+        if (!pager) return;
+        pager.classList.toggle('hidden', !visible);
+        if (!visible) return;
+        const total = tlTotalPages();
+        const strip = $('tl-pg-strip');
+        const focused = document.activeElement;
+        const hadPagerFocus = pager.contains(focused);
+        // Keep existing buttons so selecting or refreshing a page retains keyboard focus.
+        while (strip.children.length > total) strip.lastElementChild.remove();
+        for (let i = strip.children.length; i < total; i++) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'tl-pg-btn';
+            button.dataset.page = i;
+            button.textContent = i + 1;
+            strip.append(button);
+        }
+        Array.from(strip.children).forEach((button, i) => {
+            button.classList.toggle('cur', i === tlCurrentPage);
+            if (i === tlCurrentPage) button.setAttribute('aria-current', 'page');
+            else button.removeAttribute('aria-current');
+        });
+        const num = $('tl-pg-num');
+        num.max = total;
+        if (syncPageNumber || document.activeElement !== num) num.value = tlCurrentPage + 1;
+        const atStart = tlCurrentPage <= 0;
+        const atEnd = tlCurrentPage >= total - 1;
+        $('tl-pg-first').disabled = atStart;
+        $('tl-pg-prev').disabled = atStart;
+        $('tl-pg-next').disabled = atEnd;
+        $('tl-pg-last').disabled = atEnd;
+        if (hadPagerFocus && (!focused.isConnected || focused.disabled)) {
+            strip.children[tlCurrentPage].focus({ preventScroll: true });
+        }
+        revealTlCurrentPage();
+    }
+
+    function renderTimeline(ev, options = {}) {
+        const scrollState = getTimelineScrollState();
+        const previousPage = tlCurrentPage;
+        const wasPaging = timelineHasRenderedEvents && !$('tl-pager').classList.contains('hidden');
+        summaryData.events = ev || [];
+        const c = $('timeline-list');
+        if (!ev?.length) {
+            setHtml(c, '<div class="empty">暂无事件记录</div>');
+            tlCurrentPage = -1;
+            tlSavePage();
+            timelineHasRenderedEvents = false;
+            updateTlPager(false);
+            return;
+        }
+        if (tlPagingEnabled) {
+            tlCurrentPage = options.page != null
+                ? clampTlPage(options.page)
+                : (tlCurrentPage < 0 || tlCurrentPage > tlTotalPages() - 1 ? tlTotalPages() - 1 : tlCurrentPage);
+            tlSavePage();
+            const start = tlCurrentPage * TL_PAGE_SIZE;
+            setHtml(c, summaryData.events.slice(start, start + TL_PAGE_SIZE).map(tlItemHtml).join(''));
+            updateTlPager(true, options.page != null || !wasPaging || previousPage !== tlCurrentPage);
+            c.scrollTop = wasPaging && previousPage === tlCurrentPage ? scrollState.scrollTop : 0;
+        } else {
+            setHtml(c, summaryData.events.map(tlItemHtml).join(''));
+            updateTlPager(false);
+            restoreTimelineScroll(scrollState, options.scrollMode || 'auto');
+        }
+        timelineHasRenderedEvents = true;
+    }
+
+    function getCharName(c) {
+        return typeof c === 'string' ? c : c.name;
+    }
+
+    function hideRelationTooltip() {
+        if (activeRelationTooltip) {
+            activeRelationTooltip.remove();
+            activeRelationTooltip = null;
+        }
+    }
+
+    function showRelationTooltip(from, to, fromLabel, toLabel, fromTrend, toTrend, x, y, container) {
+        hideRelationTooltip();
+        const tip = document.createElement('div');
+        const mobile = innerWidth <= 768;
+        const fc = TREND_COLORS[fromTrend] || '#888';
+        const tc = TREND_COLORS[toTrend] || '#888';
+        const theme = getRelationTheme();
+
+        setHtml(tip, `<div style="line-height:1.8">
+            ${fromLabel ? `<div><small>${h(from)}→${h(to)}：</small> <span style="color:${fc}">${h(fromLabel)}</span> <span style="font-size:10px;color:${fc}">[${h(fromTrend)}]</span></div>` : ''}
+            ${toLabel ? `<div><small>${h(to)}→${h(from)}：</small> <span style="color:${tc}">${h(toLabel)}</span> <span style="font-size:10px;color:${tc}">[${h(toTrend)}]</span></div>` : ''}
+        </div>`);
+
+        tip.style.cssText = mobile
+            ? `position:absolute;left:8px;bottom:8px;background:${theme.panel};color:${theme.text};padding:10px 14px;border:1px solid ${theme.border};border-radius:6px;font-size:12px;z-index:100;box-shadow:${theme.tooltipShadow};max-width:calc(100% - 16px)`
+            : `position:absolute;left:${Math.max(80, Math.min(x, container.clientWidth - 80))}px;top:${Math.max(60, y)}px;transform:translate(-50%,-100%);background:${theme.panel};color:${theme.text};padding:10px 16px;border:1px solid ${theme.border};border-radius:6px;font-size:12px;z-index:1000;box-shadow:${theme.tooltipShadow};max-width:280px`;
+
+        container.style.position = 'relative';
+        container.appendChild(tip);
+        activeRelationTooltip = tip;
+    }
+
+    function renderRelations(data) {
+        summaryData.characters = data || { main: [], relationships: [] };
+        const dom = $('relation-chart');
+        if (!relationChart) relationChart = echarts.init(dom);
+        const theme = getRelationTheme();
+
+        const rels = data?.relationships || [];
+        const allNames = new Set((data?.main || []).map(getCharName));
+        rels.forEach(r => { if (r.from) allNames.add(r.from); if (r.to) allNames.add(r.to); });
+
+        const degrees = {};
+        rels.forEach(r => {
+            degrees[r.from] = (degrees[r.from] || 0) + 1;
+            degrees[r.to] = (degrees[r.to] || 0) + 1;
+        });
+
+        const nodeColors = { main: '#d87a7a', sec: '#f1c3c3', ter: '#888888', qua: '#b8b8b8' };
+        const sortedDegs = Object.values(degrees).sort((a, b) => b - a);
+        const getPercentile = deg => {
+            if (!sortedDegs.length || deg === 0) return 100;
+            const rank = sortedDegs.filter(d => d > deg).length;
+            return (rank / sortedDegs.length) * 100;
+        };
+
+        allNodes = Array.from(allNames).map(name => {
+            const deg = degrees[name] || 0;
+            const pct = getPercentile(deg);
+            let col, fontWeight;
+            if (pct < 30) { col = nodeColors.main; fontWeight = '600'; }
+            else if (pct < 60) { col = nodeColors.sec; fontWeight = '500'; }
+            else if (pct < 90) { col = nodeColors.ter; fontWeight = '400'; }
+            else { col = nodeColors.qua; fontWeight = '400'; }
+            return {
+                id: name, name, symbol: 'circle',
+                symbolSize: Math.min(36, Math.max(16, deg * 3 + 12)),
+                draggable: true,
+                itemStyle: { color: col, borderColor: theme.nodeBorder, borderWidth: 2, shadowColor: theme.nodeShadow, shadowBlur: 6, shadowOffsetY: 2 },
+                label: { show: true, position: 'right', distance: 5, color: theme.text, fontSize: 11, fontWeight },
+                degree: deg
+            };
+        });
+
+        const relMap = new Map();
+        rels.forEach(r => {
+            const k = [r.from, r.to].sort().join('|||');
+            if (!relMap.has(k)) relMap.set(k, { from: r.from, to: r.to, fromLabel: '', toLabel: '', fromTrend: '', toTrend: '' });
+            const e = relMap.get(k);
+            if (r.from === e.from) { e.fromLabel = r.label || r.type || ''; e.fromTrend = r.trend || ''; }
+            else { e.toLabel = r.label || r.type || ''; e.toTrend = r.trend || ''; }
+        });
+
+        allLinks = Array.from(relMap.values()).map(r => {
+            const fc = TREND_COLORS[r.fromTrend] || '#b8b8b8';
+            const tc = TREND_COLORS[r.toTrend] || '#b8b8b8';
+            return {
+                source: r.from, target: r.to, fromName: r.from, toName: r.to,
+                fromLabel: r.fromLabel, toLabel: r.toLabel, fromTrend: r.fromTrend, toTrend: r.toTrend,
+                lineStyle: { width: 1, color: theme.line, curveness: 0, opacity: 1 },
+                label: {
+                    show: true, position: 'middle', distance: 0,
+                    formatter: '{a|◀}{b|▶}',
+                    rich: { a: { color: fc, fontSize: 10 }, b: { color: tc, fontSize: 10 } },
+                    align: 'center', verticalAlign: 'middle', offset: [0, -0.1]
+                },
+                emphasis: { lineStyle: { width: 1.5, color: theme.lineFocus }, label: { fontSize: 11 } }
+            };
+        });
+
+        if (!allNodes.length) { relationChart.clear(); return; }
+
+        const updateChart = (nodes, links, focusId = null) => {
+            const fadeOpacity = 0.2;
+            const processedNodes = focusId ? nodes.map(n => {
+                const rl = links.filter(l => l.source === focusId || l.target === focusId);
+                const rn = new Set([focusId]);
+                rl.forEach(l => { rn.add(l.source); rn.add(l.target); });
+                const isRelated = rn.has(n.id);
+                return { ...n, itemStyle: { ...n.itemStyle, opacity: isRelated ? 1 : fadeOpacity }, label: { ...n.label, opacity: isRelated ? 1 : fadeOpacity } };
+            }) : nodes;
+
+            const processedLinks = focusId ? links.map(l => {
+                const isRelated = l.source === focusId || l.target === focusId;
+                return { ...l, lineStyle: { ...l.lineStyle, opacity: isRelated ? 1 : fadeOpacity }, label: { ...l.label, opacity: isRelated ? 1 : fadeOpacity } };
+            }) : links;
+
+            relationChart.setOption({
+                backgroundColor: 'transparent',
+                tooltip: { show: false },
+                hoverLayerThreshold: Infinity,
+                series: [{
+                    type: 'graph', layout: 'force', roam: true, draggable: true,
+                    animation: true, animationDuration: 800, animationDurationUpdate: 300, animationEasingUpdate: 'cubicInOut',
+                    progressive: 0, hoverAnimation: false,
+                    data: processedNodes, links: processedLinks,
+                    force: { initLayout: 'circular', repulsion: 350, edgeLength: [80, 160], gravity: .12, friction: .6, layoutAnimation: true },
+                    label: { show: true }, edgeLabel: { show: true, position: 'middle' },
+                    emphasis: { disabled: true }
+                }]
+            });
+        };
+
+        updateChart(allNodes, allLinks);
+        setTimeout(() => relationChart.resize(), 0);
+
+        relationChart.off('click');
+        relationChart.on('click', p => {
+            if (p.dataType === 'node') {
+                hideRelationTooltip();
+                const id = p.data.id;
+                selectCharacter(id);
+                updateChart(allNodes, allLinks, id);
+            } else if (p.dataType === 'edge') {
+                const d = p.data;
+                const e = p.event?.event;
+                if (e) {
+                    const rect = dom.getBoundingClientRect();
+                    showRelationTooltip(d.fromName, d.toName, d.fromLabel, d.toLabel, d.fromTrend, d.toTrend,
+                        e.offsetX || (e.clientX - rect.left), e.offsetY || (e.clientY - rect.top), dom);
+                }
+            }
+        });
+
+        relationChart.getZr().on('click', p => {
+            if (!p.target) {
+                hideRelationTooltip();
+                updateChart(allNodes, allLinks);
+            }
+        });
+    }
+
+    function selectCharacter(id) {
+        currentCharacterId = id;
+        const txt = $('sel-char-text');
+        const opts = $('char-sel-opts');
+        if (opts && id) {
+            opts.querySelectorAll('.sel-opt').forEach(o => {
+                if (o.dataset.value === id) {
+                    o.classList.add('sel');
+                    if (txt) txt.textContent = o.textContent;
+                } else {
+                    o.classList.remove('sel');
+                }
+            });
+        } else if (!id && txt) {
+            txt.textContent = '选择角色';
+        }
+        renderCharacterProfile();
+        if (relationChart && id) {
+            const opt = relationChart.getOption();
+            const idx = opt?.series?.[0]?.data?.findIndex(n => n.id === id || n.name === id);
+            if (idx >= 0) relationChart.dispatchAction({ type: 'highlight', seriesIndex: 0, dataIndex: idx });
+        }
+    }
+
+    function updateCharacterSelector(arcs) {
+        const opts = $('char-sel-opts');
+        const txt = $('sel-char-text');
+        if (!opts) return;
+        if (!arcs?.length) {
+            setHtml(opts, '<div class="sel-opt" data-value="">暂无角色</div>');
+            if (txt) txt.textContent = '暂无角色';
+            currentCharacterId = null;
+            return;
+        }
+        setHtml(opts, arcs.map(a => `<div class="sel-opt" data-value="${h(a.id || a.name)}">${h(a.name || '角色')}</div>`).join(''));
+        opts.querySelectorAll('.sel-opt').forEach(o => {
+            o.onclick = e => {
+                e.stopPropagation();
+                if (o.dataset.value) {
+                    selectCharacter(o.dataset.value);
+                    $('char-sel').classList.remove('open');
+                }
+            };
+        });
+        if (currentCharacterId && arcs.some(a => (a.id || a.name) === currentCharacterId)) {
+            selectCharacter(currentCharacterId);
+        } else if (arcs.length) {
+            selectCharacter(arcs[0].id || arcs[0].name);
+        }
+    }
+
+    function renderCharacterProfile() {
+        const c = $('profile-content');
+        const arcs = summaryData.arcs || [];
+        const rels = summaryData.characters?.relationships || [];
+
+        if (!currentCharacterId || !arcs.length) {
+            setHtml(c, '<div class="empty">暂无角色数据</div>');
+            return;
+        }
+
+        const arc = arcs.find(a => (a.id || a.name) === currentCharacterId);
+        if (!arc) {
+            setHtml(c, '<div class="empty">未找到角色数据</div>');
+            return;
+        }
+
+        const name = arc.name || '角色';
+        const moments = (arc.moments || arc.beats || []).map(m => typeof m === 'string' ? m : m.text);
+        const outRels = rels.filter(r => r.from === name);
+        const inRels = rels.filter(r => r.to === name);
+
+        setHtml(c, `
+            <div class="prof-arc">
+                <div>
+                    <div class="prof-name">${h(name)}</div>
+                    <div class="prof-traj">${h(arc.trajectory || arc.phase || '')}</div>
+                </div>
+                <div class="prof-prog-wrap">
+                    <div class="prof-prog-lbl">
+                        <span>弧光进度</span>
+                        <span>${Math.round((arc.progress || 0) * 100)}%</span>
+                    </div>
+                    <div class="prof-prog">
+                        <div class="prof-prog-inner" style="width:${(arc.progress || 0) * 100}%"></div>
+                    </div>
+                </div>
+                ${moments.length ? `
+                    <div class="prof-moments">
+                        <div class="prof-moments-title">关键时刻</div>
+                        ${moments.map(m => `<div class="prof-moment">${h(m)}</div>`).join('')}
+                    </div>
+                ` : ''}
+            </div>
+            <div class="prof-rels">
+                <div class="rels-group">
+                    <div class="rels-group-title">${h(name)}对别人的羁绊：</div>
+                    ${outRels.length ? outRels.map(r => `
+                        <div class="rel-item">
+                            <span class="rel-target">对${h(r.to)}：</span>
+                            <span class="rel-label">${h(r.label || '—')}</span>
+                            ${r.trend ? `<span class="rel-trend ${TREND_CLASS[r.trend] || ''}">${h(r.trend)}</span>` : ''}
+                        </div>
+                    `).join('') : '<div class="empty" style="padding:16px">暂无关系记录</div>'}
+                </div>
+                <div class="rels-group">
+                    <div class="rels-group-title">别人对${h(name)}的羁绊：</div>
+                    ${inRels.length ? inRels.map(r => `
+                        <div class="rel-item">
+                            <span class="rel-target">${h(r.from)}：</span>
+                            <span class="rel-label">${h(r.label || '—')}</span>
+                            ${r.trend ? `<span class="rel-trend ${TREND_CLASS[r.trend] || ''}">${h(r.trend)}</span>` : ''}
+                        </div>
+                    `).join('') : '<div class="empty" style="padding:16px">暂无关系记录</div>'}
+                </div>
+            </div>
+        `);
+    }
+
+    function renderArcs(arcs) {
+        summaryData.arcs = arcs || [];
+        updateCharacterSelector(arcs || []);
+        renderCharacterProfile();
+    }
+
+    function renderCharacterAliases(aliases) {
+        summaryData.characterAliases = aliases || [];
+        const list = $('aliases-list');
+        if (!list) return;
+        if (!aliases?.length) {
+            setHtml(list, '<div class="empty">暂无别名映射</div>');
+            return;
+        }
+        setHtml(list, aliases.map(alias => `
+            <div class="alias-item">
+                <span class="alias-from">${h(alias.from || '')}</span>
+                <span class="alias-arrow" aria-hidden="true">→</span>
+                <span class="alias-to">${h(alias.to || '')}</span>
+                ${alias.evidence ? `<span class="alias-evidence">${h(alias.evidence)}</span>` : ''}
+            </div>
+        `).join(''));
+    }
+
+    function updateStats(s) {
+        if (!s) return;
+        $('stat-summarized').textContent = s.summarizedUpTo ?? 0;
+        $('stat-events').textContent = s.eventsCount ?? 0;
+        const p = s.pendingFloors ?? 0;
+        $('stat-pending').textContent = p;
+        $('pending-warning').classList.toggle('hidden', p !== -1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Modals
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function openRelationsFullscreen() {
+        $('rel-fs-modal').classList.add('active');
+        const dom = $('relation-chart-fullscreen');
+        if (!relationChartFullscreen) relationChartFullscreen = echarts.init(dom);
+
+        if (!allNodes.length) {
+            relationChartFullscreen.clear();
+            return;
+        }
+
+        relationChartFullscreen.setOption({
+            tooltip: { show: false },
+            hoverLayerThreshold: Infinity,
+            series: [{
+                type: 'graph', layout: 'force', roam: true, draggable: true,
+                animation: true, animationDuration: 800, animationDurationUpdate: 300, animationEasingUpdate: 'cubicInOut',
+                progressive: 0, hoverAnimation: false,
+                data: allNodes.map(n => ({
+                    ...n,
+                    symbolSize: Array.isArray(n.symbolSize) ? [n.symbolSize[0] * 1.3, n.symbolSize[1] * 1.3] : n.symbolSize * 1.3,
+                    label: { ...n.label, fontSize: 14 }
+                })),
+                links: allLinks.map(l => ({ ...l, label: { ...l.label, fontSize: 18 } })),
+                force: { repulsion: 700, edgeLength: [150, 280], gravity: .06, friction: .6, layoutAnimation: true },
+                label: { show: true }, edgeLabel: { show: true, position: 'middle' },
+                emphasis: { disabled: true }
+            }]
+        });
+
+        setTimeout(() => relationChartFullscreen.resize(), 100);
+        postMsg('FULLSCREEN_OPENED');
+    }
+
+    function closeRelationsFullscreen() {
+        $('rel-fs-modal').classList.remove('active');
+        postMsg('FULLSCREEN_CLOSED');
+    }
+
+    /**
+     * 显示通用确认弹窗
+     * @returns {Promise<boolean>}
+     */
+    function showConfirm(title, message, okText = '执行', cancelText = '取消') {
+        return new Promise(resolve => {
+            const modal = $('confirm-modal');
+            const titleEl = $('confirm-title');
+            const msgEl = $('confirm-message');
+            const inputWrap = $('confirm-input-wrap');
+            const inputEl = $('confirm-input');
+            const actionList = $('confirm-action-list');
+            const okBtn = $('confirm-ok');
+            const cancelBtn = $('confirm-cancel');
+            const closeBtn = $('confirm-close');
+            const backdrop = $('confirm-backdrop');
+
+            titleEl.textContent = title;
+            msgEl.textContent = message;
+            inputWrap.classList.add('hidden');
+            actionList.classList.add('hidden');
+            inputEl.value = '';
+            okBtn.classList.remove('hidden');
+            okBtn.textContent = okText;
+            cancelBtn.textContent = cancelText;
+
+            const close = (result) => {
+                modal.classList.remove('active');
+                postMsg('CONFIRM_CLOSED');
+                okBtn.onclick = null;
+                cancelBtn.onclick = null;
+                if (closeBtn) closeBtn.onclick = null;
+                backdrop.onclick = null;
+                resolve(result);
+            };
+
+            okBtn.onclick = () => close(true);
+            cancelBtn.onclick = () => close(false);
+            if (closeBtn) closeBtn.onclick = () => close(false);
+            backdrop.onclick = () => close(false);
+
+            modal.classList.add('active');
+            postMsg('CONFIRM_OPENED');
+        });
+    }
+
+    function showConfirmInput(title, message, okText = '执行', cancelText = '取消', placeholder = '') {
+        return new Promise(resolve => {
+            const modal = $('confirm-modal');
+            const titleEl = $('confirm-title');
+            const msgEl = $('confirm-message');
+            const inputWrap = $('confirm-input-wrap');
+            const inputEl = $('confirm-input');
+            const actionList = $('confirm-action-list');
+            const okBtn = $('confirm-ok');
+            const cancelBtn = $('confirm-cancel');
+            const closeBtn = $('confirm-close');
+            const backdrop = $('confirm-backdrop');
+
+            titleEl.textContent = title;
+            msgEl.textContent = message;
+            inputWrap.classList.remove('hidden');
+            actionList.classList.add('hidden');
+            inputEl.placeholder = placeholder || '';
+            inputEl.value = '';
+            okBtn.classList.remove('hidden');
+            okBtn.textContent = okText;
+            cancelBtn.textContent = cancelText;
+
+            const close = (result) => {
+                modal.classList.remove('active');
+                postMsg('CONFIRM_CLOSED');
+                inputWrap.classList.add('hidden');
+                inputEl.value = '';
+                okBtn.onclick = null;
+                cancelBtn.onclick = null;
+                if (closeBtn) closeBtn.onclick = null;
+                backdrop.onclick = null;
+                resolve(result);
+            };
+
+            okBtn.onclick = () => close(inputEl.value);
+            cancelBtn.onclick = () => close(null);
+            if (closeBtn) closeBtn.onclick = () => close(null);
+            backdrop.onclick = () => close(null);
+
+            modal.classList.add('active');
+            postMsg('CONFIRM_OPENED');
+            setTimeout(() => inputEl.focus(), 0);
+        });
+    }
+
+    function showCleanActionMenu() {
+        return new Promise(resolve => {
+            const modal = $('confirm-modal');
+            const titleEl = $('confirm-title');
+            const msgEl = $('confirm-message');
+            const inputWrap = $('confirm-input-wrap');
+            const inputEl = $('confirm-input');
+            const actionList = $('confirm-action-list');
+            const rollbackBtn = $('confirm-action-rollback');
+            const clearBtn = $('confirm-action-clear');
+            const rollbackDesc = $('confirm-action-rollback-desc');
+            const clearDesc = $('confirm-action-clear-desc');
+            const okBtn = $('confirm-ok');
+            const cancelBtn = $('confirm-cancel');
+            const closeBtn = $('confirm-close');
+            const backdrop = $('confirm-backdrop');
+            const busy = isBusyLike();
+
+            titleEl.textContent = '清理总结数据';
+            msgEl.textContent = '请选择要执行的清理操作。';
+            inputWrap.classList.add('hidden');
+            inputEl.value = '';
+            actionList.classList.remove('hidden');
+            okBtn.classList.add('hidden');
+            cancelBtn.textContent = '退出';
+
+            if (busy) {
+                rollbackBtn.disabled = true;
+                clearBtn.disabled = true;
+                rollbackDesc.textContent = '当前有任务运行中，暂时不能执行。';
+                clearDesc.textContent = '当前有任务运行中，暂时不能执行。';
+            } else {
+                rollbackBtn.disabled = !cleanActionState.canRollback;
+                clearBtn.disabled = false;
+                rollbackDesc.textContent = cleanActionState.canRollback
+                    ? (cleanActionState.rollbackWillResetBoundary
+                        ? '撤销首次总结生成的内容；人工修改不会被覆盖，存在冲突时将拒绝回退。聊天记录不会删除。'
+                        : `撤销最近一次总结，已总结楼层将回退到 ${cleanActionState.rollbackTargetSummarizedUpTo} 楼。聊天记录不会删除。`)
+                    : '当前没有可回退的总结快照。';
+                clearDesc.textContent = '删除本聊天的全部总结数据，聊天记录不会删除。';
+            }
+
+            const close = (result) => {
+                modal.classList.remove('active');
+                postMsg('CONFIRM_CLOSED');
+                actionList.classList.add('hidden');
+                okBtn.classList.remove('hidden');
+                rollbackBtn.onclick = null;
+                clearBtn.onclick = null;
+                cancelBtn.onclick = null;
+                if (closeBtn) closeBtn.onclick = null;
+                backdrop.onclick = null;
+                resolve(result);
+            };
+
+            rollbackBtn.onclick = () => {
+                if (!rollbackBtn.disabled) close('rollback');
+            };
+            clearBtn.onclick = () => {
+                if (!clearBtn.disabled) close('clear');
+            };
+            cancelBtn.onclick = () => close(null);
+            if (closeBtn) closeBtn.onclick = () => close(null);
+            backdrop.onclick = () => close(null);
+
+            modal.classList.add('active');
+            postMsg('CONFIRM_OPENED');
+        });
+    }
+
+    function renderArcsEditor(arcs) {
+        const list = arcs?.length ? arcs : [{ name: '', trajectory: '', progress: 0, moments: [] }];
+        const es = $('editor-struct');
+
+        setHtml(es, `
+            <div id="arc-list">
+                ${list.map((a, i) => `
+                    <div class="struct-item arc-item" data-index="${i}">
+                        <div class="struct-row"><input type="text" class="arc-name" placeholder="角色名" value="${h(a.name || '')}"></div>
+                        <div class="struct-row"><textarea class="arc-trajectory" rows="2" placeholder="当前状态描述">${h(a.trajectory || '')}</textarea></div>
+                        <div class="struct-row">
+                            <label style="font-size:.75rem;color:var(--txt3)">进度：<input type="number" class="arc-progress" min="0" max="100" value="${Math.round((a.progress || 0) * 100)}" style="width:64px;display:inline-block"> %</label>
+                        </div>
+                        <div class="struct-row"><textarea class="arc-moments" rows="3" placeholder="关键时刻，一行一个">${h((a.moments || []).map(m => typeof m === 'string' ? m : m.text).join('\n'))}</textarea></div>
+                        <div class="struct-actions"><span>角色弧光 ${i + 1}</span></div>
+                    </div>
+                `).join('')}
+            </div>
+            <div style="margin-top:8px"><button type="button" class="btn btn-sm" id="arc-add">＋ 新增角色弧光</button></div>
+        `);
+
+        es.querySelectorAll('.arc-item').forEach(addDeleteHandler);
+
+        $('arc-add').onclick = () => {
+            const listEl = $('arc-list');
+            const idx = listEl.querySelectorAll('.arc-item').length;
+            const div = document.createElement('div');
+            div.className = 'struct-item arc-item';
+            div.dataset.index = idx;
+            setHtml(div, `
+                <div class="struct-row"><input type="text" class="arc-name" placeholder="角色名"></div>
+                <div class="struct-row"><textarea class="arc-trajectory" rows="2" placeholder="当前状态描述"></textarea></div>
+                <div class="struct-row">
+                    <label style="font-size:.75rem;color:var(--txt3)">进度：<input type="number" class="arc-progress" min="0" max="100" value="0" style="width:64px;display:inline-block"> %</label>
+                </div>
+                <div class="struct-row"><textarea class="arc-moments" rows="3" placeholder="关键时刻，一行一个"></textarea></div>
+                <div class="struct-actions"><span>角色弧光 ${idx + 1}</span></div>
+            `);
+            addDeleteHandler(div);
+            listEl.appendChild(div);
+        };
+    }
+
+
+    function setRecallLog(text) {
+        lastRecallLogText = text || '';
+        updateRecallLogDisplay();
+    }
+
+    function updateRecallLogDisplay() {
+        const content = $('recall-log-content');
+        if (!content) return;
+
+        if (lastRecallLogText) {
+            content.textContent = lastRecallLogText;
+            content.classList.remove('recall-empty');
+        } else {
+            setHtml(content, `<div class="recall-empty">
+            暂无召回日志<br><br>
+            当 AI 生成回复时，系统会自动进行记忆召回。<br><br>
+            召回日志将显示：<br>
+            • [L0] Query Understanding - 意图识别<br>
+            • [L1] Constraints - 硬约束注入<br>
+            • [L2] Narrative Retrieval - 事件召回<br>
+            • [L3] Evidence Assembly - 证据装配<br>
+            • [L4] Prompt Formatting - 格式化<br>
+            • [Budget] Token 预算使用情况<br>
+            • [Quality] 质量指标与潜在问题
+        </div>`);
+        }
+    }
+
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Editor
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function preserveAddedAt(n, o) {
+        if (o?._addedAt != null) n._addedAt = o._addedAt;
+        return n;
+    }
+
+    function createDelBtn() {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'btn btn-sm btn-del';
+        b.textContent = '删除';
+        return b;
+    }
+
+    function addDeleteHandler(item) {
+        const del = createDelBtn();
+        (item.querySelector('.struct-actions') || item).appendChild(del);
+        del.onclick = () => item.remove();
+    }
+
+    function memoryRoleOptions(role = '') {
+        return `<option value=""${role ? '' : ' selected'}>${UNANNOTATED_LABEL}</option>`
+            + EVENT_MEMORY_ROLES.map(value => `<option value="${h(value)}"${role === value ? ' selected' : ''}>${h(value)}</option>`).join('');
+    }
+
+    function relationTrendOptions(trend = '') {
+        return [{ value: '', label: UNANNOTATED_LABEL }, ...RELATION_TRENDS.map(value => ({ value, label: value }))]
+            .map(({ value, label }) => `<option value="${h(value)}"${trend === value ? ' selected' : ''}>${h(label)}</option>`).join('');
+    }
+
+    function renderEventsEditor(events) {
+        const list = events?.length ? events : [{ id: 'evt-1', title: '', timeLabel: '', summary: '', participants: [], memoryRole: '' }];
+        let maxId = 0;
+        list.forEach(e => {
+            const m = e.id?.match(/evt-(\d+)/);
+            if (m) maxId = Math.max(maxId, +m[1]);
+        });
+
+        const es = $('editor-struct');
+        setHtml(es, list.map(ev => {
+            const id = ev.id || `evt-${++maxId}`;
+            return `<div class="struct-item event-item" data-id="${h(id)}">
+                <div class="struct-row">
+                    <input type="text" class="event-title" placeholder="事件标题" value="${h(ev.title || '')}">
+                    <input type="text" class="event-time" placeholder="时间标签" value="${h(ev.timeLabel || '')}">
+                </div>
+                <div class="struct-row">
+                    <textarea class="event-summary" rows="2" placeholder="一句话描述">${h(ev.summary || '')}</textarea>
+                </div>
+                <div class="struct-row">
+                    <input type="text" class="event-participants" placeholder="人物（顿号分隔）" value="${h((ev.participants || []).join('、'))}">
+                </div>
+                <div class="struct-row">
+                    <label class="event-memory-role-field">记忆作用<select class="event-memory-role">${memoryRoleOptions(ev.memoryRole)}</select></label>
+                </div>
+                <div class="struct-actions"><span>ID：${h(id)}</span></div>
+            </div>`;
+        }).join('') + '<div style="margin-top:8px"><button type="button" class="btn btn-sm" id="event-add">＋ 新增事件</button></div>');
+
+        es.querySelectorAll('.event-item').forEach(addDeleteHandler);
+
+        $('event-add').onclick = () => {
+            let nmax = maxId;
+            es.querySelectorAll('.event-item').forEach(it => {
+                const m = it.dataset.id?.match(/evt-(\d+)/);
+                if (m) nmax = Math.max(nmax, +m[1]);
+            });
+            const nid = `evt-${nmax + 1}`;
+            const div = document.createElement('div');
+            div.className = 'struct-item event-item';
+            div.dataset.id = nid;
+            setHtml(div, `
+                <div class="struct-row"><input type="text" class="event-title" placeholder="事件标题"><input type="text" class="event-time" placeholder="时间标签"></div>
+                <div class="struct-row"><textarea class="event-summary" rows="2" placeholder="一句话描述"></textarea></div>
+                <div class="struct-row"><input type="text" class="event-participants" placeholder="人物（顿号分隔）"></div>
+                <div class="struct-row">
+                    <label class="event-memory-role-field">记忆作用<select class="event-memory-role">${memoryRoleOptions()}</select></label>
+                </div>
+                <div class="struct-actions"><span>ID：${h(nid)}</span></div>
+            `);
+            addDeleteHandler(div);
+            es.insertBefore(div, $('event-add').parentElement);
+        };
+    }
+
+    function renderCharactersEditor(data) {
+        const d = data || { main: [], relationships: [] };
+        const main = (d.main || []).map(getCharName);
+        const rels = d.relationships || [];
+
+        const es = $('editor-struct');
+        setHtml(es, `
+            <div class="struct-item">
+                <div class="struct-row"><strong>角色列表</strong></div>
+                <div id="char-main-list">
+                    ${(main.length ? main : ['']).map(n => `<div class="struct-row char-main-item"><input type="text" class="char-main-name" placeholder="角色名" value="${h(n || '')}"></div>`).join('')}
+                </div>
+                <div style="margin-top:8px"><button type="button" class="btn btn-sm" id="char-main-add">＋ 新增角色</button></div>
+            </div>
+            <div class="struct-item">
+                <div class="struct-row"><strong>人物关系</strong></div>
+                <div id="char-rel-list">
+                    ${(rels.length ? rels : [{ from: '', to: '', label: '', trend: '' }]).map(r => `
+                        <div class="struct-row char-rel-item">
+                            <input type="text" class="char-rel-from" placeholder="角色 A" value="${h(r.from || '')}">
+                            <input type="text" class="char-rel-to" placeholder="角色 B" value="${h(r.to || '')}">
+                            <input type="text" class="char-rel-label" placeholder="关系" value="${h(r.label || '')}">
+                            <select class="char-rel-trend">${relationTrendOptions(r.trend)}</select>
+                        </div>
+                    `).join('')}
+                </div>
+                <div style="margin-top:8px"><button type="button" class="btn btn-sm" id="char-rel-add">＋ 新增关系</button></div>
+            </div>
+        `);
+
+        es.querySelectorAll('.char-main-item,.char-rel-item').forEach(addDeleteHandler);
+
+        $('char-main-add').onclick = () => {
+            const div = document.createElement('div');
+            div.className = 'struct-row char-main-item';
+            setHtml(div, '<input type="text" class="char-main-name" placeholder="角色名">');
+            addDeleteHandler(div);
+            $('char-main-list').appendChild(div);
+        };
+
+        $('char-rel-add').onclick = () => {
+            const div = document.createElement('div');
+            div.className = 'struct-row char-rel-item';
+            setHtml(div, `
+                <input type="text" class="char-rel-from" placeholder="角色 A">
+                <input type="text" class="char-rel-to" placeholder="角色 B">
+                <input type="text" class="char-rel-label" placeholder="关系">
+                <select class="char-rel-trend">${relationTrendOptions()}</select>
+            `);
+            addDeleteHandler(div);
+            $('char-rel-list').appendChild(div);
+        };
+    }
+
+    function renderCharacterAliasesEditor(aliases) {
+        const list = aliases?.length ? aliases : [{ from: '', to: '', evidence: '' }];
+        const es = $('editor-struct');
+        const renderItem = alias => `
+            <div class="struct-item alias-edit-item">
+                <div class="struct-row">
+                    <input type="text" class="alias-edit-from" placeholder="别名、称号或译名" value="${h(alias.from || '')}">
+                    <input type="text" class="alias-edit-to" placeholder="角色主名" value="${h(alias.to || '')}">
+                </div>
+                <div class="struct-row">
+                    <input type="text" class="alias-edit-evidence" placeholder="确认依据（可选）" value="${h(alias.evidence || '')}">
+                </div>
+                <div class="struct-actions"><span>别名映射</span></div>
+            </div>`;
+
+        setHtml(es, `
+            <div id="alias-edit-list">${list.map(renderItem).join('')}</div>
+            <div style="margin-top:8px"><button type="button" class="btn btn-sm" id="alias-add">＋ 新增映射</button></div>
+        `);
+        es.querySelectorAll('.alias-edit-item').forEach(addDeleteHandler);
+        $('alias-add').onclick = () => {
+            // renderItem already emits a .struct-item.alias-edit-item wrapper. Giving
+            // this outer element the same class nested the new row twice, so saveEditor's
+            // querySelectorAll('.alias-edit-item') read it twice and every save failed
+            // validation with "duplicate alias points at several characters".
+            const div = document.createElement('div');
+            setHtml(div, renderItem({ from: '', to: '', evidence: '' }));
+            addDeleteHandler(div);
+            $('alias-edit-list').appendChild(div);
+        };
+    }
+
+    function openEditor(section) {
+        currentEditSection = section;
+        const meta = SECTION_META[section];
+        const es = $('editor-struct');
+        const ta = $('editor-ta');
+
+        $('editor-title').textContent = meta.title;
+        $('editor-hint').textContent = meta.hint;
+        $('editor-err').classList.remove('visible');
+        $('editor-err').textContent = '';
+        es.classList.add('hidden');
+        ta.classList.remove('hidden');
+
+        if (section === 'keywords') {
+            ta.value = summaryData.keywords.map(k => `${k.text}|${k.weight || '一般'}`).join('\n');
+        } else if (section === 'facts') {
+            ta.value = (summaryData.facts || [])
+                .filter(f => !f.retracted)
+                .map(f => {
+                    const parts = [f.s, f.p, f.o];
+                    if (f.trend) parts.push(f.trend);
+                    return parts.join('|');
+                })
+                .join('\n');
+        } else {
+            ta.classList.add('hidden');
+            es.classList.remove('hidden');
+            if (section === 'events') renderEventsEditor(summaryData.events || []);
+            else if (section === 'characters') renderCharactersEditor(summaryData.characters || { main: [], relationships: [] });
+            else if (section === 'arcs') renderArcsEditor(summaryData.arcs || []);
+            else if (section === 'aliases') renderCharacterAliasesEditor(summaryData.characterAliases || []);
+        }
+
+        $('editor-modal').classList.add('active');
+        postMsg('EDITOR_OPENED');
+    }
+
+    function closeEditor() {
+        $('editor-modal').classList.remove('active');
+        currentEditSection = null;
+        postMsg('EDITOR_CLOSED');
+    }
+
+    function saveEditor() {
+        const section = currentEditSection;
+        const es = $('editor-struct');
+        const ta = $('editor-ta');
+        let parsed;
+
+        try {
+            if (section === 'keywords') {
+                const oldMap = new Map((summaryData.keywords || []).map(k => [k.text, k]));
+                parsed = ta.value.trim().split('\n').filter(l => l.trim()).map(line => {
+                    const [text, weight] = line.split('|').map(s => s.trim());
+                    return preserveAddedAt({ text: text || '', weight: weight || '一般' }, oldMap.get(text));
+                });
+            } else if (section === 'events') {
+                const oldMap = new Map((summaryData.events || []).map(e => [e.id, e]));
+                parsed = Array.from(es.querySelectorAll('.event-item')).map(it => {
+                    const id = it.dataset.id;
+                    return preserveAddedAt({
+                        id,
+                        title: it.querySelector('.event-title').value.trim(),
+                        timeLabel: it.querySelector('.event-time').value.trim(),
+                        summary: it.querySelector('.event-summary').value.trim(),
+                        participants: it.querySelector('.event-participants').value.trim().split(/[,、，]/).map(s => s.trim()).filter(Boolean),
+                        memoryRole: it.querySelector('.event-memory-role').value,
+                        causedBy: [...(oldMap.get(id)?.causedBy || [])],
+                    }, oldMap.get(id));
+                }).filter(e => e.title || e.summary);
+                parsed = projectEditedSummaryEvents(parsed);
+            } else if (section === 'characters') {
+                const oldMainMap = new Map((summaryData.characters?.main || []).map(m => [getCharName(m), m]));
+                const mainNames = Array.from(es.querySelectorAll('.char-main-name')).map(i => i.value.trim()).filter(Boolean);
+                const main = mainNames.map(n => preserveAddedAt({ name: n }, oldMainMap.get(n)));
+
+                const oldRelMap = new Map((summaryData.characters?.relationships || []).map(r => [`${r.from}->${r.to}`, r]));
+                const rels = Array.from(es.querySelectorAll('.char-rel-item')).map(it => {
+                    const from = it.querySelector('.char-rel-from').value.trim();
+                    const to = it.querySelector('.char-rel-to').value.trim();
+                    return preserveAddedAt({
+                        from, to,
+                        label: it.querySelector('.char-rel-label').value.trim(),
+                        trend: it.querySelector('.char-rel-trend').value
+                    }, oldRelMap.get(`${from}->${to}`));
+                }).filter(r => r.from && r.to);
+
+                parsed = { main, relationships: rels };
+            } else if (section === 'arcs') {
+                const oldArcMap = new Map((summaryData.arcs || []).map(a => [a.name, a]));
+                parsed = Array.from(es.querySelectorAll('.arc-item')).map(it => {
+                    const name = it.querySelector('.arc-name').value.trim();
+                    const oldArc = oldArcMap.get(name);
+                    const oldMomentMap = new Map((oldArc?.moments || []).map(m => [typeof m === 'string' ? m : m.text, m]));
+                    const momentsRaw = it.querySelector('.arc-moments').value.trim();
+                    const moments = momentsRaw ? momentsRaw.split('\n').map(s => s.trim()).filter(Boolean).map(t => preserveAddedAt({ text: t }, oldMomentMap.get(t))) : [];
+                    return preserveAddedAt({
+                        name,
+                        trajectory: it.querySelector('.arc-trajectory').value.trim(),
+                        progress: Math.max(0, Math.min(1, (parseFloat(it.querySelector('.arc-progress').value) || 0) / 100)),
+                        moments
+                    }, oldArc);
+                }).filter(a => a.name || a.trajectory || a.moments?.length);
+            } else if (section === 'facts') {
+                const oldMap = new Map((summaryData.facts || []).map(f => [`${f.s}::${f.p}`, f]));
+                parsed = ta.value
+                    .split('\n')
+                    .map(l => l.trim())
+                    .filter(Boolean)
+                    .map(line => {
+                        const parts = line.split('|').map(s => s.trim());
+                        const s = parts[0];
+                        const p = parts[1];
+                        const o = parts[2];
+                        const trend = parts[3];
+                        if (!s || !p) return null;
+                        if (!o) return null;
+                        const key = `${s}::${p}`;
+                        const old = oldMap.get(key);
+                        const fact = {
+                            s, p, o,
+                            since: old?.since ?? 0,
+                            _addedAt: old?._addedAt ?? 0,
+                        };
+                        if (/^对.+的/.test(p) && trend) {
+                            fact.trend = trend;
+                        }
+                        return fact;
+                    })
+                    .filter(Boolean);
+            } else if (section === 'aliases') {
+                parsed = Array.from(es.querySelectorAll('.alias-edit-item')).map(item => ({
+                    from: item.querySelector('.alias-edit-from').value.trim(),
+                    to: item.querySelector('.alias-edit-to').value.trim(),
+                    evidence: item.querySelector('.alias-edit-evidence').value.trim(),
+                })).filter(alias => alias.from || alias.to || alias.evidence);
+                if (parsed.some(alias => !alias.from || !alias.to)) {
+                    throw new Error('每条映射都要填写别名和角色主名');
+                }
+            }
+        } catch (e) {
+            $('editor-err').textContent = `格式错误: ${e.message}`;
+            $('editor-err').classList.add('visible');
+            return;
+        }
+
+        if (section === 'aliases') postMsg('UPDATE_CHARACTER_ALIASES', { aliases: parsed });
+        else postMsg('UPDATE_SECTION', { section, data: parsed });
+
+        if (section === 'keywords') renderKeywords(parsed);
+        else if (section === 'events') { renderTimeline(parsed, { scrollMode: 'preserve' }); $('stat-events').textContent = parsed.length; }
+        else if (section === 'characters') renderRelations(parsed);
+        else if (section === 'arcs') renderArcs(parsed);
+        else if (section === 'facts') renderFacts(parsed);
+
+        closeEditor();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Message Handler
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function handleParentMessage(e) {
+        if (e.origin !== PARENT_ORIGIN || e.source !== window.parent) return;
+
+        const d = e.data;
+        if (!d || d.source !== 'LittleWhiteBox') return;
+
+        const btn = $('btn-generate');
+
+        switch (d.type) {
+            case 'CHAT_SUMMARY_STATE':
+                currentChatSummaryPending = d.state?.changing === true;
+                syncCurrentChatSummaryControls(
+                    d.state?.chatEnabled !== false,
+                    d.state?.effectiveEnabled !== false,
+                    d.state?.consumable !== false,
+                );
+                break;
+
+            case 'GENERATION_STATE':
+                localGenerating = !!d.isGenerating;
+                btn.textContent = localGenerating ? '停止' : '总结';
+                break;
+
+            case 'SUMMARY_BASE_DATA':
+                if (d.stats) {
+                    updateStats(d.stats);
+                    $('summarized-count').textContent = d.stats.hiddenCount ?? 0;
+                    cleanActionState.summarizedUpTo = d.stats.summarizedUpTo ?? 0;
+                }
+                if (d.hideSummarized !== undefined) {
+                    $('hide-summarized').checked = d.hideSummarized;
+                    config.ui.hideSummarized = d.hideSummarized;
+                }
+                if (d.keepVisibleCount !== undefined) $('keep-visible-count').value = d.keepVisibleCount;
+                if (d.useVectorBoundary !== undefined) config.ui.useVectorBoundary = d.useVectorBoundary !== false;
+                syncVectorBoundaryControl(d.vectorEnabled, d.hideSummarized ?? config.ui.hideSummarized);
+                cleanActionState.canRollback = !!d.canRollback;
+                cleanActionState.rollbackTargetSummarizedUpTo = Number(d.rollbackTargetSummarizedUpTo || 0);
+                cleanActionState.rollbackWillResetBoundary = !!d.rollbackWillResetBoundary;
+                break;
+
+            case 'SUMMARY_FULL_DATA':
+                if (d.payload) {
+                    const p = d.payload;
+                    const nextChatId = typeof p.chatId === 'string' ? p.chatId : '';
+                    memoryMaintenancePage.setChat(nextChatId);
+                    if (nextChatId !== currentTimelineChatId) {
+                        currentTimelineChatId = nextChatId;
+                        timelineHasRenderedEvents = false;
+                        tlCurrentPage = tlLoadPage();
+                    }
+                    if (p.keywords) renderKeywords(p.keywords);
+                    if (p.events) renderTimeline(p.events);
+                    if (p.characters) renderRelations(p.characters);
+                    if (p.arcs) renderArcs(p.arcs);
+                    if (p.facts) renderFacts(p.facts);
+                    if (p.characterAliases) renderCharacterAliases(p.characterAliases);
+                    $('stat-events').textContent = p.events?.length || 0;
+                    if (p.lastSummarizedMesId != null) $('stat-summarized').textContent = p.lastSummarizedMesId + 1;
+                    if (p.stats) updateStats(p.stats);
+                }
+                break;
+
+            case 'SUMMARY_STATUS':
+            case 'SUMMARY_ERROR': {
+                const status = $('summary-status');
+                const isError = d.type === 'SUMMARY_ERROR';
+                status.classList.toggle('is-error', isError);
+                status.setAttribute('role', isError ? 'alert' : 'status');
+                status.setAttribute('aria-live', isError ? 'assertive' : 'polite');
+                status.tabIndex = isError ? 0 : -1;
+                status.textContent = String((isError ? d.message : d.statusText) || '');
+                status.hidden = !status.textContent;
+                break;
+            }
+
+            case 'MEMORY_MAINTENANCE_RESULTS':
+                memoryMaintenancePage.render(d.payload);
+                break;
+            case 'MEMORY_MAINTENANCE_SOURCE_RESULT':
+                memoryMaintenancePage.renderSource(d.payload);
+                break;
+
+            case 'SUMMARY_CLEARED': {
+                const t = d.payload?.totalFloors || 0;
+                $('stat-events').textContent = 0;
+                $('stat-summarized').textContent = 0;
+                $('stat-pending').textContent = t;
+                $('summarized-count').textContent = 0;
+                summaryData = { keywords: [], events: [], characters: { main: [], relationships: [] }, arcs: [], facts: [], characterAliases: [] };
+                currentTimelineChatId = '';
+                renderKeywords([]);
+                renderTimeline([]);
+                renderRelations(null);
+                renderArcs([]);
+                renderFacts([]);
+                renderCharacterAliases([]);
+                break;
+            }
+
+            case 'LOAD_PANEL_CONFIG':
+                showPanelConfigLoadState('ready');
+                applyBuiltInSummaryPrompts(d.builtInSummaryPrompts);
+                if (d.config) applyConfig(d.config);
+                if ($('settings-modal')?.classList.contains('active') && !settingsOpenedWithServerConfig) {
+                    openSettings({ preserveTab: true });
+                }
+                break;
+
+            case 'PANEL_CONFIG_LOAD_ERROR':
+                settingsOpenedWithServerConfig = false;
+                showPanelConfigLoadState('error', d.message || '');
+                break;
+
+            case 'PANEL_CONFIG_SAVE_RESULT': {
+                if ($('tab-agent').classList.contains('active')) memoryMaintenancePage.settingsSaved(d.success);
+                const pending = pendingConfigSaveRequests.get(d.requestId || '');
+                if (pending) {
+                    pendingConfigSaveRequests.delete(d.requestId || '');
+                    if (pending.timeoutId) clearTimeout(pending.timeoutId);
+                    const statusEl = $(pending.statusId);
+                    if (d.success) {
+                        if (d.config) applyConfig(d.config);
+                        setStatusText(statusEl, pending.successMessage, 'success');
+                        pending.resolve(true);
+                    } else {
+                        setStatusText(statusEl, `${pending.errorPrefix}${d.error || '未知错误'}`, 'error');
+                        pending.resolve(false);
+                    }
+                } else if (d.success && d.config) {
+                    applyConfig(d.config);
+                }
+                break;
+            }
+
+            case 'SUMMARY_MODELS': {
+                if (!d.requestId || d.requestId !== pendingSummaryModelFetchRequestId) break;
+                pendingSummaryModelFetchRequestId = '';
+                resetSummaryModelFetchUi();
+
+                const models = Array.isArray(d.models) ? [...new Set(d.models.filter(Boolean))] : [];
+                config.api.modelCache = models;
+                modelListFetchedThisIframe = models.length > 0;
+                setSelectOptions($('api-model-select'), config.api.modelCache, '请选择');
+                $('api-model-select-row').classList.toggle('hidden', !models.length);
+
+                if (!config.api.model && models.length) {
+                    config.api.model = models[0];
+                    $('api-model-text').value = models[0];
+                    $('api-model-select').value = models[0];
+                } else if (config.api.model) {
+                    $('api-model-select').value = config.api.model;
+                }
+
+                setStatusText($('api-connect-status'), `拉取成功：${models.length} 个模型`, 'success');
+                break;
+            }
+
+            case 'SUMMARY_MODELS_ERROR':
+                if (!d.requestId || d.requestId !== pendingSummaryModelFetchRequestId) break;
+                pendingSummaryModelFetchRequestId = '';
+                resetSummaryModelFetchUi();
+                setStatusText($('api-connect-status'), '拉取失败：' + (d.message || '请检查 URL 和 KEY'), 'error');
+                break;
+
+            case 'VECTOR_CONFIG':
+                if (d.config) loadVectorConfig(d.config);
+                break;
+
+            case 'VECTOR_ONLINE_STATUS':
+                updateVectorOnlineStatus(d.target, d.status, d.message);
+                break;
+
+            case 'VECTOR_STATS':
+                updateVectorStats(d.stats);
+                break;
+
+            case 'VECTOR_INTEGRITY':
+                $('vector-integrity-status').textContent = d.message || '';
+                break;
+
+            case 'ANCHOR_STATS':
+                updateAnchorStats(d.stats || {});
+                break;
+
+            case 'ANCHOR_GEN_PROGRESS':
+                updateAnchorProgress(d.current, d.total, d.message);
+                break;
+
+            case 'VECTOR_GEN_PROGRESS':
+                updateVectorProgress(d);
+                break;
+
+            case 'VECTOR_EXPORT_RESULT':
+                $('btn-export-vectors').disabled = false;
+                if (d.success) {
+                    $('vector-io-status').textContent = `导出成功: ${d.filename} (${(d.size / 1024 / 1024).toFixed(2)}MB)`;
+                } else {
+                    $('vector-io-status').textContent = '导出失败: ' + (d.error || '未知错误');
+                }
+                break;
+
+            case 'SUMMARY_COPY_RESULT':
+                $('btn-copy-summary').disabled = false;
+                if (d.success) {
+                    $('summary-io-status').textContent = `复制成功: ${d.events || 0} 条事件, ${d.facts || 0} 条世界状态`;
+                } else {
+                    $('summary-io-status').textContent = '复制失败: ' + (d.error || '未知错误');
+                }
+                break;
+
+            case 'SUMMARY_IMPORT_RESULT':
+                $('btn-import-summary').disabled = false;
+                if (d.success) {
+                    const c = d.counts || {};
+                    $('summary-io-status').textContent = `导入成功: ${c.events || 0} 条事件, ${c.facts || 0} 条世界状态。向量与锚点已清空，请先生成锚点，再补齐向量。`;
+                    postMsg('REQUEST_VECTOR_STATS');
+                    postMsg('REQUEST_ANCHOR_STATS');
+                } else {
+                    $('summary-io-status').textContent = '导入失败: ' + (d.error || '未知错误');
+                }
+                break;
+
+            case 'VECTOR_IMPORT_RESULT':
+                $('btn-import-vectors').disabled = false;
+                if (d.success) {
+                    let msg = `导入成功: ${formatVectorPackageCounts(d)}`;
+                    if (d.warnings?.length) {
+                        msg += '\n⚠️ ' + d.warnings.join('\n⚠️ ');
+                    }
+                    $('vector-io-status').textContent = msg;
+                    // 刷新统计
+                    postMsg('REQUEST_VECTOR_STATS');
+                } else {
+                    $('vector-io-status').textContent = '导入失败: ' + (d.error || '未知错误');
+                }
+                break;
+            case 'VECTOR_BACKUP_RESULT':
+                $('btn-backup-server').disabled = false;
+                if (d.success) {
+                    $('server-io-status').textContent = `☁️ 备份成功: ${(d.size / 1024 / 1024).toFixed(2)}MB (${formatVectorPackageCounts(d)})`;
+                } else {
+                    $('server-io-status').textContent = '备份失败: ' + (d.error || '未知错误');
+                }
+                break;
+
+            case 'VECTOR_RESTORE_RESULT':
+                $('btn-restore-server').disabled = false;
+                if (d.success) {
+                    let msg = `☁️ 恢复成功: ${formatVectorPackageCounts(d)}`;
+                    if (d.warnings?.length) {
+                        msg += '\n⚠️ ' + d.warnings.join('\n⚠️ ');
+                    }
+                    $('server-io-status').textContent = msg;
+                    postMsg('REQUEST_VECTOR_STATS');
+                } else {
+                    $('server-io-status').textContent = '恢复失败: ' + (d.error || '未知错误');
+                }
+                break;
+
+            case 'RECALL_LOG':
+                setRecallLog(d.text || '');
+                break;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Event Bindings
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function bindEvents() {
+        // Section edit buttons
+        $$('.sec-btn[data-section]').forEach(b => b.onclick = () => openEditor(b.dataset.section));
+
+        // Editor modal
+        $('editor-backdrop').onclick = closeEditor;
+        $('editor-close').onclick = closeEditor;
+        $('editor-cancel').onclick = closeEditor;
+        $('editor-save').onclick = saveEditor;
+
+        // Settings modal
+        $('btn-settings').onclick = openSettings;
+        $('settings-backdrop').onclick = closeSettings;
+        $('settings-close').onclick = closeSettings;
+        $('settings-cancel').onclick = closeSettings;
+        $('settings-config-retry').onclick = retryPanelConfigLoad;
+        $('settings-save').onclick = saveSettings;
+
+        // Settings tabs
+        $$('.settings-tab').forEach(tab => {
+            tab.onclick = () => {
+                const targetId = tab.dataset.tab;
+                if (!targetId) return;
+
+                // Update tab active state
+                $$('.settings-tab').forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+
+                // Update pane active state
+                $$('.tab-pane').forEach(p => p.classList.remove('active'));
+                $(targetId).classList.add('active');
+
+                // If switching to debug tab, refresh log
+                if (targetId === 'tab-debug') {
+                    postMsg('REQUEST_RECALL_LOG');
+                }
+                if (targetId === 'tab-agent') memoryMaintenancePage.open();
+            };
+        });
+
+        // API provider change
+        $('api-provider').onchange = e => {
+            const pv = PROVIDER_DEFAULTS[e.target.value] || PROVIDER_DEFAULTS.openai;
+            $('api-url').value = '';
+            modelListFetchedThisIframe = false;
+            if (!pv.canFetch) config.api.modelCache = [];
+            updateProviderUI(e.target.value);
+        };
+
+        $('btn-connect').onclick = fetchModels;
+        $('api-model-text').oninput = e => { config.api.model = e.target.value.trim(); };
+        $('api-model-select').onchange = e => {
+            const value = e.target.value || '';
+            if (value) {
+                $('api-model-text').value = value;
+                config.api.model = value;
+            }
+        };
+        $('btn-reset-memory-prompt-template').onclick = () => {
+            $('memory-prompt-template').value = DEFAULT_MEMORY_PROMPT_TEMPLATE;
+        };
+
+        // Trigger timing
+        $('trigger-timing').onchange = () => {
+            syncAutoSummaryControls();
+        };
+
+        // 总结间隔范围校验
+        $('trigger-interval').onchange = e => {
+            let val = parseInt(e.target.value) || 20;
+            val = Math.max(1, Math.min(30, val));
+            e.target.value = val;
+        };
+
+        // 延迟总结楼层范围校验
+        $('trigger-delay-floors').onchange = e => {
+            e.target.value = normalizeSummaryDelayFloors(e.target.value);
+        };
+
+        // Current chat switch (saved immediately in chat metadata)
+        $('current-chat-enabled').onchange = e => {
+            const enabled = e.target.checked;
+            currentChatSummaryPending = true;
+            syncCurrentChatSummaryControls(enabled);
+            postMsg('SET_CURRENT_CHAT_ENABLED', { enabled });
+        };
+
+        // Main actions
+        $('btn-clear').onclick = async () => {
+            const action = await showCleanActionMenu();
+            if (action === 'rollback') {
+                const currentUpTo = cleanActionState.summarizedUpTo || 0;
+                const rollbackMessage = cleanActionState.rollbackWillResetBoundary
+                    ? '确定回退首次总结吗？首次总结生成的内容会被撤销；人工修改不会被覆盖，存在冲突时将拒绝回退。聊天记录不会删除。'
+                    : `确定回退上一次总结吗？将把已总结楼层从 ${currentUpTo} 回退到 ${cleanActionState.rollbackTargetSummarizedUpTo}。聊天记录不会删除。`;
+                if (await showConfirm('回退一次', rollbackMessage, '回退', '取消')) {
+                    postMsg('REQUEST_ROLLBACK_ONCE');
+                }
+            } else if (action === 'clear') {
+                if (await showConfirm('清空全部', '确定要清空本聊天的所有总结、关键词及人物关系数据吗？聊天记录不会删除。此操作不可撤销。', '清空', '取消')) {
+                    postMsg('REQUEST_CLEAR');
+                }
+            }
+        };
+        $('btn-generate').onclick = () => {
+            const btn = $('btn-generate');
+            if (!localGenerating) {
+                localGenerating = true;
+                btn.textContent = '停止';
+                postMsg('REQUEST_GENERATE', { config: { api: config.api, gen: config.gen, trigger: config.trigger } });
+            } else {
+                localGenerating = false;
+                btn.textContent = '总结';
+                postMsg('REQUEST_CANCEL');
+            }
+        };
+
+        // Hide summarized
+        $('hide-summarized').onchange = e => {
+            config.ui.hideSummarized = e.target.checked;
+            syncVectorBoundaryControl(config.vector?.enabled, config.ui.hideSummarized);
+            postMsg('TOGGLE_HIDE_SUMMARIZED', { enabled: e.target.checked });
+        };
+        $('use-vector-boundary').onchange = e => {
+            config.ui.useVectorBoundary = e.target.checked;
+            postMsg('TOGGLE_USE_VECTOR_BOUNDARY', { enabled: e.target.checked });
+        };
+        $('keep-visible-count').onchange = e => {
+            const parsedCount = Number.parseInt(e.target.value, 10);
+            const c = Number.isFinite(parsedCount) ? Math.max(0, Math.min(50, parsedCount)) : 6;
+            e.target.value = c;
+            postMsg('UPDATE_KEEP_VISIBLE', { count: c });
+        };
+
+        // Fullscreen relations
+        $('btn-fullscreen-relations').onclick = openRelationsFullscreen;
+        $('rel-fs-backdrop').onclick = closeRelationsFullscreen;
+        $('rel-fs-close').onclick = closeRelationsFullscreen;
+
+        // HF guide
+
+        // Character selector
+        $('char-sel-trigger').onclick = e => {
+            e.stopPropagation();
+            $('char-sel').classList.toggle('open');
+        };
+
+        document.onclick = e => {
+            const cs = $('char-sel');
+            if (cs && !cs.contains(e.target)) cs.classList.remove('open');
+        };
+
+        // Vector UI
+        initSummaryIOUI();
+        initVectorUI();
+
+        // Gen params collapsible
+        const genParamsToggle = $('gen-params-toggle');
+        const genParamsContent = $('gen-params-content');
+        if (genParamsToggle && genParamsContent) {
+            genParamsToggle.onclick = () => {
+                const collapse = genParamsToggle.closest('.settings-collapse');
+                collapse.classList.toggle('open');
+                genParamsContent.classList.toggle('hidden');
+            };
+        }
+
+        // Filter rules collapsible
+        const filterRulesToggle = $('filter-rules-toggle');
+        const filterRulesContent = $('filter-rules-content');
+        if (filterRulesToggle && filterRulesContent) {
+            filterRulesToggle.onclick = () => {
+                const collapse = filterRulesToggle.closest('.settings-collapse');
+                collapse.classList.toggle('open');
+                filterRulesContent.classList.toggle('hidden');
+            };
+        }
+
+        // Auto summary sub-options toggle
+        const triggerEnabled = $('trigger-enabled');
+        const autoSummaryOptions = $('auto-summary-options');
+        if (triggerEnabled && autoSummaryOptions) {
+            triggerEnabled.onchange = () => {
+                syncAutoSummaryControls();
+            };
+        }
+
+        // Force insert sub-options toggle
+        const triggerInsertAtEnd = $('trigger-insert-at-end');
+        const insertWrapperOptions = $('insert-wrapper-options');
+        if (triggerInsertAtEnd && insertWrapperOptions) {
+            triggerInsertAtEnd.onchange = () => {
+                insertWrapperOptions.classList.toggle('hidden', !triggerInsertAtEnd.checked);
+            };
+        }
+
+
+        // Timeline pager
+        const tlPagingToggle = $('tl-paging-toggle');
+        tlPagingToggle.setAttribute('aria-pressed', String(tlPagingEnabled));
+        tlPagingToggle.onclick = () => {
+            localStorage.setItem(TL_PAGING_KEY, tlPagingEnabled ? '0' : '1');
+            tlPagingEnabled = !tlPagingEnabled;
+            tlPagingToggle.setAttribute('aria-pressed', String(tlPagingEnabled));
+            renderTimeline(summaryData.events);
+        };
+        $('tl-pg-first').onclick = () => renderTimeline(summaryData.events, { page: 0 });
+        $('tl-pg-prev').onclick = () => renderTimeline(summaryData.events, { page: tlCurrentPage - 1 });
+        $('tl-pg-next').onclick = () => renderTimeline(summaryData.events, { page: tlCurrentPage + 1 });
+        $('tl-pg-last').onclick = () => renderTimeline(summaryData.events, { page: tlTotalPages() - 1 });
+        const tlPgStrip = $('tl-pg-strip');
+        new ResizeObserver(revealTlCurrentPage).observe(tlPgStrip);
+        tlPgStrip.addEventListener('click', (e) => {
+            const btn = e.target.closest('.tl-pg-btn');
+            if (btn) renderTimeline(summaryData.events, { page: parseInt(btn.dataset.page, 10) });
+        });
+        tlPgStrip.addEventListener('wheel', (e) => {
+            if (tlPgStrip.scrollWidth <= tlPgStrip.clientWidth) return;
+            if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+            e.preventDefault();
+            tlPgStrip.scrollLeft += e.deltaY;
+        }, { passive: false });
+        const tlPgNum = $('tl-pg-num');
+        const tlPgJump = () => {
+            const v = parseInt(tlPgNum.value, 10);
+            if (Number.isNaN(v)) {
+                tlPgNum.value = tlCurrentPage + 1;
+                return;
+            }
+            renderTimeline(summaryData.events, { page: v - 1 });
+        };
+        tlPgNum.addEventListener('change', tlPgJump);
+        tlPgNum.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                tlPgJump();
+            }
+        });
+
+        // Resize
+        window.onresize = () => {
+            relationChart?.resize();
+            relationChartFullscreen?.resize();
+        };
+
+        // Parent messages
+        window.onmessage = handleParentMessage;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Init
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function init() {
+        $('memory-agent-tab').textContent = MEMORY_COPY.tab;
+        $('settings-save').textContent = MEMORY_COPY.settingsSave;
+        $('settings-cancel').textContent = MEMORY_COPY.settingsClose;
+        memoryMaintenancePage = createMemoryMaintenancePage($('tab-agent'), postMsg);
+        loadConfig();
+        tlPagingEnabled = localStorage.getItem(TL_PAGING_KEY) === '1';
+
+        // Initial state
+        $('stat-events').textContent = '—';
+        $('stat-summarized').textContent = '—';
+        $('stat-pending').textContent = '—';
+        $('summarized-count').textContent = '0';
+
+        renderKeywords([]);
+        renderTimeline([]);
+        renderArcs([]);
+        renderFacts([]);
+        renderCharacterAliases([]);
+
+        bindEvents();
+        syncCurrentChatSummaryControls(currentChatSummaryEnabled);
+
+        // === THEME SWITCHER ===
+        (function () {
+            const STORAGE_KEY = 'xb-theme-alt';
+            const CSS_MAP = { default: 'story-summary.css', dark: 'story-summary.css', neo: 'story-summary-a.css', 'neo-dark': 'story-summary-a.css' };
+            const link = document.querySelector('link[rel="stylesheet"]');
+            const sel = document.getElementById('theme-select');
+            if (!link || !sel) return;
+
+            function applyTheme(theme) {
+                if (!CSS_MAP[theme]) return;
+                link.setAttribute('href', CSS_MAP[theme]);
+                document.documentElement.setAttribute('data-theme', (theme === 'dark' || theme === 'neo-dark') ? 'dark' : '');
+                hideRelationTooltip();
+                if (relationChart) renderRelations(summaryData.characters);
+            }
+
+            // 启动时恢复主题
+            const saved = localStorage.getItem(STORAGE_KEY) || 'default';
+            applyTheme(saved);
+            sel.value = saved;
+
+            // 下拉框切换
+            sel.addEventListener('change', function () {
+                const theme = sel.value;
+                applyTheme(theme);
+                localStorage.setItem(STORAGE_KEY, theme);
+                console.log(`[Theme] Switched → ${theme} (${CSS_MAP[theme]})`);
+            });
+        })();
+        // === END THEME SWITCHER ===
+
+        // Notify parent
+        postMsg('FRAME_READY');
+        document.body.classList.remove('xb-frame-loading');
+    }
+
+    // Start
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+
+
+    function renderFacts(facts) {
+        summaryData.facts = facts || [];
+
+        const container = $('facts-list');
+        if (!container) return;
+
+        const isRelation = f => /^对.+的/.test(f.p);
+        const stateFacts = (facts || []).filter(f => !f.retracted && !isRelation(f));
+
+        if (!stateFacts.length) {
+            setHtml(container, '<div class="empty">暂无状态记录</div>');
+            return;
+        }
+
+        const grouped = new Map();
+        for (const f of stateFacts) {
+            if (!grouped.has(f.s)) grouped.set(f.s, []);
+            grouped.get(f.s).push(f);
+        }
+
+        let html = '';
+        for (const [subject, items] of grouped) {
+            html += `<div class="fact-group">
+            <div class="fact-group-title">${h(subject)}</div>
+            ${items.map(f => `
+                <div class="fact-item">
+                    <span class="fact-predicate">${h(f.p)}</span>
+                    <span class="fact-object">${h(f.o)}</span>
+                    <span class="fact-since">#${(f.since || 0) + 1}</span>
+                </div>
+            `).join('')}
+        </div>`;
+        }
+
+        setHtml(container, html);
+    }
+
+})();

@@ -1,0 +1,2091 @@
+// floating-panel.js
+/**
+ * NovelDraw 画图按钮面板 - 支持楼层按钮和悬浮按钮双模式
+ */
+
+import { getContext } from '../../../../../../../extensions.js';
+import {
+    openNovelDrawSettings,
+    generateAndInsertImages,
+    getSettings,
+    updateSettingsPersistent,
+    findLastAIMessageId,
+    getGenerationState,
+    abortGeneration,
+} from './novel-draw.js';
+import { registerToToolbar, removeFromToolbar } from '../../../../widgets/message-toolbar.js';
+import { formatScenePlannerProgress } from '../../shared/draw-common.js';
+import { DRAW_CAPSULE_COPY } from '../../shared/draw-capsule-copy.js';
+import {
+    resolveCurrentDrawRunActivityTarget,
+    subscribeDrawRunActivity,
+} from '../../shared/draw-run-activity.js';
+import {
+    cancelPendingChildDrawRuns,
+    captureDrawCancellationTarget,
+    isDrawCancellationTargetCurrent,
+    getPendingDrawWorkState,
+} from '../../shared/draw-run-controls.js';
+import { isDrawRunPendingError } from '../../shared/draw-run-production.js';
+import {
+    formatDrawRunProgress,
+    getDrawRunProgressIcon,
+    hasDrawRunProgressDetail,
+    resolveDrawRunActivityDetail,
+    resolveDrawRunUiState,
+} from '../../shared/draw-run-ui-state.js';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 常量
+// ═══════════════════════════════════════════════════════════════════════════
+
+import { FloorImageBusyError } from '../../shared/floor-image-job.js';
+import { DRAW_SLOT_COPY } from '../../shared/image-record.js';
+
+const FLOAT_POS_KEY = 'xb_novel_float_pos';
+const AUTO_RESET_DELAY = 8000;
+const DRAW_RUN_PROVIDER = 'novelai';
+
+const FloatState = {
+    IDLE: 'idle',
+    SUBMITTING: 'submitting',
+    ACCEPTED: 'accepted',
+    UNCERTAIN: 'uncertain',
+    QUEUED: 'queued',
+    LLM: 'llm',
+    GEN: 'gen',
+    COOLDOWN: 'cooldown',
+    RECONNECTING: 'reconnecting',
+    CANCELLING: 'cancelling',
+    BACKEND_LEGACY: 'backend_legacy',
+    SUCCESS: 'success',
+    PARTIAL: 'partial',
+    ERROR: 'error',
+};
+
+const SIZE_OPTIONS = [
+    { value: 'default', label: '跟随预设', width: null, height: null },
+    { value: 'auto', label: 'AI 自动（按构图）', width: null, height: null },
+    { value: '832x1216', label: '832 × 1216  竖图', width: 832, height: 1216 },
+    { value: '1216x832', label: '1216 × 832  横图', width: 1216, height: 832 },
+    { value: '1024x1024', label: '1024 × 1024  方图', width: 1024, height: 1024 },
+    { value: '768x1280', label: '768 x 1280  大竖', width: 768, height: 1280 },
+    { value: '1280x768', label: '1280 x 768  大横', width: 1280, height: 768 },
+];
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 状态
+// ═══════════════════════════════════════════════════════════════════════════
+
+// 楼层按钮状态
+const panelMap = new Map();
+const pendingCallbacks = new Map();
+let floorObserver = null;
+
+// 悬浮按钮状态
+let floatingEl = null;
+let floatingDragState = null;
+let floatingState = FloatState.IDLE;
+let floatingMessageId = null;
+let floatingResult = { success: 0, total: 0, error: null, startTime: 0 };
+let floatingAutoResetTimer = null;
+let floatingCooldownRafId = null;
+let floatingCooldownEndTime = 0;
+let $floatingCache = {};
+
+// 通用状态
+let stylesInjected = false;
+let drawRunActivityDispose = null;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 样式 - 统一样式（楼层+悬浮共用）
+// ═══════════════════════════════════════════════════════════════════════════
+
+const STYLES = `
+:root {
+    --nd-h: 34px;
+    --nd-bg: rgba(0, 0, 0, 0.55);
+    --nd-bg-solid: rgba(24, 24, 28, 0.98);
+    --nd-bg-hover: rgba(0, 0, 0, 0.7);
+    --nd-bg-active: rgba(255, 255, 255, 0.1);
+    --nd-border: rgba(255, 255, 255, 0.08);
+    --nd-border-hover: rgba(255, 255, 255, 0.2);
+    --nd-border-subtle: rgba(255, 255, 255, 0.08);
+    --nd-text-primary: rgba(255, 255, 255, 0.85);
+    --nd-text-secondary: rgba(255, 255, 255, 0.65);
+    --nd-text-muted: rgba(255, 255, 255, 0.45);
+    --nd-text-dim: rgba(255, 255, 255, 0.25);
+    --nd-success: #3ecf8e;
+    --nd-warning: #f0b429;
+    --nd-error: #f87171;
+    --nd-info: #60a5fa;
+    --nd-shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
+    --nd-radius-sm: 6px;
+    --nd-radius-md: 10px;
+    --nd-radius-lg: 14px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   楼层按钮样式
+   ═══════════════════════════════════════════════════════════════════════════ */
+.nd-float {
+    position: relative;
+    user-select: none;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+.nd-capsule {
+    width: 74px;
+    height: var(--nd-h);
+    background: var(--nd-bg);
+    border: 1px solid var(--nd-border);
+    border-radius: 17px;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    position: relative;
+    overflow: hidden;
+    transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.nd-float:hover .nd-capsule {
+    background: var(--nd-bg-hover);
+    border-color: var(--nd-border-hover);
+}
+
+.nd-float.working .nd-capsule { border-color: rgba(240, 180, 41, 0.5); }
+.nd-float.cooldown .nd-capsule { border-color: rgba(96, 165, 250, 0.6); background: rgba(96, 165, 250, 0.1); }
+.nd-float.success .nd-capsule { border-color: rgba(62, 207, 142, 0.6); background: rgba(62, 207, 142, 0.1); }
+.nd-float.partial .nd-capsule { border-color: rgba(240, 180, 41, 0.6); background: rgba(240, 180, 41, 0.1); }
+.nd-float.error .nd-capsule { border-color: rgba(248, 113, 113, 0.6); background: rgba(248, 113, 113, 0.1); }
+
+.nd-inner {
+    display: grid;
+    width: 100%;
+    height: 100%;
+    grid-template-areas: "s";
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
+    pointer-events: none;
+}
+
+.nd-layer {
+    grid-area: s;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    width: 100%;
+    height: 100%;
+    transition: opacity 0.2s, transform 0.2s;
+    pointer-events: auto;
+}
+
+.nd-layer-idle { opacity: 1; transform: translateY(0); }
+
+.nd-float.working .nd-layer-idle,
+.nd-float.cooldown .nd-layer-idle,
+.nd-float.success .nd-layer-idle,
+.nd-float.partial .nd-layer-idle,
+.nd-float.error .nd-layer-idle {
+    opacity: 0;
+    transform: translateY(-100%);
+    pointer-events: none;
+}
+
+.nd-btn-draw {
+    flex: 1;
+    height: 100%;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    color: var(--nd-text-primary);
+    transition: background 0.15s;
+    font-size: 16px;
+}
+.nd-btn-draw:hover { background: rgba(255, 255, 255, 0.12); }
+.nd-btn-draw:active { transform: scale(0.92); }
+
+.nd-auto-dot {
+    position: absolute;
+    top: 7px;
+    right: 6px;
+    width: 6px;
+    height: 6px;
+    background: var(--nd-success);
+    border-radius: 50%;
+    box-shadow: 0 0 6px rgba(62, 207, 142, 0.6);
+    opacity: 0;
+    transform: scale(0);
+    transition: all 0.2s;
+}
+.nd-float.auto-on .nd-auto-dot { opacity: 1; transform: scale(1); }
+
+.nd-sep { width: 1px; height: 12px; background: var(--nd-border); }
+
+.nd-btn-menu {
+    width: 24px;
+    height: 100%;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--nd-text-dim);
+    font-size: 8px;
+    opacity: 0.6;
+    transition: opacity 0.25s, transform 0.25s;
+}
+.nd-float:hover .nd-btn-menu { opacity: 1; }
+.nd-btn-menu:hover { background: rgba(255, 255, 255, 0.12); color: var(--nd-text-muted); }
+
+.nd-arrow { transition: transform 0.2s; }
+.nd-float.expanded .nd-arrow { transform: rotate(180deg); }
+
+.nd-layer-active {
+    box-sizing: border-box;
+    padding: 0 6px;
+    opacity: 0;
+    transform: translateY(100%);
+    justify-content: center;
+    gap: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    color: #fff;
+    cursor: pointer;
+    pointer-events: none;
+}
+
+.nd-float.working .nd-layer-active,
+.nd-float.cooldown .nd-layer-active,
+.nd-float.success .nd-layer-active,
+.nd-float.partial .nd-layer-active,
+.nd-float.error .nd-layer-active {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+}
+
+.nd-float.cooldown .nd-layer-active { color: var(--nd-info); }
+.nd-float.success .nd-layer-active { color: var(--nd-success); }
+.nd-float.partial .nd-layer-active { color: var(--nd-warning); }
+.nd-float.error .nd-layer-active { color: var(--nd-error); }
+
+.nd-spin { display: inline-block; animation: nd-spin 1.5s linear infinite; }
+.nd-status-icon { flex-shrink: 0; }
+.nd-status-text { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@keyframes nd-spin { to { transform: rotate(360deg); } }
+
+.nd-countdown { font-variant-numeric: tabular-nums; min-width: 36px; text-align: center; }
+
+/* 详情弹窗 - 向下展开（楼层按钮用） */
+.nd-detail {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    background: rgba(18, 18, 22, 0.98);
+    border: 1px solid var(--nd-border);
+    border-radius: 12px;
+    padding: 12px 16px;
+    font-size: 12px;
+    color: var(--nd-text-secondary);
+    white-space: nowrap;
+    box-shadow: var(--nd-shadow-lg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    opacity: 0;
+    visibility: hidden;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    z-index: 100;
+    transform: translateY(-6px) scale(0.96);
+    transform-origin: top right;
+}
+
+.nd-float.show-detail .nd-detail {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0) scale(1);
+}
+
+.nd-detail-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+.nd-detail-row + .nd-detail-row { margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--nd-border-subtle); }
+.nd-detail-icon { opacity: 0.6; font-size: 13px; }
+.nd-detail-label { color: var(--nd-text-muted); }
+.nd-detail-value { margin-left: auto; font-weight: 600; color: var(--nd-text-primary); }
+.nd-detail-value.success { color: var(--nd-success); }
+.nd-detail-value.warning { color: var(--nd-warning); }
+.nd-detail-value.error { color: var(--nd-error); }
+
+/* 菜单 - 向下展开（楼层按钮用），视觉化画师串预设网格 */
+.nd-menu {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    width: 260px;
+    height: 380px;
+    min-width: 200px;
+    max-width: 92vw;
+    min-height: 200px;
+    max-height: 70vh;
+    background: rgba(18, 18, 22, 0.96);
+    border: 1px solid var(--nd-border);
+    border-radius: 12px;
+    padding: 10px;
+    box-shadow: var(--nd-shadow-lg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(-6px) scale(0.96);
+    transform-origin: top right;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    z-index: 100;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.nd-float.expanded .nd-menu {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0) scale(1);
+}
+
+.nd-card {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    overflow: visible;
+}
+
+.nd-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 2px;
+    min-height: 36px;
+}
+
+.nd-label {
+    font-size: 11px;
+    color: var(--nd-text-muted);
+    width: 32px;
+    flex-shrink: 0;
+    padding: 0;
+}
+
+.nd-select {
+    flex: 1;
+    min-width: 0;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--nd-border-subtle);
+    color: var(--nd-text-primary);
+    font-size: 11px;
+    min-height: 32px;
+    border-radius: 6px;
+    padding: 6px 8px;
+    margin: 0;
+    box-sizing: border-box;
+    outline: none;
+    cursor: pointer;
+    text-align: center;
+    text-align-last: center;
+    transition: border-color 0.2s;
+    vertical-align: middle;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+}
+.nd-select:hover { border-color: rgba(255, 255, 255, 0.2); }
+.nd-select:focus { border-color: rgba(255, 255, 255, 0.3); }
+.nd-select option { background: #1a1a1e; color: #eee; text-align: left; }
+.nd-select.size { font-family: "SF Mono", "Menlo", "Consolas", monospace; font-size: 11px; }
+
+.nd-inner-sep { display: none; }
+
+.nd-controls { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+
+.nd-auto {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--nd-border-subtle);
+    border-radius: var(--nd-radius-sm);
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.nd-auto:hover { background: rgba(255, 255, 255, 0.08); }
+.nd-auto.on { background: rgba(62, 207, 142, 0.08); border-color: rgba(62, 207, 142, 0.3); }
+
+.nd-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.2);
+    transition: all 0.2s;
+}
+.nd-auto.on .nd-dot { background: var(--nd-success); box-shadow: 0 0 8px rgba(62, 207, 142, 0.5); }
+
+.nd-auto-text { font-size: 12px; color: var(--nd-text-muted); }
+.nd-auto:hover .nd-auto-text { color: var(--nd-text-secondary); }
+.nd-auto.on .nd-auto-text { color: rgba(62, 207, 142, 0.95); }
+
+.nd-gear {
+    width: 36px;
+    height: 36px;
+    border: 1px solid var(--nd-border-subtle);
+    border-radius: var(--nd-radius-sm);
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--nd-text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    transition: all 0.15s;
+}
+.nd-gear:hover { background: rgba(255, 255, 255, 0.08); color: var(--nd-text-secondary); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   画师串预设网格
+   ═══════════════════════════════════════════════════════════════════════════ */
+/* 结构与已验证可用的 nai-preset-switcher 对齐：
+   普通 block 卡片（不用 button/flex），缩略图直接是 <img> 本身 */
+.nd-preset-grid {
+    flex: 1;
+    min-height: 0;
+    margin-top: 10px;
+    display: grid;
+    /* 固定 4 列：菜单宽 260px，内容约 240px，每列约 54px（原卡片一半） */
+    grid-template-columns: repeat(4, 1fr);
+    grid-auto-rows: max-content;
+    align-items: start;
+    gap: 6px;
+    align-content: start;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+}
+
+.nd-preset-card {
+    position: relative;
+    border: 1px solid var(--nd-border-subtle);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    overflow: hidden;
+    cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
+    transition: border-color 0.15s, background 0.15s, transform 0.1s;
+}
+.nd-preset-card:hover { border-color: rgba(255, 255, 255, 0.28); background: rgba(255, 255, 255, 0.07); }
+.nd-preset-card:active { transform: scale(0.96); }
+.nd-preset-card.active {
+    border: 1px solid var(--nd-success);
+    box-shadow: 0 0 8px rgba(62, 207, 142, 0.35);
+    background: rgba(62, 207, 142, 0.08);
+}
+
+/* 缩略图固定像素高度：绝不依赖 aspect-ratio 或百分比 padding，
+   否则该 WebView 会把高度算成 0，导致卡片被压成细线、全部挤在一起不滚动 */
+.nd-preset-thumb {
+    width: 100%;
+    height: 75px;
+    object-fit: cover;
+    background: rgba(255, 255, 255, 0.05);
+    display: block;
+    pointer-events: none;
+}
+.nd-preset-thumb.empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: rgba(255, 255, 255, 0.35);
+    font-size: 10px;
+    line-height: 1.2;
+    text-align: center;
+    padding: 2px;
+    box-sizing: border-box;
+}
+
+.nd-preset-check {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    z-index: 2;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--nd-success);
+    color: #0b1712;
+    font-size: 9px;
+    font-weight: 700;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+}
+.nd-preset-card.active .nd-preset-check { display: flex; }
+
+.nd-preset-name {
+    font-size: 10px;
+    line-height: 1.25;
+    color: var(--nd-text-secondary);
+    padding: 3px 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+}
+.nd-preset-card.active .nd-preset-name { color: var(--nd-text-primary); }
+
+.nd-preset-empty {
+    grid-column: 1 / -1;
+    text-align: center;
+    color: var(--nd-text-muted);
+    font-size: 11px;
+    padding: 24px 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   悬浮按钮样式（固定定位，可拖拽）
+   ═══════════════════════════════════════════════════════════════════════════ */
+.nd-floating-global {
+    position: fixed;
+    z-index: 10000;
+    user-select: none;
+    will-change: transform;
+    transition: transform 0.25s ease;
+}
+
+/* 貼邊半藏：膠囊一半移出螢幕；吸附時隱藏跳圖鈕 */
+.nd-floating-global.nd-docked-left { transform: translateX(-50%); }
+.nd-floating-global.nd-docked-right { transform: translateX(50%); }
+.nd-floating-global[class*="nd-docked"] .nd-img-jump { display: none; }
+
+.nd-floating-global .nd-capsule {
+    background: var(--nd-bg-solid);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+    touch-action: none;
+    cursor: grab;
+}
+
+/* 跳圖上下鈕：絕對定位在膠囊外，不影響膠囊尺寸與拖曳 */
+.nd-floating-global .nd-img-jump {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 34px;
+    height: 22px;
+    border: none;
+    border-radius: 11px;
+    background: transparent;
+    color: #000;
+    font-size: 12px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: none;
+    z-index: 1;
+    padding: 0;
+}
+.nd-floating-global .nd-img-jump-prev { bottom: calc(100% + 4px); }
+.nd-floating-global .nd-img-jump-next { top: calc(100% + 4px); }
+.nd-floating-global .nd-img-jump:hover { color: #000; opacity: 0.65; }
+
+.nd-floating-global .nd-capsule:active { cursor: grabbing; }
+
+/* 悬浮按钮的详情和菜单向上展开 */
+.nd-floating-global .nd-detail {
+    top: auto;
+    bottom: calc(100% + 10px);
+    transform: translateY(4px) scale(0.96);
+    transform-origin: bottom right;
+}
+
+.nd-floating-global.show-detail .nd-detail {
+    transform: translateY(0) scale(1);
+}
+
+.nd-floating-global .nd-detail::after {
+    content: '';
+    position: absolute;
+    top: auto;
+    bottom: -6px;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 6px solid transparent;
+    border-top-color: rgba(18, 18, 22, 0.98);
+    border-bottom-color: transparent;
+}
+
+.nd-floating-global .nd-menu {
+    top: auto;
+    bottom: calc(100% + 10px);
+    transform: translateY(6px) scale(0.98);
+    transform-origin: bottom right;
+}
+
+.nd-floating-global.expanded .nd-menu {
+    transform: translateY(0) scale(1);
+}
+
+/* 悬浮按钮箭头向上 */
+.nd-floating-global .nd-arrow { transform: rotate(180deg); }
+.nd-floating-global.expanded .nd-arrow { transform: rotate(0deg); }
+`;
+
+function injectStyles() {
+    if (stylesInjected) return;
+    stylesInjected = true;
+
+    const el = document.createElement('style');
+    el.id = 'nd-float-styles';
+    el.textContent = STYLES;
+    document.head.appendChild(el);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 通用工具函数
+// ═══════════════════════════════════════════════════════════════════════════
+
+function createEl(tag, className, text) {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text !== undefined) el.textContent = text;
+    return el;
+}
+
+function fillPresetSelect(selectEl) {
+    if (!selectEl) return;
+    const settings = getSettings();
+    const presets = settings.paramsPresets || [];
+    const currentId = settings.selectedParamsPresetId;
+    selectEl.replaceChildren();
+    presets.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name || '未命名';
+        if (p.id === currentId) opt.selected = true;
+        selectEl.appendChild(opt);
+    });
+}
+
+function fillSizeSelect(selectEl) {
+    if (!selectEl) return;
+    const settings = getSettings();
+    const current = settings.overrideSize || 'default';
+    selectEl.replaceChildren();
+    SIZE_OPTIONS.forEach(opt => {
+        const option = document.createElement('option');
+        option.value = opt.value;
+        option.textContent = opt.label;
+        if (opt.value === current) option.selected = true;
+        selectEl.appendChild(option);
+    });
+}
+
+/**
+ * 渲染视觉化画师串预设网格：每张卡片 = 缩略图 + 预设 name，
+ * 当前选中预设高亮；点击事件由调用方在网格容器上委托处理。
+ */
+function renderPresetGrid(gridEl) {
+    if (!gridEl) return;
+    const settings = getSettings();
+    const presets = settings.paramsPresets || [];
+    const currentId = settings.selectedParamsPresetId;
+    gridEl.replaceChildren();
+
+    if (!presets.length) {
+        gridEl.appendChild(createEl('div', 'nd-preset-empty', '暂无画师串预设'));
+        return;
+    }
+
+    presets.forEach((p) => {
+        // 卡片必须是普通 div（不能是 button + flex）：旧 WebKit 对 button 内
+        // flex 内容的高度计算在 grid auto 行中会循环归零导致整卡塌陷
+        const card = createEl('div', `nd-preset-card${p.id === currentId ? ' active' : ''}`);
+        card.dataset.presetId = p.id;
+        card.title = p.name || '未命名';
+        // 内联 align-self 防止 grid 把卡片在纵向拉伸/压缩
+        card.style.alignSelf = 'start';
+
+        // 空缩略图占位：内联固定高度（不依赖 stylesheet，杜绝被外部样式压成 0），纯文字
+        const makeEmpty = () => {
+            const empty = createEl('div', 'nd-preset-thumb empty', '无预览');
+            empty.style.cssText = 'width:100%;height:75px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,0.05);color:rgba(255,255,255,0.35);font-size:10px;line-height:1.2;text-align:center;padding:2px;box-sizing:border-box;';
+            return empty;
+        };
+
+        if (p.thumbnail) {
+            const img = document.createElement('img');
+            img.className = 'nd-preset-thumb';
+            img.alt = '';
+            img.loading = 'lazy';
+            img.decoding = 'async';
+            // 内联固定尺寸：最高优先级，避免任何外部/残留 CSS 把高度算成 0
+            img.style.cssText = 'width:100%;height:75px;object-fit:cover;display:block;background:rgba(255,255,255,0.05);box-sizing:border-box;';
+            img.src = p.thumbnail;
+            img.addEventListener('error', () => img.replaceWith(makeEmpty()), { once: true });
+            card.appendChild(img);
+        } else {
+            card.appendChild(makeEmpty());
+        }
+
+        card.appendChild(createEl('span', 'nd-preset-check', '✓'));
+        card.appendChild(createEl('div', 'nd-preset-name', p.name || '未命名'));
+        gridEl.appendChild(card);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ▼▼▼ 楼层按钮逻辑 ▼▼▼
+// ═══════════════════════════════════════════════════════════════════════════
+
+function createFloorPanelData(messageId) {
+    return {
+        messageId,
+        root: null,
+        state: FloatState.IDLE,
+        result: { success: 0, total: 0, error: null, startTime: 0 },
+        autoResetTimer: null,
+        cooldownRafId: null,
+        cooldownEndTime: 0,
+        $cache: {},
+        _cleanup: null,
+    };
+}
+
+function createFloorPanelElement(messageId) {
+    const settings = getSettings();
+    const isAuto = settings.mode === 'auto';
+
+    const root = document.createElement('div');
+    root.className = `nd-float${isAuto ? ' auto-on' : ''}`;
+    root.dataset.messageId = messageId;
+
+    const capsule = createEl('div', 'nd-capsule');
+    const inner = createEl('div', 'nd-inner');
+    const layerIdle = createEl('div', 'nd-layer nd-layer-idle');
+    const drawBtn = createEl('button', 'nd-btn-draw');
+    drawBtn.title = '点击生成配图';
+    drawBtn.appendChild(createEl('span', '', '🎨'));
+    drawBtn.appendChild(createEl('span', 'nd-auto-dot'));
+    const sep = createEl('div', 'nd-sep');
+    const menuBtn = createEl('button', 'nd-btn-menu');
+    menuBtn.title = '展开菜单';
+    menuBtn.appendChild(createEl('span', 'nd-arrow', '▼'));
+    layerIdle.append(drawBtn, sep, menuBtn);
+
+    const layerActive = createEl('div', 'nd-layer nd-layer-active');
+    layerActive.append(
+        createEl('span', 'nd-status-icon', '⏳'),
+        createEl('span', 'nd-status-text', DRAW_CAPSULE_COPY.analysis)
+    );
+
+    inner.append(layerIdle, layerActive);
+    capsule.appendChild(inner);
+
+    const detail = createEl('div', 'nd-detail');
+    const detailRowResult = createEl('div', 'nd-detail-row');
+    detailRowResult.append(
+        createEl('span', 'nd-detail-icon', '📊'),
+        createEl('span', 'nd-detail-label', '结果'),
+        createEl('span', 'nd-detail-value nd-result', '-')
+    );
+    const detailRowError = createEl('div', 'nd-detail-row nd-error-row');
+    detailRowError.style.display = 'none';
+    detailRowError.append(
+        createEl('span', 'nd-detail-icon', '💡'),
+        createEl('span', 'nd-detail-label', '原因'),
+        createEl('span', 'nd-detail-value error nd-error', '-')
+    );
+    const detailRowTime = createEl('div', 'nd-detail-row');
+    detailRowTime.append(
+        createEl('span', 'nd-detail-icon', '⏱'),
+        createEl('span', 'nd-detail-label', '耗时'),
+        createEl('span', 'nd-detail-value nd-time', '-')
+    );
+    detail.append(detailRowResult, detailRowError, detailRowTime);
+
+    const menu = createEl('div', 'nd-menu');
+    const sizeSelect = createEl('select', 'nd-select size nd-size-select');
+    fillSizeSelect(sizeSelect);
+
+    const controls = createEl('div', 'nd-controls');
+    const autoToggle = createEl('div', `nd-auto${isAuto ? ' on' : ''} nd-auto-toggle`);
+    autoToggle.append(
+        createEl('span', 'nd-dot'),
+        createEl('span', 'nd-auto-text', '自动配图')
+    );
+    const settingsBtn = createEl('button', 'nd-gear nd-settings-btn', '⚙');
+    settingsBtn.title = '打开设置';
+    controls.append(autoToggle, sizeSelect, settingsBtn);
+    menu.append(controls);
+
+    const presetGrid = createEl('div', 'nd-preset-grid');
+    renderPresetGrid(presetGrid);
+    menu.append(presetGrid);
+
+    root.append(capsule, detail, menu);
+    return root;
+}
+
+function cacheFloorDOM(panelData) {
+    const el = panelData.root;
+    if (!el) return;
+
+    panelData.$cache = {
+        statusIcon: el.querySelector('.nd-status-icon'),
+        statusText: el.querySelector('.nd-status-text'),
+        result: el.querySelector('.nd-result'),
+        errorRow: el.querySelector('.nd-error-row'),
+        error: el.querySelector('.nd-error'),
+        time: el.querySelector('.nd-time'),
+        presetSelect: el.querySelector('.nd-preset-select'),
+        sizeSelect: el.querySelector('.nd-size-select'),
+        presetGrid: el.querySelector('.nd-preset-grid'),
+        autoToggle: el.querySelector('.nd-auto-toggle'),
+    };
+}
+
+function setFloorState(messageId, state, data = {}) {
+    const panelData = panelMap.get(messageId);
+    if (!panelData?.root) return;
+
+    const el = panelData.root;
+    panelData.state = state;
+
+    if (panelData.autoResetTimer) {
+        clearTimeout(panelData.autoResetTimer);
+        panelData.autoResetTimer = null;
+    }
+    if (state !== FloatState.COOLDOWN && panelData.cooldownRafId) {
+        cancelAnimationFrame(panelData.cooldownRafId);
+        panelData.cooldownRafId = null;
+        panelData.cooldownEndTime = 0;
+    }
+
+    el.classList.remove('working', 'cooldown', 'success', 'partial', 'error', 'show-detail');
+
+    const { statusIcon, statusText } = panelData.$cache;
+    if (statusText) statusText.className = 'nd-status-text';
+
+    switch (state) {
+        case FloatState.IDLE:
+            panelData.result = { success: 0, total: 0, error: null, startTime: 0 };
+            break;
+        case FloatState.SUBMITTING:
+            el.classList.add('working');
+            if (!panelData.result.startTime) panelData.result.startTime = Date.now();
+            if (statusIcon) { statusIcon.textContent = '↥'; statusIcon.className = 'nd-status-icon nd-spin'; }
+            if (statusText) statusText.textContent = DRAW_CAPSULE_COPY.submitting;
+            break;
+        case FloatState.ACCEPTED:
+            el.classList.add('working');
+            if (!panelData.result.startTime) panelData.result.startTime = Date.now();
+            if (statusIcon) { statusIcon.textContent = getDrawRunProgressIcon(data); statusIcon.className = 'nd-status-icon nd-spin'; }
+            if (statusText) statusText.textContent = formatDrawRunProgress(data);
+            break;
+        case FloatState.UNCERTAIN:
+            el.classList.add('working');
+            if (!panelData.result.startTime) panelData.result.startTime = Date.now();
+            if (statusIcon) { statusIcon.textContent = '↻'; statusIcon.className = 'nd-status-icon nd-spin'; }
+            if (statusText) statusText.textContent = DRAW_CAPSULE_COPY.uncertain;
+            break;
+        case FloatState.QUEUED:
+            el.classList.add('working');
+            if (!panelData.result.startTime) panelData.result.startTime = Date.now();
+            if (statusIcon) { statusIcon.textContent = '⌛'; statusIcon.className = 'nd-status-icon'; }
+            if (statusText) statusText.textContent = DRAW_CAPSULE_COPY.queued;
+            panelData.result.total = data.total || panelData.result.total || 0;
+            break;
+        case FloatState.LLM:
+            el.classList.add('working');
+            if (!panelData.result.startTime) panelData.result.startTime = Date.now();
+            if (statusIcon) { statusIcon.textContent = '⏳'; statusIcon.className = 'nd-status-icon nd-spin'; }
+            if (statusText) statusText.textContent = formatScenePlannerProgress(data);
+            break;
+        case FloatState.GEN:
+            el.classList.add('working');
+            if (statusIcon) { statusIcon.textContent = '🎨'; statusIcon.className = 'nd-status-icon nd-spin'; }
+            if (statusText) statusText.textContent = `${data.current || 0}/${data.total || 0}`;
+            panelData.result.total = data.total || 0;
+            break;
+        case FloatState.COOLDOWN:
+            el.classList.add('cooldown');
+            if (statusIcon) { statusIcon.textContent = '⏳'; statusIcon.className = 'nd-status-icon nd-spin'; }
+            startFloorCooldownTimer(panelData, data);
+            break;
+        case FloatState.RECONNECTING:
+            el.classList.add('working');
+            if (statusIcon) { statusIcon.textContent = '↻'; statusIcon.className = 'nd-status-icon nd-spin'; }
+            if (statusText) statusText.textContent = DRAW_CAPSULE_COPY.reconnecting;
+            break;
+        case FloatState.CANCELLING:
+            el.classList.add('working');
+            if (statusIcon) { statusIcon.textContent = '⏳'; statusIcon.className = 'nd-status-icon nd-spin'; }
+            if (statusText) statusText.textContent = DRAW_CAPSULE_COPY.cancelling;
+            break;
+        case FloatState.BACKEND_LEGACY:
+            el.classList.add('working');
+            if (statusIcon) { statusIcon.textContent = '↪'; statusIcon.className = 'nd-status-icon'; }
+            if (statusText) statusText.textContent = DRAW_CAPSULE_COPY.legacy;
+            break;
+        case FloatState.SUCCESS:
+            el.classList.add('success');
+            if (statusIcon) { statusIcon.textContent = '✓'; statusIcon.className = 'nd-status-icon'; }
+            if (statusText) statusText.textContent = `${data.success}/${data.total}`;
+            panelData.result.success = data.success;
+            panelData.result.total = data.total;
+            panelData.autoResetTimer = setTimeout(() => setFloorState(messageId, FloatState.IDLE), AUTO_RESET_DELAY);
+            break;
+        case FloatState.PARTIAL:
+            el.classList.add('partial');
+            if (statusIcon) { statusIcon.textContent = '⚠'; statusIcon.className = 'nd-status-icon'; }
+            if (statusText) statusText.textContent = `${data.success}/${data.total}`;
+            panelData.result.success = data.success;
+            panelData.result.total = data.total;
+            panelData.autoResetTimer = setTimeout(() => setFloorState(messageId, FloatState.IDLE), AUTO_RESET_DELAY);
+            break;
+        case FloatState.ERROR:
+            el.classList.add('error');
+            if (statusIcon) { statusIcon.textContent = '✗'; statusIcon.className = 'nd-status-icon'; }
+            if (statusText) statusText.textContent = data.unknown ? DRAW_CAPSULE_COPY.unknown : DRAW_CAPSULE_COPY.error;
+            panelData.result.error = data.error;
+            panelData.autoResetTimer = setTimeout(() => setFloorState(messageId, FloatState.IDLE), AUTO_RESET_DELAY);
+            break;
+    }
+}
+
+async function syncDrawRunPanelState(messageId, detail = {}) {
+    const local = getGenerationState(messageId);
+    if (local) { setStateForMessage(messageId, local.state, local.data); return; }
+    const target = captureDrawCancellationTarget(messageId);
+    // 当前 swipe 最多只有一个 Draw Run；即使用户切换了图片 Provider，
+    // 活动任务仍应在新面板可见并可取消。
+    const markerState = await getPendingDrawWorkState(messageId).catch(() => null);
+    if (!markerState) return;
+    if (!isDrawCancellationTargetCurrent(target)) return;
+    messageId = getContext().chat.indexOf(target.message);
+    const current = getGenerationState(messageId);
+    if (current) { setStateForMessage(messageId, current.state, current.data); return; }
+    const ctx = getContext();
+    const chatId = String(ctx?.chatId || '');
+    const message = ctx?.chat?.[Number(messageId)];
+    if (!chatId || !message) return;
+    const activeSwipeIndex = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
+    const swipeIndex = Number.isSafeInteger(markerState.swipeIndex)
+        ? markerState.swipeIndex
+        : activeSwipeIndex;
+    const provider = markerState.provider || detail?.provider || DRAW_RUN_PROVIDER;
+    const runId = markerState.runId || detail?.runId || '';
+    const activityTarget = { chatId, messageId, swipeIndex, provider, runId };
+    const matchedDetail = resolveDrawRunActivityDetail({
+        detail,
+        pending: markerState.pending,
+        ...activityTarget,
+    });
+    const progressDetail = markerState.backendAccepted && !hasDrawRunProgressDetail(matchedDetail)
+        ? { ...matchedDetail, stage: 'reattaching' }
+        : matchedDetail;
+    const effectiveDetail = markerState.cancelling
+        ? { ...progressDetail, ...activityTarget, phase: 'cancelling' }
+        : markerState.backendAccepted
+            ? { ...progressDetail, ...activityTarget, phase: 'active' }
+            : progressDetail;
+    const panelData = panelMap.get(messageId);
+    if (panelData) {
+        const next = resolveDrawRunUiState({
+            currentState: panelData.state,
+            pending: markerState.pending,
+            detail: effectiveDetail,
+            ...activityTarget,
+        });
+        if (next !== panelData.state
+            || (next === FloatState.ACCEPTED && hasDrawRunProgressDetail(matchedDetail))) {
+            setFloorState(messageId, next, effectiveDetail);
+        }
+    }
+    if (floatingEl && Number(messageId) === findLastAIMessageId()) {
+        const next = resolveDrawRunUiState({
+            currentState: floatingState,
+            pending: markerState.pending,
+            detail: effectiveDetail,
+            ...activityTarget,
+        });
+        if (markerState.pending) floatingMessageId = Number(messageId);
+        if (next !== floatingState
+            || (next === FloatState.ACCEPTED && hasDrawRunProgressDetail(matchedDetail))) {
+            setFloatingState(next, effectiveDetail);
+        }
+    }
+}
+
+function syncDrawRunActivity(detail = {}) {
+    const currentTarget = resolveCurrentDrawRunActivityTarget(detail, getContext());
+    if (!currentTarget) return;
+    const lastMessageId = findLastAIMessageId();
+    if (panelMap.has(currentTarget.messageId)
+        || (floatingEl && currentTarget.messageId === lastMessageId)) {
+        void syncDrawRunPanelState(currentTarget.messageId, detail);
+    }
+}
+
+export function refreshDrawRunUiState() {
+    const messageId = findLastAIMessageId();
+    if (floatingEl) {
+        const generation = messageId >= 0 ? getGenerationState(messageId) : null;
+        if (generation) {
+            floatingMessageId = messageId;
+            setFloatingState(generation.state, generation.data);
+        } else {
+            setFloatingState(FloatState.IDLE);
+        }
+    }
+    if (messageId >= 0) void syncDrawRunPanelState(messageId);
+}
+
+function resolveCooldownEndTime({ cooldownUntil, duration } = {}) {
+    const absolute = Number(cooldownUntil);
+    if (Number.isFinite(absolute) && absolute > 0) return absolute;
+    return Date.now() + Math.max(0, Number(duration) || 0);
+}
+
+function startFloorCooldownTimer(panelData, data) {
+    if (panelData.cooldownRafId) cancelAnimationFrame(panelData.cooldownRafId);
+    panelData.cooldownEndTime = resolveCooldownEndTime(data);
+
+    function tick() {
+        if (!panelData.cooldownEndTime) return;
+        const remaining = Math.max(0, panelData.cooldownEndTime - Date.now());
+        const statusText = panelData.$cache?.statusText;
+        if (statusText) {
+            statusText.textContent = `${(remaining / 1000).toFixed(1)}s`;
+            statusText.className = 'nd-status-text nd-countdown';
+        }
+        if (remaining <= 0) {
+            panelData.cooldownRafId = null;
+            panelData.cooldownEndTime = 0;
+            return;
+        }
+        panelData.cooldownRafId = requestAnimationFrame(tick);
+    }
+
+    panelData.cooldownRafId = requestAnimationFrame(tick);
+}
+
+function updateFloorDetailPopup(messageId) {
+    const panelData = panelMap.get(messageId);
+    if (!panelData?.root) return;
+
+    const { result: resultEl, errorRow, error: errorEl, time: timeEl } = panelData.$cache;
+    const { result, state } = panelData;
+
+    const elapsed = result.startTime
+        ? ((Date.now() - result.startTime) / 1000).toFixed(1)
+        : '-';
+
+    if (state === FloatState.SUCCESS || state === FloatState.PARTIAL) {
+        if (resultEl) {
+            resultEl.textContent = `${result.success}/${result.total} 成功`;
+            resultEl.className = `nd-detail-value ${state === FloatState.SUCCESS ? 'success' : 'warning'}`;
+        }
+        if (errorRow) errorRow.style.display = state === FloatState.PARTIAL ? 'flex' : 'none';
+        if (errorEl && state === FloatState.PARTIAL) {
+            errorEl.textContent = `${result.total - result.success} 张失败`;
+        }
+    } else if (state === FloatState.ERROR) {
+        if (resultEl) {
+            resultEl.textContent = result.error?.label || DRAW_SLOT_COPY.redrawFailed;
+            resultEl.className = 'nd-detail-value error';
+        }
+        if (errorRow) errorRow.style.display = 'flex';
+        if (errorEl) errorEl.textContent = result.error?.desc || '未知错误';
+    }
+
+    if (timeEl) timeEl.textContent = `${elapsed}s`;
+}
+
+async function handleFloorDrawClick(messageId) {
+    const panelData = panelMap.get(messageId);
+    if (!panelData || panelData.state !== FloatState.IDLE) return;
+
+    try {
+        await generateAndInsertImages({
+            messageId,
+            onStateChange: (state, data, liveId) => {
+                setStateForMessage(liveId, state, data);
+            }
+        });
+    } catch (error) {
+        if (error.drawTaskReported) return;
+        if (error instanceof FloorImageBusyError || isDrawRunPendingError(error)) {
+            toastr?.info?.(error.message);
+        } else {
+            console.error(error);
+            toastr?.error?.(error.message);
+        }
+    }
+}
+
+async function handleFloorAbort(messageId) {
+    const target = captureDrawCancellationTarget(messageId);
+    try {
+        const aborted = abortGeneration(messageId, { target });
+        if (aborted && isDrawCancellationTargetCurrent(target)) {
+            setFloorState(getContext().chat.indexOf(target.message), FloatState.CANCELLING);
+            toastr?.info?.('正在中止');
+        }
+        const cancelledChild = await cancelPendingChildDrawRuns(messageId, { target });
+        if (!aborted && cancelledChild && isDrawCancellationTargetCurrent(target)) {
+            toastr?.info?.('正在中止');
+            const liveId = getContext().chat.indexOf(target.message);
+            void syncDrawRunPanelState(liveId, { messageId: liveId, phase: 'cancelling' });
+        }
+    } catch (e) {
+        console.error('[NovelDraw] 中止失败:', e);
+        toastr?.error?.(DRAW_SLOT_COPY.cancelFailed);
+    }
+}
+
+function bindFloorPanelEvents(panelData) {
+    const { messageId, root: el } = panelData;
+
+    el.querySelector('.nd-btn-draw')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        handleFloorDrawClick(messageId);
+    });
+
+    el.querySelector('.nd-btn-menu')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        el.classList.remove('show-detail');
+        if (!el.classList.contains('expanded')) {
+            refreshFloorPresetSelect(messageId);
+            refreshFloorSizeSelect(messageId);
+        }
+        el.classList.toggle('expanded');
+    });
+
+    el.querySelector('.nd-layer-active')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const state = panelData.state;
+        if ([FloatState.SUBMITTING, FloatState.ACCEPTED, FloatState.UNCERTAIN, FloatState.QUEUED, FloatState.LLM, FloatState.GEN, FloatState.COOLDOWN, FloatState.RECONNECTING, FloatState.BACKEND_LEGACY].includes(state)) {
+            handleFloorAbort(messageId);
+        } else if ([FloatState.SUCCESS, FloatState.PARTIAL, FloatState.ERROR].includes(state)) {
+            updateFloorDetailPopup(messageId);
+            el.classList.toggle('show-detail');
+        }
+    });
+
+    panelData.$cache.presetSelect?.addEventListener('change', async (e) => {
+        await setQuickPreset(e.target.value);
+    });
+
+    panelData.$cache.sizeSelect?.addEventListener('change', async (e) => {
+        await setQuickSize(e.target.value);
+    });
+
+    panelData.$cache.presetGrid?.addEventListener('click', async (e) => {
+        const card = e.target.closest('.nd-preset-card');
+        if (!card) return;
+        e.stopPropagation();
+        const id = card.dataset.presetId;
+        if (id && id !== getSettings().selectedParamsPresetId) {
+            await setQuickPreset(id);
+        }
+        el.classList.remove('expanded');
+    });
+
+    panelData.$cache.autoToggle?.addEventListener('click', async () => {
+        await toggleQuickAutoMode();
+    });
+
+    el.querySelector('.nd-settings-btn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        el.classList.remove('expanded');
+        openNovelDrawSettings();
+    });
+
+    const closeMenu = (e) => {
+        if (!el.contains(e.target)) {
+            el.classList.remove('expanded', 'show-detail');
+        }
+    };
+    document.addEventListener('click', closeMenu, { passive: true });
+
+    panelData._cleanup = () => {
+        document.removeEventListener('click', closeMenu);
+        if (panelData.autoResetTimer) clearTimeout(panelData.autoResetTimer);
+        panelData.autoResetTimer = null;
+        if (panelData.cooldownRafId) cancelAnimationFrame(panelData.cooldownRafId);
+        panelData.cooldownRafId = null;
+        panelData.cooldownEndTime = null;
+    };
+}
+
+function refreshFloorPresetSelect(messageId) {
+    const data = panelMap.get(messageId);
+    const select = data?.$cache?.presetSelect;
+    fillPresetSelect(select);
+    renderPresetGrid(data?.$cache?.presetGrid);
+}
+
+function refreshFloorSizeSelect(messageId) {
+    const data = panelMap.get(messageId);
+    const select = data?.$cache?.sizeSelect;
+    fillSizeSelect(select);
+}
+
+async function persistQuickSetting(mutator, okText, afterSave) {
+    const ok = await updateSettingsPersistent(mutator, okText);
+    if (ok && typeof afterSave === 'function') {
+        afterSave();
+    }
+    return ok;
+}
+
+async function setQuickPreset(value) {
+    return persistQuickSetting(
+        (settings) => { settings.selectedParamsPresetId = value; },
+        '预设已切换',
+        updateAllPresetSelects,
+    );
+}
+
+async function setQuickSize(value) {
+    return persistQuickSetting(
+        (settings) => { settings.overrideSize = value; },
+        '尺寸已切换',
+        updateAllSizeSelects,
+    );
+}
+
+async function toggleQuickAutoMode() {
+    const current = getSettings();
+    const nextMode = current.mode === 'auto' ? 'manual' : 'auto';
+    return persistQuickSetting(
+        (settings) => { settings.mode = nextMode; },
+        nextMode === 'auto' ? '自动配图已开启' : '自动配图已关闭',
+        updateAutoModeUI,
+    );
+}
+
+function mountFloorPanel(messageEl, messageId) {
+    if (panelMap.has(messageId)) {
+        const existing = panelMap.get(messageId);
+        if (existing.root?.isConnected) {
+            void syncDrawRunPanelState(messageId);
+            return existing;
+        }
+        existing._cleanup?.();
+        panelMap.delete(messageId);
+    }
+
+    injectStyles();
+
+    const panelData = createFloorPanelData(messageId);
+    const panel = createFloorPanelElement(messageId);
+    panelData.root = panel;
+
+    const success = registerToToolbar(messageId, panel, {
+        position: 'right',
+        id: `novel-draw-${messageId}`
+    });
+
+    if (!success) return null;
+
+    cacheFloorDOM(panelData);
+    bindFloorPanelEvents(panelData);
+
+    panelMap.set(messageId, panelData);
+    void syncDrawRunPanelState(messageId);
+    return panelData;
+}
+
+function setupFloorObserver() {
+    if (floorObserver) return;
+
+    floorObserver = new IntersectionObserver((entries) => {
+        const toMount = [];
+
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+
+            const el = entry.target;
+            const mid = Number(el.getAttribute('mesid'));
+
+            if (pendingCallbacks.has(mid)) {
+                toMount.push({ el, mid });
+                pendingCallbacks.delete(mid);
+                floorObserver.unobserve(el);
+            }
+        }
+
+        if (toMount.length > 0) {
+            requestAnimationFrame(() => {
+                for (const { el, mid } of toMount) {
+                    mountFloorPanel(el, mid);
+                }
+            });
+        }
+    }, { rootMargin: '300px' });
+}
+
+export function ensureNovelDrawPanel(messageEl, messageId, options = {}) {
+    const settings = getSettings();
+    if (settings.showFloorButton === false) return null;
+
+    const { force = false } = options;
+
+    injectStyles();
+
+    if (panelMap.has(messageId)) {
+        const existing = panelMap.get(messageId);
+        if (existing.root?.isConnected) return existing;
+        existing._cleanup?.();
+        panelMap.delete(messageId);
+    }
+
+    if (force) {
+        return mountFloorPanel(messageEl, messageId);
+    }
+
+    const rect = messageEl.getBoundingClientRect();
+    if (rect.top < window.innerHeight + 500 && rect.bottom > -500) {
+        return mountFloorPanel(messageEl, messageId);
+    }
+
+    setupFloorObserver();
+    pendingCallbacks.set(messageId, true);
+    floorObserver.observe(messageEl);
+
+    return null;
+}
+
+export function releaseNovelDrawPanel(messageEl, messageId) {
+    floorObserver?.unobserve(messageEl);
+    pendingCallbacks.delete(messageId);
+    const panelData = panelMap.get(messageId);
+    if (!panelData || !messageEl.contains(panelData.root)) return;
+    if (panelData.autoResetTimer) clearTimeout(panelData.autoResetTimer);
+    if (panelData.cooldownRafId) cancelAnimationFrame(panelData.cooldownRafId);
+    panelData._cleanup?.();
+    removeFromToolbar(messageId, panelData.root);
+    panelMap.delete(messageId);
+}
+
+export function setStateForMessage(messageId, state, data = {}) {
+    let panelData = panelMap.get(messageId);
+
+    if (!panelData?.root?.isConnected) {
+        const messageEl = document.querySelector(`.mes[mesid="${messageId}"]`);
+        if (messageEl) {
+            panelData = ensureNovelDrawPanel(messageEl, messageId, { force: true });
+        }
+    }
+
+    if (panelData) {
+        setFloorState(messageId, state, data);
+    }
+
+    if (floatingEl && messageId === findLastAIMessageId()) {
+        floatingMessageId = messageId;
+        setFloatingState(state, data);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ▼▼▼ 悬浮按钮逻辑 ▼▼▼
+// ═══════════════════════════════════════════════════════════════════════════
+
+function getFloatingPosition() {
+    try {
+        const raw = localStorage.getItem(FLOAT_POS_KEY);
+        if (raw) return JSON.parse(raw);
+    } catch {}
+
+    const debug = document.getElementById('xiaobaix-debug-mini');
+    if (debug) {
+        const r = debug.getBoundingClientRect();
+        return { left: r.left, top: r.bottom + 8 };
+    }
+    return { left: window.innerWidth - 110, top: window.innerHeight - 80 };
+}
+
+let floatingDockedSide = null;
+
+// side: 'left' | 'right' | null（null＝完全展開）
+function setFloatingDock(side) {
+    if (!floatingEl) return;
+    floatingDockedSide = side;
+    floatingEl.classList.toggle('nd-docked-left', side === 'left');
+    floatingEl.classList.toggle('nd-docked-right', side === 'right');
+}
+
+function saveFloatingPosition() {
+    if (!floatingEl) return;
+    // 吸附狀態下 getBoundingClientRect 含 translateX 偏移，只能讀 inline 定位
+    const left = parseFloat(floatingEl.style.left) || 0;
+    const top = parseFloat(floatingEl.style.top) || 0;
+    try {
+        localStorage.setItem(FLOAT_POS_KEY, JSON.stringify({
+            left: Math.round(left),
+            top: Math.round(top),
+            docked: floatingDockedSide || '',
+        }));
+    } catch {}
+}
+
+function applyFloatingPosition() {
+    if (!floatingEl) return;
+    const pos = getFloatingPosition();
+    const w = floatingEl.offsetWidth || 77;
+    const h = floatingEl.offsetHeight || 34;
+    const JUMP_RESERVE = 30;
+    floatingEl.style.left = `${Math.max(0, Math.min(pos.left, window.innerWidth - w))}px`;
+    floatingEl.style.top = `${Math.max(JUMP_RESERVE, Math.min(pos.top, window.innerHeight - h - JUMP_RESERVE))}px`;
+    setFloatingDock(pos.docked === 'left' || pos.docked === 'right' ? pos.docked : null);
+}
+
+function clearFloatingCooldownTimer() {
+    if (floatingCooldownRafId) {
+        cancelAnimationFrame(floatingCooldownRafId);
+        floatingCooldownRafId = null;
+    }
+    floatingCooldownEndTime = 0;
+}
+
+function startFloatingCooldownTimer(data) {
+    clearFloatingCooldownTimer();
+    floatingCooldownEndTime = resolveCooldownEndTime(data);
+
+    function tick() {
+        if (!floatingCooldownEndTime) return;
+        const remaining = Math.max(0, floatingCooldownEndTime - Date.now());
+        const statusText = $floatingCache.statusText;
+        if (statusText) {
+            statusText.textContent = `${(remaining / 1000).toFixed(1)}s`;
+            statusText.className = 'nd-status-text nd-countdown';
+        }
+        if (remaining <= 0) {
+            clearFloatingCooldownTimer();
+            return;
+        }
+        floatingCooldownRafId = requestAnimationFrame(tick);
+    }
+
+    floatingCooldownRafId = requestAnimationFrame(tick);
+}
+
+function setFloatingState(state, data = {}) {
+    if (!floatingEl) return;
+
+    floatingState = state;
+
+    if (floatingAutoResetTimer) {
+        clearTimeout(floatingAutoResetTimer);
+        floatingAutoResetTimer = null;
+    }
+
+    if (state !== FloatState.COOLDOWN) {
+        clearFloatingCooldownTimer();
+    }
+
+    floatingEl.classList.remove('working', 'cooldown', 'success', 'partial', 'error', 'show-detail');
+
+    const { statusIcon, statusText } = $floatingCache;
+    if (!statusIcon || !statusText) return;
+    statusText.className = 'nd-status-text';
+
+    switch (state) {
+        case FloatState.IDLE:
+            floatingMessageId = null;
+            floatingResult = { success: 0, total: 0, error: null, startTime: 0 };
+            break;
+        case FloatState.SUBMITTING:
+            floatingEl.classList.add('working');
+            if (!floatingResult.startTime) floatingResult.startTime = Date.now();
+            statusIcon.textContent = '↥';
+            statusIcon.className = 'nd-status-icon nd-spin';
+            statusText.textContent = DRAW_CAPSULE_COPY.submitting;
+            break;
+        case FloatState.ACCEPTED:
+            floatingEl.classList.add('working');
+            if (!floatingResult.startTime) floatingResult.startTime = Date.now();
+            statusIcon.textContent = getDrawRunProgressIcon(data);
+            statusIcon.className = 'nd-status-icon nd-spin';
+            statusText.textContent = formatDrawRunProgress(data);
+            break;
+        case FloatState.UNCERTAIN:
+            floatingEl.classList.add('working');
+            if (!floatingResult.startTime) floatingResult.startTime = Date.now();
+            statusIcon.textContent = '↻';
+            statusIcon.className = 'nd-status-icon nd-spin';
+            statusText.textContent = DRAW_CAPSULE_COPY.uncertain;
+            break;
+        case FloatState.QUEUED:
+            floatingEl.classList.add('working');
+            if (!floatingResult.startTime) floatingResult.startTime = Date.now();
+            statusIcon.textContent = '⌛';
+            statusIcon.className = 'nd-status-icon';
+            statusText.textContent = DRAW_CAPSULE_COPY.queued;
+            break;
+        case FloatState.LLM:
+            floatingEl.classList.add('working');
+            if (!floatingResult.startTime) floatingResult.startTime = Date.now();
+            statusIcon.textContent = '⏳';
+            statusIcon.className = 'nd-status-icon nd-spin';
+            statusText.textContent = formatScenePlannerProgress(data);
+            break;
+        case FloatState.GEN:
+            floatingEl.classList.add('working');
+            statusIcon.textContent = '🎨';
+            statusIcon.className = 'nd-status-icon nd-spin';
+            statusText.textContent = `${data.current || 0}/${data.total || 0}`;
+            floatingResult.total = data.total || 0;
+            break;
+        case FloatState.COOLDOWN:
+            floatingEl.classList.add('cooldown');
+            statusIcon.textContent = '⏳';
+            statusIcon.className = 'nd-status-icon nd-spin';
+            startFloatingCooldownTimer(data);
+            break;
+        case FloatState.RECONNECTING:
+            floatingEl.classList.add('working');
+            statusIcon.textContent = '↻';
+            statusIcon.className = 'nd-status-icon nd-spin';
+            statusText.textContent = DRAW_CAPSULE_COPY.reconnecting;
+            break;
+        case FloatState.CANCELLING:
+            floatingEl.classList.add('working');
+            statusIcon.textContent = '⏳';
+            statusIcon.className = 'nd-status-icon nd-spin';
+            statusText.textContent = DRAW_CAPSULE_COPY.cancelling;
+            break;
+        case FloatState.BACKEND_LEGACY:
+            floatingEl.classList.add('working');
+            statusIcon.textContent = '↪';
+            statusIcon.className = 'nd-status-icon';
+            statusText.textContent = DRAW_CAPSULE_COPY.legacy;
+            break;
+        case FloatState.SUCCESS:
+            floatingEl.classList.add('success');
+            statusIcon.textContent = '✓';
+            statusIcon.className = 'nd-status-icon';
+            statusText.textContent = `${data.success}/${data.total}`;
+            floatingResult.success = data.success;
+            floatingResult.total = data.total;
+            floatingAutoResetTimer = setTimeout(() => setFloatingState(FloatState.IDLE), AUTO_RESET_DELAY);
+            break;
+        case FloatState.PARTIAL:
+            floatingEl.classList.add('partial');
+            statusIcon.textContent = '⚠';
+            statusIcon.className = 'nd-status-icon';
+            statusText.textContent = `${data.success}/${data.total}`;
+            floatingResult.success = data.success;
+            floatingResult.total = data.total;
+            floatingAutoResetTimer = setTimeout(() => setFloatingState(FloatState.IDLE), AUTO_RESET_DELAY);
+            break;
+        case FloatState.ERROR:
+            floatingEl.classList.add('error');
+            statusIcon.textContent = '✗';
+            statusIcon.className = 'nd-status-icon';
+            statusText.textContent = data.unknown ? DRAW_CAPSULE_COPY.unknown : DRAW_CAPSULE_COPY.error;
+            floatingResult.error = data.error;
+            floatingAutoResetTimer = setTimeout(() => setFloatingState(FloatState.IDLE), AUTO_RESET_DELAY);
+            break;
+    }
+}
+
+function updateFloatingDetailPopup() {
+    const { detailResult, detailErrorRow, detailError, detailTime } = $floatingCache;
+    if (!detailResult) return;
+
+    const elapsed = floatingResult.startTime
+        ? ((Date.now() - floatingResult.startTime) / 1000).toFixed(1)
+        : '-';
+
+    if (floatingState === FloatState.SUCCESS || floatingState === FloatState.PARTIAL) {
+        detailResult.textContent = `${floatingResult.success}/${floatingResult.total} 成功`;
+        detailResult.className = `nd-detail-value ${floatingState === FloatState.SUCCESS ? 'success' : 'warning'}`;
+        detailErrorRow.style.display = floatingState === FloatState.PARTIAL ? 'flex' : 'none';
+        if (floatingState === FloatState.PARTIAL) {
+            detailError.textContent = `${floatingResult.total - floatingResult.success} 张失败`;
+        }
+    } else if (floatingState === FloatState.ERROR) {
+        detailResult.textContent = floatingResult.error?.label || DRAW_SLOT_COPY.redrawFailed;
+        detailResult.className = 'nd-detail-value error';
+        detailErrorRow.style.display = 'flex';
+        detailError.textContent = floatingResult.error?.desc || '未知错误';
+    }
+
+    detailTime.textContent = `${elapsed}s`;
+}
+
+function onFloatingPointerDown(e) {
+    if (e.button !== 0) return;
+
+    // 吸附半藏狀態：首次按下只拉回，不起拖曳、不觸發膠囊內按鈕
+    if (floatingDockedSide) {
+        setFloatingDock(null);
+        saveFloatingPosition();
+        e.preventDefault();
+        return;
+    }
+
+    floatingDragState = {
+        startX: e.clientX,
+        startY: e.clientY,
+        startLeft: floatingEl.getBoundingClientRect().left,
+        startTop: floatingEl.getBoundingClientRect().top,
+        pointerId: e.pointerId,
+        moved: false,
+        originalTarget: e.target
+    };
+
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+    e.preventDefault();
+}
+
+function onFloatingPointerMove(e) {
+    if (!floatingDragState || floatingDragState.pointerId !== e.pointerId) return;
+
+    const dx = e.clientX - floatingDragState.startX;
+    const dy = e.clientY - floatingDragState.startY;
+
+    if (!floatingDragState.moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+        floatingDragState.moved = true;
+    }
+
+    if (floatingDragState.moved) {
+        const w = floatingEl.offsetWidth || 88;
+        const h = floatingEl.offsetHeight || 36;
+        // 預留膠囊外上下跳圖鈕的高度
+        const JUMP_RESERVE = 30;
+        floatingEl.style.left = `${Math.max(0, Math.min(floatingDragState.startLeft + dx, window.innerWidth - w))}px`;
+        floatingEl.style.top = `${Math.max(JUMP_RESERVE, Math.min(floatingDragState.startTop + dy, window.innerHeight - h - JUMP_RESERVE))}px`;
+    }
+
+    e.preventDefault();
+}
+
+function onFloatingPointerUp(e) {
+    if (!floatingDragState || floatingDragState.pointerId !== e.pointerId) return;
+
+    const { moved, originalTarget } = floatingDragState;
+
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+    floatingDragState = null;
+
+    if (moved) {
+        // 離左右邊緣 28px 內放開＝貼邊半藏；其餘位置解除吸附
+        const finalLeft = parseFloat(floatingEl.style.left) || 0;
+        const w = floatingEl.offsetWidth || 88;
+        const EDGE_SNAP = 28;
+        let side = null;
+        if (finalLeft <= EDGE_SNAP) side = 'left';
+        else if (finalLeft >= window.innerWidth - w - EDGE_SNAP) side = 'right';
+        setFloatingDock(side);
+        saveFloatingPosition();
+    } else {
+        routeFloatingClick(originalTarget);
+    }
+}
+
+function getVisibleChatImageWrappers() {
+    return [...document.querySelectorAll('#chat .mes .mes_text .xb-nd-img')]
+        .filter(w => w.offsetHeight > 0 && w.offsetWidth > 0 && w.querySelector('img'));
+}
+
+// 以視口中線為「當前位置」：dir=-1 跳到中線上方最近一張，dir=1 跳下方最近一張。
+// 不記樓層，手動滾動後再點仍然正確。
+function jumpToChatImage(dir) {
+    const center = window.innerHeight / 2;
+    let target = null;
+    let best = Infinity;
+    for (const w of getVisibleChatImageWrappers()) {
+        const r = w.getBoundingClientRect();
+        if (dir < 0 && r.bottom < center - 1) {
+            const d = center - r.bottom;
+            if (d < best) { best = d; target = w; }
+        } else if (dir > 0 && r.top > center + 1) {
+            const d = r.top - center;
+            if (d < best) { best = d; target = w; }
+        }
+    }
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function routeFloatingClick(target) {
+    if (target.closest('.nd-btn-draw')) {
+        handleFloatingDrawClick();
+    } else if (target.closest('.nd-btn-menu')) {
+        floatingEl.classList.remove('show-detail');
+        if (!floatingEl.classList.contains('expanded')) {
+            refreshFloatingPresetSelect();
+            refreshFloatingSizeSelect();
+        }
+        floatingEl.classList.toggle('expanded');
+    } else if (target.closest('.nd-layer-active')) {
+        if ([FloatState.SUBMITTING, FloatState.ACCEPTED, FloatState.UNCERTAIN, FloatState.QUEUED, FloatState.LLM, FloatState.GEN, FloatState.COOLDOWN, FloatState.RECONNECTING, FloatState.BACKEND_LEGACY].includes(floatingState)) {
+            handleFloatingAbort();
+        } else if ([FloatState.SUCCESS, FloatState.PARTIAL, FloatState.ERROR].includes(floatingState)) {
+            updateFloatingDetailPopup();
+            floatingEl.classList.toggle('show-detail');
+        }
+    }
+}
+
+async function handleFloatingDrawClick() {
+    if (floatingState !== FloatState.IDLE) return;
+
+    const messageId = findLastAIMessageId();
+    if (messageId < 0) {
+        toastr?.warning?.('没有可配图的AI消息');
+        return;
+    }
+
+    floatingMessageId = messageId;
+
+    try {
+        await generateAndInsertImages({
+            messageId,
+            onStateChange: (state, data, liveId) => {
+                setStateForMessage(liveId, state, data);
+            }
+        });
+    } catch (error) {
+        if (error.drawTaskReported) return;
+        if (error instanceof FloorImageBusyError || isDrawRunPendingError(error)) {
+            toastr?.info?.(error.message);
+        } else {
+            console.error(error);
+            toastr?.error?.(error.message);
+        }
+    }
+}
+
+async function handleFloatingAbort() {
+    const messageId = floatingMessageId;
+    const target = captureDrawCancellationTarget(messageId);
+    try {
+        const aborted = messageId >= 0 && abortGeneration(messageId, { target });
+        if (aborted && isDrawCancellationTargetCurrent(target)) {
+            setFloatingState(FloatState.CANCELLING);
+            toastr?.info?.('正在中止');
+        }
+        const cancelledChild = messageId >= 0 && await cancelPendingChildDrawRuns(messageId, { target });
+        if (!aborted && cancelledChild && isDrawCancellationTargetCurrent(target)) {
+            toastr?.info?.('正在中止');
+            const liveId = getContext().chat.indexOf(target.message);
+            void syncDrawRunPanelState(liveId, { messageId: liveId, phase: 'cancelling' });
+        }
+    } catch (e) {
+        console.error('[NovelDraw] 中止失败:', e);
+        toastr?.error?.(DRAW_SLOT_COPY.cancelFailed);
+    }
+}
+
+function refreshFloatingPresetSelect() {
+    fillPresetSelect($floatingCache.presetSelect);
+    renderPresetGrid($floatingCache.presetGrid);
+}
+
+function refreshFloatingSizeSelect() {
+    fillSizeSelect($floatingCache.sizeSelect);
+}
+
+function cacheFloatingDOM() {
+    if (!floatingEl) return;
+    $floatingCache = {
+        capsule: floatingEl.querySelector('.nd-capsule'),
+        statusIcon: floatingEl.querySelector('.nd-status-icon'),
+        statusText: floatingEl.querySelector('.nd-status-text'),
+        detailResult: floatingEl.querySelector('.nd-result'),
+        detailErrorRow: floatingEl.querySelector('.nd-error-row'),
+        detailError: floatingEl.querySelector('.nd-error'),
+        detailTime: floatingEl.querySelector('.nd-time'),
+        presetSelect: floatingEl.querySelector('.nd-preset-select'),
+        sizeSelect: floatingEl.querySelector('.nd-size-select'),
+        presetGrid: floatingEl.querySelector('.nd-preset-grid'),
+        autoToggle: floatingEl.querySelector('.nd-auto-toggle'),
+    };
+}
+
+function handleFloatingOutsideClick(e) {
+    if (floatingEl && !floatingEl.contains(e.target)) {
+        floatingEl.classList.remove('expanded', 'show-detail');
+    }
+}
+
+function createFloatingButton() {
+    if (floatingEl) return;
+
+    const settings = getSettings();
+    if (settings.showFloatingButton !== true) return;
+
+    injectStyles();
+
+    const isAuto = settings.mode === 'auto';
+
+    floatingEl = document.createElement('div');
+    floatingEl.className = `nd-float nd-floating-global${isAuto ? ' auto-on' : ''}`;
+    floatingEl.id = 'nd-floating-global';
+
+    const detail = createEl('div', 'nd-detail');
+    const detailRowResult = createEl('div', 'nd-detail-row');
+    detailRowResult.append(
+        createEl('span', 'nd-detail-icon', '📊'),
+        createEl('span', 'nd-detail-label', '结果'),
+        createEl('span', 'nd-detail-value nd-result', '-')
+    );
+    const detailRowError = createEl('div', 'nd-detail-row nd-error-row');
+    detailRowError.style.display = 'none';
+    detailRowError.append(
+        createEl('span', 'nd-detail-icon', '💡'),
+        createEl('span', 'nd-detail-label', '原因'),
+        createEl('span', 'nd-detail-value error nd-error', '-')
+    );
+    const detailRowTime = createEl('div', 'nd-detail-row');
+    detailRowTime.append(
+        createEl('span', 'nd-detail-icon', '⏱'),
+        createEl('span', 'nd-detail-label', '耗时'),
+        createEl('span', 'nd-detail-value nd-time', '-')
+    );
+    detail.append(detailRowResult, detailRowError, detailRowTime);
+
+    const menu = createEl('div', 'nd-menu');
+    const sizeSelect = createEl('select', 'nd-select size nd-size-select');
+    fillSizeSelect(sizeSelect);
+
+    const controls = createEl('div', 'nd-controls');
+    const autoToggle = createEl('div', `nd-auto${isAuto ? ' on' : ''} nd-auto-toggle`);
+    autoToggle.append(
+        createEl('span', 'nd-dot'),
+        createEl('span', 'nd-auto-text', '自动配图')
+    );
+    const settingsBtn = createEl('button', 'nd-gear nd-settings-btn', '⚙');
+    settingsBtn.title = '打开设置';
+    controls.append(autoToggle, sizeSelect, settingsBtn);
+    menu.append(controls);
+
+    const presetGrid = createEl('div', 'nd-preset-grid');
+    renderPresetGrid(presetGrid);
+    menu.append(presetGrid);
+
+    const capsule = createEl('div', 'nd-capsule');
+    const inner = createEl('div', 'nd-inner');
+    const layerIdle = createEl('div', 'nd-layer nd-layer-idle');
+    const drawBtn = createEl('button', 'nd-btn-draw');
+    drawBtn.title = '点击为最后一条AI消息生成配图';
+    drawBtn.appendChild(createEl('span', '', '🎨'));
+    drawBtn.appendChild(createEl('span', 'nd-auto-dot'));
+    const sep = createEl('div', 'nd-sep');
+    const menuBtn = createEl('button', 'nd-btn-menu');
+    menuBtn.title = '展开菜单';
+    menuBtn.appendChild(createEl('span', 'nd-arrow', '▲'));
+    layerIdle.append(drawBtn, sep, menuBtn);
+    const layerActive = createEl('div', 'nd-layer nd-layer-active');
+    layerActive.append(
+        createEl('span', 'nd-status-icon', '⏳'),
+        createEl('span', 'nd-status-text', DRAW_CAPSULE_COPY.analysis)
+    );
+    inner.append(layerIdle, layerActive);
+    capsule.appendChild(inner);
+
+    // 上下跳圖鈕在膠囊外部，獨立於拖曳膠囊
+    const imgPrevBtn = createEl('button', 'nd-img-jump nd-img-jump-prev', '▲');
+    imgPrevBtn.title = '跳到上一张图片';
+    const imgNextBtn = createEl('button', 'nd-img-jump nd-img-jump-next', '▼');
+    imgNextBtn.title = '跳到下一张图片';
+    imgPrevBtn.addEventListener('click', (e) => { e.stopPropagation(); jumpToChatImage(-1); });
+    imgNextBtn.addEventListener('click', (e) => { e.stopPropagation(); jumpToChatImage(1); });
+
+    floatingEl.append(detail, menu, imgPrevBtn, capsule, imgNextBtn);
+
+    document.body.appendChild(floatingEl);
+    cacheFloatingDOM();
+    applyFloatingPosition();
+
+    const capsuleEl = $floatingCache.capsule;
+    if (capsuleEl) {
+        capsuleEl.addEventListener('pointerdown', onFloatingPointerDown, { passive: false });
+        capsuleEl.addEventListener('pointermove', onFloatingPointerMove, { passive: false });
+        capsuleEl.addEventListener('pointerup', onFloatingPointerUp, { passive: false });
+        capsuleEl.addEventListener('pointercancel', onFloatingPointerUp, { passive: false });
+    }
+
+    $floatingCache.presetSelect?.addEventListener('change', async (e) => {
+        await setQuickPreset(e.target.value);
+    });
+
+    $floatingCache.sizeSelect?.addEventListener('change', async (e) => {
+        await setQuickSize(e.target.value);
+    });
+
+    $floatingCache.presetGrid?.addEventListener('click', async (e) => {
+        const card = e.target.closest('.nd-preset-card');
+        if (!card) return;
+        e.stopPropagation();
+        const id = card.dataset.presetId;
+        if (id && id !== getSettings().selectedParamsPresetId) {
+            await setQuickPreset(id);
+        }
+        floatingEl.classList.remove('expanded');
+    });
+
+    $floatingCache.autoToggle?.addEventListener('click', async () => {
+        await toggleQuickAutoMode();
+    });
+
+    floatingEl.querySelector('.nd-settings-btn')?.addEventListener('click', () => {
+        floatingEl.classList.remove('expanded');
+        openNovelDrawSettings();
+    });
+
+    document.addEventListener('click', handleFloatingOutsideClick, { passive: true });
+    window.addEventListener('resize', applyFloatingPosition);
+    const messageId = findLastAIMessageId();
+    if (messageId >= 0) void syncDrawRunPanelState(messageId);
+}
+
+function destroyFloatingButton() {
+    clearFloatingCooldownTimer();
+
+    if (floatingAutoResetTimer) {
+        clearTimeout(floatingAutoResetTimer);
+        floatingAutoResetTimer = null;
+    }
+
+    window.removeEventListener('resize', applyFloatingPosition);
+    document.removeEventListener('click', handleFloatingOutsideClick);
+
+    floatingEl?.remove();
+    floatingEl = null;
+    floatingDragState = null;
+    floatingState = FloatState.IDLE;
+    $floatingCache = {};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 全局更新函数
+// ═══════════════════════════════════════════════════════════════════════════
+
+function updateAllPresetSelects() {
+    panelMap.forEach((data) => {
+        fillPresetSelect(data.$cache?.presetSelect);
+        renderPresetGrid(data.$cache?.presetGrid);
+    });
+    fillPresetSelect($floatingCache.presetSelect);
+    renderPresetGrid($floatingCache.presetGrid);
+}
+
+function updateAllSizeSelects() {
+    panelMap.forEach((data) => {
+        fillSizeSelect(data.$cache?.sizeSelect);
+    });
+    fillSizeSelect($floatingCache.sizeSelect);
+}
+
+export function updateAutoModeUI() {
+    const isAuto = getSettings().mode === 'auto';
+
+    panelMap.forEach((data) => {
+        if (!data.root) return;
+        data.root.classList.toggle('auto-on', isAuto);
+        data.$cache.autoToggle?.classList.toggle('on', isAuto);
+    });
+
+    if (floatingEl) {
+        floatingEl.classList.toggle('auto-on', isAuto);
+        $floatingCache.autoToggle?.classList.toggle('on', isAuto);
+    }
+}
+
+export function refreshPresetSelectAll() {
+    updateAllPresetSelects();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 按钮显示控制
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function updateButtonVisibility(showFloor, showFloating) {
+    if (showFloating && !floatingEl) {
+        createFloatingButton();
+    } else if (!showFloating && floatingEl) {
+        destroyFloatingButton();
+    }
+
+    if (!showFloor) {
+        panelMap.forEach((data, messageId) => {
+            if (data.autoResetTimer) clearTimeout(data.autoResetTimer);
+            if (data.cooldownRafId) cancelAnimationFrame(data.cooldownRafId);
+            data._cleanup?.();
+            if (data.root) removeFromToolbar(messageId, data.root);
+        });
+        panelMap.clear();
+        pendingCallbacks.clear();
+        floorObserver?.disconnect();
+        floorObserver = null;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 初始化与清理
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function initFloatingPanel() {
+    const settings = getSettings();
+
+    drawRunActivityDispose ??= subscribeDrawRunActivity(syncDrawRunActivity);
+
+    if (settings.showFloatingButton === true) {
+        createFloatingButton();
+    }
+}
+
+export function destroyFloatingPanel() {
+    drawRunActivityDispose?.();
+    drawRunActivityDispose = null;
+    panelMap.forEach((data, messageId) => {
+        if (data.autoResetTimer) clearTimeout(data.autoResetTimer);
+        if (data.cooldownRafId) cancelAnimationFrame(data.cooldownRafId);
+        data._cleanup?.();
+        if (data.root) removeFromToolbar(messageId, data.root);
+    });
+    panelMap.clear();
+    pendingCallbacks.clear();
+
+    floorObserver?.disconnect();
+    floorObserver = null;
+
+    destroyFloatingButton();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 导出
+// ═══════════════════════════════════════════════════════════════════════════
+
+export {
+    FloatState,
+    refreshPresetSelectAll as refreshPresetSelect,
+    SIZE_OPTIONS,
+    updateAllPresetSelects,
+    updateAllSizeSelects,
+    createFloatingButton,
+    destroyFloatingButton,
+    setFloatingState,
+};

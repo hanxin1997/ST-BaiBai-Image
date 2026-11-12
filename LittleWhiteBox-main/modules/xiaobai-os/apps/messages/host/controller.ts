@@ -1,0 +1,289 @@
+import type { XiaobaiOsAppActivationContext, XiaobaiOsAppRuntime } from '../../../types.js';
+import type { XiaobaiOsHostFrameMessage } from '../../../host/frame-bridge.js';
+import { addContact } from '../../../domains/messages/commands.js';
+import { messageString, record } from '../../../domains/messages/invariants.js';
+import { parseOutgoingMessage } from '../application/image-upload.js';
+import { payloadText } from '../../../domains/messages/types.js';
+import { unsyncedIds } from '../application/projection.js';
+import type { MessagesService } from '../application/service.js';
+import type { MessagesTimeline } from '../application/timeline.js';
+import type { MessagesContext } from './context-adapter.js';
+import type { MessagesMedia } from './media-adapter.js';
+import { syncCurrentMessages, type createMessagesRuntime } from './runtime.js';
+import type { MessagesClientState, MessagesSettings, ThreadPage } from '../types.js';
+import { messagesRevision, type MessagesModifications } from '../application/modifications.js';
+import { messageSyncCopy } from '../sync-copy.js';
+
+export interface MessagesControllerDependencies {
+    service: MessagesService; timeline: MessagesTimeline; context: MessagesContext; media: MessagesMedia;
+    runtime: ReturnType<typeof createMessagesRuntime>;
+    modifications: MessagesModifications;
+    getSettings(): MessagesSettings;
+    saveSettings(settings: MessagesSettings): Promise<void>;
+    subscribeSettings(listener: () => void): () => void;
+    identity(): string; isGenerating(): boolean;
+    subscribeGeneration(listener: (active: boolean) => void): () => void;
+    subscribeChat(listener: () => void): () => void;
+}
+
+export function createMessagesController(deps: MessagesControllerDependencies): XiaobaiOsAppRuntime & { emit(): void } {
+    const { service, timeline, context, media, runtime, modifications } = deps;
+    let activation: XiaobaiOsAppActivationContext | null = null;
+    let pageIdentity = '';
+    const localBusy = new Set<string>();
+    let localError = '';
+    let syncError = '';
+    let recoveryBlocked = false;
+    let chatBoundary = 0;
+    let viewBoundary = 0;
+    let cleanups: (() => void)[] = [];
+    function state(): MessagesClientState {
+        const domain = service.current();
+        const assessment = modifications.inspect(domain);
+        const latest = new Map(domain.messages.map(message => [message.contactId, message]));
+        const missing = unsyncedIds(domain);
+        return {
+            chatIdentity: deps.identity(),
+            settings: deps.getSettings(),
+            contacts: domain.contacts.map(({ summary: _summary, ...contact }) => {
+                const last = latest.get(contact.id);
+                const ids = domain.messages.filter(message => message.contactId === contact.id).map(message => message.id);
+                const deleteReason = ids.length ? assessment.reason(ids) : '';
+                return { ...contact, deleteReason, preview: last ? (last.sender === 'user' ? '我：' : '') + (last.payload.type === 'image' ? '［图片］' : last.payload.type === 'voice' ? '［语音］' : '') + payloadText(last.payload).slice(0, 100) : '还没有消息', lastSeq: last?.seq ?? 0, lastAt: last?.createdAt ?? null, lastMessageId: last?.id ?? null };
+            }).sort((left, right) => right.lastSeq - left.lastSeq || left.createdAt - right.createdAt),
+            knownPeople: context.knownPeople().map(({ name, aliases }) => ({ name, aliases })),
+            fileState: service.fileState(), pendingSave: service.pending(),
+            recoveryBlocked, operationPending: localBusy.has(deps.identity()),
+            pendingModification: !!domain.pendingMutation, revision: messagesRevision(domain),
+            boundary: viewBoundary,
+            busy: runtime.active?.identity === deps.identity() ? { contactId: runtime.active.contactId, messageId: runtime.active.messageId, stage: runtime.active.stage, preview: runtime.active.preview } : null,
+            outgoing: runtime.outgoing, sendFailure: runtime.failure,
+            generationActive: deps.isGenerating(),
+            syncNotice: { messageIds: missing, error: syncError || runtime.syncError },
+            error: localError || runtime.error, media: media.capabilities(),
+        };
+    }
+    function emit() {
+        if (!activation?.isCurrent() || pageIdentity !== deps.identity()) {return;}
+        try {activation.post('messages/state', { state: state() });}
+        catch (cause) {console.warn('[LittleWhiteBox] 信息状态读取失败', cause);}
+    }
+    function page(contactId: string, before = Infinity, window?: { first: number; last: number; latest: boolean }): ThreadPage {
+        const domain = service.current();
+        const all = domain.messages.filter(message => message.contactId === contactId);
+        const selected = window ? all.filter(message => message.seq >= window.first && (window.latest || message.seq <= window.last))
+            : all.filter(message => message.seq < before);
+        const messages = selected.slice(window ? -100 : -50);
+        const last = all.at(-1);
+        return { contactId, messages, hasMore: !!messages.length && all[0].id !== messages[0].id,
+            hasNewer: !!messages.length && all.at(-1)!.id !== messages.at(-1)!.id,
+            revision: messagesRevision(domain), permissions: modifications.permissions(domain, contactId, messages),
+            retryMessageId: last?.sender === 'user' ? last.id : null };
+    }
+    async function exclusive<T>(task: () => Promise<T>): Promise<T> {
+        const identity = deps.identity();
+        if (localBusy.has(identity) || runtime.active?.identity === identity) {throw new Error('messages_busy');}
+        localBusy.add(identity); localError = '';
+        try {return await task();}
+        finally {localBusy.delete(identity); emit();}
+    }
+    async function exclusiveState(task: () => Promise<void>): Promise<MessagesClientState> {
+        await exclusive(task);
+        return state();
+    }
+    async function handleMessage(message: XiaobaiOsHostFrameMessage): Promise<unknown> {
+        const payload = record(message.payload) ? message.payload : {};
+        if (!activation?.isCurrent() || payload.chatIdentity !== deps.identity() || pageIdentity !== deps.identity()) {throw new Error('messages_chat_changed');}
+        const guard = runtime.guard();
+        const requestIdentity = deps.identity(); const requestBoundary = chatBoundary;
+        const isCurrentRequest = () => requestIdentity === deps.identity() && requestBoundary === chatBoundary;
+        const string = (key: string, max = 160) => messageString(payload[key], max).trim();
+        try {
+            switch (message.type) {
+                case 'messages/refresh':
+                    await service.refresh(); return state();
+                case 'messages/settings':
+                    {
+                        const settings = payload.settings;
+                        if (!record(settings) || typeof settings.imagePrompt !== 'boolean' || typeof settings.voicePrompt !== 'boolean'
+                            || typeof settings.syncNoticeEnabled !== 'boolean') {
+                            throw new Error('messages_invalid_settings');
+                        }
+                        await deps.saveSettings({ imagePrompt: settings.imagePrompt, voicePrompt: settings.voicePrompt,
+                            syncNoticeEnabled: settings.syncNoticeEnabled });
+                        localError = '';
+                        return state();
+                    }
+                case 'messages/thread': {
+                    const before = payload.before === undefined ? Infinity : Number(payload.before);
+                    if (before !== Infinity && (!Number.isSafeInteger(before) || before < 1)) {throw new Error('messages_invalid_page');}
+                    const window = payload.window;
+                    if (window !== undefined && (!record(window) || !Number.isSafeInteger(window.first) || !Number.isSafeInteger(window.last)
+                        || Number(window.first) < 1 || Number(window.last) < Number(window.first) || typeof window.latest !== 'boolean')) {throw new Error('messages_invalid_page');}
+                    if (payload.before !== undefined && payload.revision !== messagesRevision(service.current())) {throw new Error('messages_page_stale');}
+                    return page(string('contactId'), before, window as { first: number; last: number; latest: boolean } | undefined);
+                }
+                case 'messages/context': {
+                    const domain = service.current(); const contact = domain.contacts.find(person => person.id === string('contactId'));
+                    if (!contact) {throw new Error('messages_contact_missing');}
+                    const revision = messagesRevision(domain); const boundary = viewBoundary; const identity = deps.identity();
+                    const stats = await runtime.contextStats(contact, domain.messages.filter(message => message.contactId === contact.id));
+                    if (identity !== deps.identity()) {throw new Error('messages_chat_changed');}
+                    return { revision, boundary, stats };
+                }
+                case 'messages/contact/add':
+                    {
+                        const contactId = await exclusive(async () => {
+                            const id = `contact:${string('actionId', 100)}`;
+                            const name = string('name', 120); const note = messageString(payload.note ?? '', 600, true).trim();
+                            await service.change(domain => addContact(domain, { id, name, note, createdAt: Date.now(), summary: null }), guard);
+                            return id;
+                        });
+                        return { contactId, state: state() };
+                    }
+                case 'messages/contact/note':
+                    return await exclusiveState(async () => {
+                        const contactId = string('contactId'); const note = messageString(payload.note, 600, true).trim();
+                        await service.change(domain => {
+                            const contact = domain.contacts.find(item => item.id === contactId);
+                            if (!contact) {throw new Error('messages_contact_missing');} contact.note = note;
+                        }, guard);
+                    });
+                case 'messages/contact/delete':
+                    return await exclusiveState(async () => {
+                        const contactId = string('contactId');
+                        await modifications.commit({ contactId, revision: string('revision') }, 'delete-contact', guard);
+                    });
+                case 'messages/send':
+                    if (localBusy.has(deps.identity())) {throw new Error('messages_busy');}
+                    runtime.start(string('contactId'), `input:${string('actionId', 100)}`, parseOutgoingMessage(payload.payload));
+                    return state();
+                case 'messages/message/delete':
+                    return await exclusiveState(async () => {
+                        const contactId = string('contactId'); const messageId = string('messageId');
+                        await modifications.commit({ contactId, messageId, revision: string('revision') }, 'delete', guard);
+                        media.stop();
+                        runtime.clearError();
+                    });
+                case 'messages/regenerate':
+                    if (localBusy.has(deps.identity())) {throw new Error('messages_busy');}
+                    runtime.regenerate({ contactId: string('contactId'), messageId: string('messageId'), revision: string('revision') });
+                    return state();
+                case 'messages/retry':
+                    if (localBusy.has(deps.identity())) {throw new Error('messages_busy');}
+                    runtime.start(string('contactId'), string('messageId'));
+                    return state();
+                case 'messages/discard-send':
+                    runtime.discard(string('messageId')); return state();
+                case 'messages/confirm':
+                    return await exclusiveState(async () => {
+                        const result = await service.confirm();
+                        if (result.status !== 'none' && result.status !== 'confirmed') {
+                            const blocked = result.error?.code === 'commit_guard_rejected';
+                            if (isCurrentRequest()) {recoveryBlocked = blocked;}
+                            throw new Error(blocked ? messageSyncCopy.saveOutdated : messageSyncCopy.saveFailed);
+                        }
+                        if (isCurrentRequest()) {recoveryBlocked = false;}
+                        await modifications.recover(guard);
+                        runtime.clearError();
+                    });
+                case 'messages/adopt-server-state':
+                    return await exclusiveState(async () => {
+                        if (!guard()) {throw new Error('messages_chat_changed');}
+                        const result = await service.adoptServerState();
+                        if (!guard()) {throw new Error('messages_chat_changed');}
+                        if (result.status === 'adopted') {timeline.reset(); runtime.reset(); if (isCurrentRequest()) {recoveryBlocked = false;}}
+                    });
+                case 'messages/sync':
+                    syncError = '';
+                    await modifications.recover(guard);
+                    await syncCurrentMessages(service, timeline, guard);
+                    runtime.clearError(); return state();
+                case 'messages/recover':
+                    return await exclusiveState(async () => {syncError = ''; await service.refresh(); await modifications.recover(guard); await timeline.recover(guard); runtime.clearError();});
+                case 'messages/dismiss-sync-notice':
+                    await deps.saveSettings({ ...deps.getSettings(), syncNoticeEnabled: false });
+                    localError = '';
+                    return state();
+                case 'messages/image/cancel': media.cancelImage(string('mediaRequestId')); return {};
+                case 'messages/image/generate':
+                case 'messages/voice/play': {
+                    const id = string('messageId'); const current = activation;
+                    const selected = service.current().messages.find(item => item.id === id);
+                    if (!selected) {throw new Error('messages_message_missing');}
+                    if (message.type === 'messages/voice/play') {
+                        media.play(selected, status => current?.post('messages/voice-state', { messageId: id, status }));
+                        return { started: true };
+                    }
+                    const mediaRequestId = string('mediaRequestId');
+                    return { data: await media.image(selected, {
+                        requestId: mediaRequestId,
+                        onProgress(status, ahead, delay) {
+                            if (activation === current && current?.isCurrent() && pageIdentity === deps.identity()) {
+                                current.post('messages/image-progress', { messageId: id, mediaRequestId, status, ahead, delay });
+                            }
+                        },
+                    }) };
+                }
+                case 'messages/voice/stop': media.stop(); return {};
+                default: throw new Error('messages_unknown_action');
+            }
+        } catch (cause) {
+            console.warn('[LittleWhiteBox] 信息操作失败', cause);
+            if (message.type === 'messages/context') {throw new Error('上下文用量暂时无法读取。');}
+            if (message.type.startsWith('messages/image/')) {
+                const reason = cause instanceof Error ? cause.message : '';
+                throw new Error(reason === 'messages_image_invalid' ? '画图返回的图片数据无效。'
+                    : reason === 'messages_media_cancelled' ? '图片生成已取消。'
+                        : reason === 'messages_image_busy' ? '这张图片正在处理中。'
+                            : reason && !reason.startsWith('messages_') ? reason : '图片暂时无法读取。');
+            }
+            if (message.type.startsWith('messages/voice/')) {
+                throw new Error('媒体暂不可用，消息原文已保留。');
+            }
+            const code = cause instanceof Error ? cause.message : '';
+            if (message.type === 'messages/sync' || message.type === 'messages/recover') {
+                if (isCurrentRequest()) {syncError = code === 'messages_projection_closed' ? messageSyncCopy.closed : messageSyncCopy.failed;}
+                emit(); throw new Error(syncError);
+            }
+            const userMessage = code && !code.startsWith('messages_') && /[\u3400-\u9fff]/u.test(code) ? code
+                : code === 'messages_contact_exists' ? '通讯录里已经有这个人了。'
+                : code === 'messages_busy' ? '上一项操作还没完成，请稍候。'
+                    : code.startsWith('messages_invalid') ? '请检查输入内容和长度。'
+                        : code === 'messages_projection_closed' ? messageSyncCopy.closed
+                            : message.type === 'messages/settings' || message.type === 'messages/dismiss-sync-notice' ? messageSyncCopy.settingsFailed
+                                : '操作未完成，已保存的消息会保留，请稍后重试。';
+            if (isCurrentRequest()) {localError = userMessage; emit();}
+            throw new Error(userMessage);
+        }
+    }
+    function deactivate() {activation = null; pageIdentity = ''; media.cancelAll();}
+    return {
+        emit, handleMessage,
+        activate(current) {
+            activation = current; pageIdentity = deps.identity();
+            void service.refresh().then(emit).catch(cause => {console.warn('[LittleWhiteBox] 信息读取失败', cause); localError = '通讯记录暂时无法读取，请重试。'; emit();});
+            return state();
+        },
+        deactivate, cancelForeground: deactivate, handleWindowClosed: deactivate,
+        cancelAll() {chatBoundary++; runtime.cancel(); deactivate();},
+        handleChatChanged() {chatBoundary++; runtime.reset(); timeline.reset(); localError = ''; syncError = ''; recoveryBlocked = false; deactivate();},
+        startBackground() {
+            if (cleanups.length) {return;}
+            cleanups = [service.subscribe(emit), service.subscribeFile(emit), deps.subscribeSettings(emit),
+                deps.subscribeGeneration(active => {if (active) {runtime.cancel();} emit();}),
+                deps.subscribeChat(() => {
+                    viewBoundary++;
+                    runtime.cancel();
+                    const closed = timeline.observe();
+                    const boundary = chatBoundary; const identity = deps.identity();
+                    // Sealing records an already observed fact. Subsequent edit/render
+                    // events or generation must not cancel it like an unfinished reply.
+                    const guard = () => !!identity && chatBoundary === boundary && deps.identity() === identity;
+                    if (closed.length) {void timeline.seal(closed, guard).catch(cause => console.warn('[LittleWhiteBox] 通讯时点封存待确认', cause));}
+                    emit();
+                })];
+        },
+        async stopBackground() {chatBoundary++; cleanups.forEach(cleanup => cleanup()); cleanups = []; deactivate(); await runtime.stop();},
+    };
+}

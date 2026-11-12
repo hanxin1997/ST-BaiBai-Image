@@ -1,0 +1,1309 @@
+import OpenAI from 'openai';
+import { resolveAgentAuth } from '../provider-auth.js';
+import { requireResponseCompletion } from '../runtime/response-completion.js';
+import {
+    getLastUserMessageIndex,
+    shouldPreserveHistoricalReasoning,
+    shouldReplayFullNativeMessage,
+} from './openai-compatible-replay-policy.js';
+import {
+    buildEffectiveReasoningConfig,
+    buildSdkRequestInspection,
+} from './request-inspection.js';
+import {
+    resolveModelFamily,
+    resolveTaskReasoning,
+    shouldOmitTemperatureForReasoning,
+} from '../reasoning-capabilities.js';
+import { isReasoningOutputVisible } from '../reasoning-config.js';
+import {
+    extractLooseField,
+    findLooseKeyMatch,
+    repairLooseToolArguments,
+} from '../runtime/loose-tool-arguments.js';
+import {
+    findPartialTextToolStart,
+    findTextToolStart,
+    scanTextToolBlocks,
+} from './text-tool-protocol.js';
+
+function parseArgumentsForTaggedReplay(text) {
+    try {
+        return JSON.parse(text);
+    } catch {
+        // JSON.stringify will escape the failed call's original text in the replay envelope.
+        return text;
+    }
+}
+
+function pushThought(thoughts, label, text) {
+    const normalized = String(text || '').trim();
+    if (!normalized) return;
+    thoughts.push({
+        label,
+        text: normalized,
+    });
+}
+
+function cloneJson(value) {
+    if (value === undefined) return undefined;
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch {
+        return undefined;
+    }
+}
+
+// Opt-in, request-local diagnostics. Replay uses normalized tool calls, not this full snapshot.
+// Streaming callers receive the assembled assistant message, not individual SSE frames.
+export function captureRawAssistantMessage(task, message) {
+    return task.captureRawAssistantMessage === true
+        ? { rawAssistantMessage: cloneJson(message) }
+        : {};
+}
+
+function isPlainObject(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasTaggedToolCallStart(text = '') {
+    return !!findTextToolStart(String(text || ''));
+}
+
+function stringifyToolArguments(value) {
+    if (typeof value === 'string') return value;
+    if (value === undefined || value === null) return '{}';
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return '{}';
+    }
+}
+
+function normalizeTaggedToolArguments(argumentsValue, toolName = '') {
+    const text = stringifyToolArguments(argumentsValue);
+    try {
+        JSON.parse(text);
+        return text;
+    } catch {
+        // Keep unrecoverable text for tool-layer validation and corrective replay.
+        return repairLooseToolArguments(text, toolName) || text;
+    }
+}
+
+function extractLooseArgumentsTextFromToolPayload(payloadText = '') {
+    const source = String(payloadText || '');
+    const match = findLooseKeyMatch(source, 'arguments');
+    if (!match) return '';
+    let start = match.end;
+    while (/\s/.test(source[start] || '')) start += 1;
+    const first = source[start] || '';
+    if (first === '{') {
+        return source.slice(start).replace(/\}\s*$/, '').trimEnd();
+    }
+    if (first === '"') {
+        return source.slice(start + 1).replace(/"\s*\}\s*$/, '').trimEnd();
+    }
+    return source.slice(start).replace(/\}\s*$/, '').trimEnd();
+}
+
+function parseLooseTaggedToolPayload(payloadText = '') {
+    const source = String(payloadText || '').trim();
+    const name = extractLooseField(source, 'name', ['id', 'arguments'])
+        || extractLooseField(source, 'toolName', ['id', 'arguments'])
+        || '';
+    const id = extractLooseField(source, 'id', ['name', 'toolName', 'arguments']);
+    const argumentsText = extractLooseArgumentsTextFromToolPayload(source);
+    if (!name || !argumentsText) return null;
+    return {
+        id,
+        name,
+        arguments: normalizeTaggedToolArguments(argumentsText, name),
+    };
+}
+
+function normalizeToolCallForReplay(toolCall, index = 0, fallbackPrefix = 'openai-tool') {
+    if (!isPlainObject(toolCall)) return null;
+    const toolFunction = isPlainObject(toolCall.function) ? toolCall.function : null;
+    const name = String(toolFunction?.name || '').trim();
+    if (!name) return null;
+
+    const normalized = cloneJson(toolCall) || {};
+    delete normalized.index;
+    normalized.id = String(normalized.id || `${fallbackPrefix}-${index + 1}`);
+    normalized.type = 'function';
+    normalized.function = {
+        ...(cloneJson(toolFunction) || {}),
+        name,
+        arguments: stringifyToolArguments(toolFunction.arguments),
+    };
+    return normalized;
+}
+
+function normalizeToolCallsForReplay(toolCalls = [], fallbackPrefix = 'openai-tool') {
+    return (Array.isArray(toolCalls) ? toolCalls : [])
+        .map((toolCall, index) => normalizeToolCallForReplay(toolCall, index, fallbackPrefix))
+        .filter(Boolean);
+}
+
+function hasThoughtSignatureMatching(value, predicate) {
+    if (Array.isArray(value)) {
+        return value.some((item) => hasThoughtSignatureMatching(item, predicate));
+    }
+    if (!isPlainObject(value)) return false;
+    return Object.entries(value).some(([key, nestedValue]) => {
+        const normalizedKey = String(key || '').replace(/[_-]/g, '').toLowerCase();
+        if (normalizedKey === 'thoughtsignature') return predicate(nestedValue);
+        return (Array.isArray(nestedValue) || isPlainObject(nestedValue))
+            && hasThoughtSignatureMatching(nestedValue, predicate);
+    });
+}
+
+function hasThoughtSignature(value) {
+    return hasThoughtSignatureMatching(value, (signature) => (
+        typeof signature === 'string' && signature.length > 0
+    ));
+}
+
+function hasThoughtSignatureField(value) {
+    return hasThoughtSignatureMatching(value, () => true);
+}
+
+function hasInvalidThoughtSignature(value) {
+    return hasThoughtSignatureMatching(value, (signature) => (
+        typeof signature !== 'string' || signature.length === 0
+    ));
+}
+
+function hasSignedToolCalls(message = {}) {
+    return Array.isArray(message?.tool_calls)
+        && message.tool_calls.some((toolCall) => hasThoughtSignature(toolCall));
+}
+
+const warnedCorruptedSignedHistoryMessages = new WeakSet();
+
+function sanitizeOpenAICompatibleMessage(message) {
+    if (!isPlainObject(message)) return null;
+    const cloned = cloneJson(message) || {};
+    if (typeof cloned.content === 'string' && hasTaggedToolCallStart(cloned.content)) {
+        cloned.content = stripTaggedToolCallsForDisplay(extractThinkTaggedContent(cloned.content).cleaned);
+    }
+    if (Array.isArray(cloned.tool_calls)) {
+        const normalizedToolCalls = normalizeToolCallsForReplay(cloned.tool_calls);
+        if (normalizedToolCalls.length) {
+            cloned.tool_calls = normalizedToolCalls;
+        } else {
+            delete cloned.tool_calls;
+        }
+    }
+    return cloned;
+}
+
+export function buildToolCallResultsFromOpenAI(toolCalls = [], fallbackPrefix = 'openai-tool') {
+    return normalizeToolCallsForReplay(toolCalls, fallbackPrefix).map((item, index) => ({
+        id: item.id || `${fallbackPrefix}-${Date.now()}-${index + 1}`,
+        name: item.function.name,
+        arguments: item.function.arguments,
+    }));
+}
+
+export function flattenTextContent(content) {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    return content
+        .map((part) => {
+            if (!part) return '';
+            if (typeof part === 'string') return part;
+            return part.text || part.content || '';
+        })
+        .filter(Boolean)
+        .join('\n');
+}
+
+export function extractThinkTaggedContent(text = '') {
+    const thoughts = [];
+    const source = String(text || '');
+    let cursor = 0;
+    let cleaned = '';
+    for (const match of source.matchAll(/<think>([\s\S]*?)<\/think>/gi)) {
+        const toolStart = findTextToolStart(source, cursor);
+        if (toolStart && toolStart.index < match.index) break;
+        cleaned += source.slice(cursor, match.index);
+        pushThought(thoughts, '思考块', match[1]);
+        cursor = match.index + match[0].length;
+    }
+    cleaned = (cleaned + source.slice(cursor)).trim();
+    return {
+        cleaned,
+        thoughts,
+    };
+}
+
+export function stripTaggedToolCallsForDisplay(text = '', { streaming = false } = {}) {
+    const source = String(text || '');
+    const firstToolTag = findTextToolStart(source)?.index ?? (streaming ? findPartialTextToolStart(source) : -1);
+    if (firstToolTag < 0) return source.trim();
+    return source.slice(0, firstToolTag).trim();
+}
+
+export function buildTaggedToolCallDraft(text = '') {
+    const source = String(text || '');
+    if (!hasTaggedToolCallStart(source)) return [];
+    const start = findTextToolStart(source);
+    const body = source.slice(start.index);
+    const nameMatch = /^<tool_call/i.test(start[0])
+        ? body.match(/["']?name["']?\s*:\s*["']([^"']+)/i)
+        : body.match(/<[｜|]+DSML[｜|]+\s*invoke\s+name="([^"]+)"/i);
+    return [{
+        id: 'tagged-json-draft',
+        name: nameMatch?.[1] || '工具调用',
+        arguments: '{}',
+        draft: true,
+    }];
+}
+
+function collectThoughtsFromUnknown(thoughts, value, label) {
+    if (!value) return;
+    if (typeof value === 'string') {
+        pushThought(thoughts, label, value);
+        return;
+    }
+    if (Array.isArray(value)) {
+        value.forEach((item) => collectThoughtsFromUnknown(thoughts, item, label));
+        return;
+    }
+    if (typeof value !== 'object') return;
+
+    if (typeof value.text === 'string') {
+        pushThought(thoughts, label, value.text);
+    }
+    if (typeof value.content === 'string') {
+        pushThought(thoughts, label, value.content);
+    }
+    if (typeof value.reasoning_content === 'string') {
+        pushThought(thoughts, label, value.reasoning_content);
+    }
+    if (typeof value.thinking === 'string') {
+        pushThought(thoughts, label, value.thinking);
+    }
+
+    if (Array.isArray(value.summary)) {
+        value.summary.forEach((item) => {
+            if (typeof item === 'string') {
+                pushThought(thoughts, '推理摘要', item);
+                return;
+            }
+            if (item && typeof item === 'object') {
+                pushThought(thoughts, '推理摘要', item.text || item.content || '');
+            }
+        });
+    }
+}
+
+export function extractThoughtsFromMessage(message = {}, choice = {}) {
+    const thoughts = [];
+
+    collectThoughtsFromUnknown(thoughts, message.reasoning_content, '推理文本');
+    collectThoughtsFromUnknown(thoughts, message.reasoning, '推理文本');
+    collectThoughtsFromUnknown(thoughts, message.reasoning_text, '推理文本');
+    collectThoughtsFromUnknown(thoughts, message.thinking, '思考块');
+    collectThoughtsFromUnknown(thoughts, choice.reasoning_content, '推理文本');
+    collectThoughtsFromUnknown(thoughts, choice.reasoning, '推理文本');
+
+    if (Array.isArray(message.content)) {
+        message.content.forEach((part) => {
+            if (!part || typeof part !== 'object') return;
+            if (part.type === 'reasoning_text') {
+                pushThought(thoughts, '推理文本', part.text);
+                return;
+            }
+            if (part.type === 'summary_text') {
+                pushThought(thoughts, '推理摘要', part.text);
+                return;
+            }
+            if (part.type === 'thinking' || part.type === 'reasoning' || part.type === 'reasoning_content') {
+                pushThought(thoughts, '思考块', part.text || part.content || part.reasoning || '');
+            }
+        });
+    }
+
+    return thoughts;
+}
+
+export function extractTaggedToolCalls(content = '') {
+    const source = String(content || '');
+    const results = [];
+
+    scanTextToolBlocks(source).forEach((block) => {
+        if (block.calls) {
+            results.push(...block.calls);
+            return;
+        }
+        try {
+            const parsed = JSON.parse(block.payload);
+            results.push({
+                id: parsed.id,
+                name: String(parsed.name || ''),
+                arguments: normalizeTaggedToolArguments(parsed.arguments, parsed.name),
+            });
+        } catch {
+            const repaired = parseLooseTaggedToolPayload(block.payload);
+            if (repaired) results.push(repaired);
+        }
+    });
+    const calls = results.filter((item) => item.name);
+    const usedIds = new Set(calls.filter(item => item.id).map(item => String(item.id)));
+    return calls.map((call, index) => {
+        if (call.id) return call;
+        let number = index + 1;
+        while (usedIds.has(`tool-call-${number}`)) number += 1;
+        const id = `tool-call-${number}`;
+        usedIds.add(id);
+        return { ...call, id };
+    });
+}
+
+export function extractResponseTaggedToolCalls(task, content, message, requestInspection) {
+    try {
+        return extractTaggedToolCalls(content);
+    } catch (error) {
+        Object.assign(error, captureRawAssistantMessage(task, message));
+        if (requestInspection) error.requestInspection = requestInspection;
+        throw error;
+    }
+}
+
+function normalizeOpenAICompatibleMessage(message) {
+    const preserved = message?.providerPayload?.openaiCompatibleMessage;
+    if (!preserved || typeof preserved !== 'object' || Array.isArray(preserved)) {
+        return null;
+    }
+    return sanitizeOpenAICompatibleMessage(preserved);
+}
+
+function getReplayableToolCalls(message = {}) {
+    const topLevelToolCalls = normalizeToolCallsForReplay(message?.tool_calls);
+    if (topLevelToolCalls.length) return topLevelToolCalls;
+    const preserved = normalizeOpenAICompatibleMessage(message);
+    const preservedToolCalls = normalizeToolCallsForReplay(preserved?.tool_calls);
+    if (preservedToolCalls.length) return preservedToolCalls;
+    return [];
+}
+
+function shouldForceDeepSeekReasoningContent(model = '') {
+    return /deepseek/i.test(String(model || ''));
+}
+
+export function isClaudeLikeModel(model = '') {
+    return /claude/i.test(String(model || ''));
+}
+
+function usesMaxCompletionTokens(model = '') {
+    return resolveModelFamily(model) === 'openai';
+}
+
+export function applyOpenAICompatibleReasoningControls(body = {}, reasoning = {}) {
+    if (reasoning.mode !== 'on' && reasoning.mode !== 'off') return body;
+
+    if (reasoning.profileId === 'kimi-k3') {
+        body.reasoning_effort = reasoning.mode === 'off' ? 'off' : reasoning.effort;
+        return body;
+    }
+    if (reasoning.profileId === 'deepseek-thinking') {
+        body.thinking = { type: reasoning.mode === 'off' ? 'disabled' : 'enabled' };
+        if (reasoning.mode === 'on') body.reasoning_effort = reasoning.effort;
+        return body;
+    }
+    if (String(reasoning.profileId || '').startsWith('openai-')) {
+        body.reasoning_effort = reasoning.mode === 'off' ? 'none' : reasoning.effort;
+    }
+    return body;
+}
+
+export function normalizeFinalClaudeLikeMessageRole(messages = [], model = '') {
+    if (!isClaudeLikeModel(model)) return messages;
+    let finalRoleIndex = -1;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (typeof messages[index]?.role === 'string') {
+            finalRoleIndex = index;
+            break;
+        }
+    }
+    const finalRole = messages[finalRoleIndex]?.role;
+    if (finalRoleIndex < 0 || finalRole === 'user') return messages;
+    if (finalRole !== 'system' && finalRole !== 'assistant') return messages;
+    return messages.map((message, index) => (
+        index === finalRoleIndex
+            ? { ...message, role: 'user' }
+            : message
+    ));
+}
+
+function ensureReasoningContentForToolCalls(message, model = '') {
+    if (!isPlainObject(message)) return message;
+    if (!shouldForceDeepSeekReasoningContent(model)) return message;
+    if (!Array.isArray(message.tool_calls) || !message.tool_calls.length) return message;
+    if (Object.prototype.hasOwnProperty.call(message, 'reasoning_content')) {
+        return message;
+    }
+    return {
+        ...message,
+        reasoning_content: '',
+    };
+}
+
+const APPENDABLE_STRING_FIELDS = new Set([
+    'content',
+    'refusal',
+    'arguments',
+    'reasoning_content',
+    'reasoning_text',
+    'thinking',
+    'text',
+]);
+
+function mergeToolCallArrays(existing = [], next = []) {
+    const merged = Array.isArray(existing)
+        ? existing.map((item) => cloneJson(item) || {})
+        : [];
+
+    (Array.isArray(next) ? next : []).forEach((item, index) => {
+        const normalizedItem = cloneJson(item) || {};
+        const targetIndex = Number.isInteger(Number(item?.index))
+            ? Number(item.index)
+            : index;
+        const current = merged[targetIndex];
+        merged[targetIndex] = isPlainObject(current)
+            ? mergeReplayValue(current, normalizedItem, 'tool_call')
+            : normalizedItem;
+    });
+
+    return merged.filter((item) => item !== undefined);
+}
+
+function mergeReplayValue(existing, next, fieldName = '') {
+    if (next === undefined) return existing;
+    if (existing === undefined) {
+        return cloneJson(next);
+    }
+    if (next === null && APPENDABLE_STRING_FIELDS.has(String(fieldName || ''))) {
+        return existing;
+    }
+    if (fieldName === 'tool_calls' && Array.isArray(existing) && Array.isArray(next)) {
+        return mergeToolCallArrays(existing, next);
+    }
+    if (typeof existing === 'string' && typeof next === 'string') {
+        if (APPENDABLE_STRING_FIELDS.has(String(fieldName || ''))) {
+            if (existing === next) return existing;
+            if (next.startsWith(existing)) return next;
+            if (existing.startsWith(next)) return existing;
+            return `${existing}${next}`;
+        }
+        return existing === next ? existing : cloneJson(next);
+    }
+    if (Array.isArray(existing) && Array.isArray(next)) {
+        return existing.concat(cloneJson(next) || []);
+    }
+    if (isPlainObject(existing) && isPlainObject(next)) {
+        const merged = { ...existing };
+        Object.entries(next).forEach(([key, value]) => {
+            merged[key] = mergeReplayValue(merged[key], value, key);
+        });
+        return merged;
+    }
+    return cloneJson(next);
+}
+
+export function buildReplayableAssistantMessage(message = {}, choice = {}) {
+    const replayableMessage = isPlainObject(message)
+        ? (cloneJson(message) || {})
+        : {};
+    const choiceExtras = isPlainObject(choice)
+        ? (cloneJson(choice) || {})
+        : {};
+
+    delete choiceExtras.message;
+    delete choiceExtras.finish_reason;
+    delete choiceExtras.index;
+    delete choiceExtras.logprobs;
+    delete choiceExtras.delta;
+
+    Object.entries(choiceExtras).forEach(([key, value]) => {
+        replayableMessage[key] = mergeReplayValue(replayableMessage[key], value, key);
+    });
+
+    if (!replayableMessage.role) {
+        replayableMessage.role = 'assistant';
+    }
+
+    return sanitizeOpenAICompatibleMessage(replayableMessage) || { role: 'assistant' };
+}
+
+export function buildProviderPayload(message, choice = {}) {
+    const preserved = sanitizeOpenAICompatibleMessage(buildReplayableAssistantMessage(message, choice));
+    if (!preserved || typeof preserved !== 'object' || Array.isArray(preserved)) {
+        return undefined;
+    }
+    return {
+        openaiCompatibleMessage: preserved,
+    };
+}
+
+export function mergeReplayMessages(existing = {}, next = {}) {
+    if (!isPlainObject(existing)) return cloneJson(next);
+    if (!isPlainObject(next)) return cloneJson(existing);
+    return mergeReplayValue(cloneJson(existing) || {}, next, '');
+}
+
+export function buildNativeMessages(task, model = '', { preserveReasoningContent = false } = {}) {
+    const sourceMessages = Array.isArray(task.messages) ? task.messages : [];
+    const lastUserIndex = getLastUserMessageIndex(sourceMessages);
+    const normalizedMessages = [];
+    let skipCorruptedToolResults = false;
+
+    sourceMessages.forEach((message, index) => {
+        if (skipCorruptedToolResults) {
+            if (message?.role === 'tool') return;
+            skipCorruptedToolResults = false;
+        }
+
+        const isAssistantMessage = message?.role === 'assistant';
+        const rawPreserved = isAssistantMessage
+            ? message?.providerPayload?.openaiCompatibleMessage
+            : null;
+        const rawSignedToolCalls = Array.isArray(rawPreserved?.tool_calls)
+            && rawPreserved.tool_calls.some((toolCall) => hasThoughtSignatureField(toolCall))
+            ? rawPreserved.tool_calls
+            : (isAssistantMessage && Array.isArray(message?.tool_calls)
+                && message.tool_calls.some((toolCall) => hasThoughtSignatureField(toolCall))
+                    ? message.tool_calls
+                    : null);
+        const signedBatchCorruption = findSignedToolCallBatchCorruption(rawSignedToolCalls);
+        if (signedBatchCorruption) {
+            const warningOwner = isPlainObject(rawPreserved) ? rawPreserved : message;
+            if (!isPlainObject(warningOwner) || !warnedCorruptedSignedHistoryMessages.has(warningOwner)) {
+                if (isPlainObject(warningOwner)) {
+                    warnedCorruptedSignedHistoryMessages.add(warningOwner);
+                }
+                console.warn('[LittleWhiteBox/OpenAI-compatible] skipped corrupted signed tool-call history', {
+                    code: 'openai_compatible_signed_tool_call_history_corrupted',
+                    toolIndex: signedBatchCorruption.index,
+                    toolName: signedBatchCorruption.toolName,
+                    reason: signedBatchCorruption.reason,
+                });
+            }
+            skipCorruptedToolResults = true;
+            return;
+        }
+
+        const topLevelToolCalls = isAssistantMessage
+            ? normalizeToolCallsForReplay(message?.tool_calls)
+            : [];
+        const preserved = isAssistantMessage ? normalizeOpenAICompatibleMessage(message) : null;
+        const preservedToolCalls = Array.isArray(preserved?.tool_calls) ? preserved.tool_calls : [];
+        // 签名调用必须原样回放（含 id 与 extra_content），不能被上层重建的 tool_calls 覆盖。
+        const hasPreservedSignedToolCalls = preservedToolCalls.length > 0 && hasSignedToolCalls(preserved);
+
+        // Replay the full provider message within the current tool loop. Earlier turns
+        // normally keep only content/tool calls; the direct DeepSeek thinking adapter
+        // separately retains reasoning_content below, including text-only replies.
+        if (shouldReplayFullNativeMessage(preserved, index, lastUserIndex)) {
+            normalizedMessages.push(ensureReasoningContentForToolCalls({
+                ...preserved,
+                ...(topLevelToolCalls.length && !hasPreservedSignedToolCalls ? {
+                    tool_calls: topLevelToolCalls,
+                } : {}),
+            }, model));
+            return;
+        }
+
+        const baseMessage = {
+            role: message.role,
+            content: message.content,
+        };
+
+        if (preserveReasoningContent && typeof preserved?.reasoning_content === 'string') {
+            baseMessage.reasoning_content = preserved.reasoning_content;
+        }
+
+        if (message.role === 'tool' && message.tool_call_id) {
+            baseMessage.tool_call_id = message.tool_call_id;
+        }
+
+        if (hasPreservedSignedToolCalls) {
+            baseMessage.tool_calls = preservedToolCalls;
+        } else if (topLevelToolCalls.length) {
+            baseMessage.tool_calls = topLevelToolCalls;
+        }
+
+        normalizedMessages.push(ensureReasoningContentForToolCalls(baseMessage, model));
+    });
+
+    const systemPrompt = String(task.systemPrompt || '').trim();
+    if (systemPrompt) {
+        if (normalizedMessages[0]?.role === 'system') {
+            const firstSystemContent = String(normalizedMessages[0].content || '').trim();
+            normalizedMessages[0] = {
+                ...normalizedMessages[0],
+                content: [systemPrompt, firstSystemContent === systemPrompt ? '' : firstSystemContent]
+                    .filter(Boolean)
+                    .join('\n\n'),
+            };
+        } else {
+            normalizedMessages.unshift({
+                role: 'system',
+                content: systemPrompt,
+            });
+        }
+    }
+
+    return normalizeFinalClaudeLikeMessageRole(normalizedMessages, model);
+}
+
+function buildTaggedProtocolPrompt(task) {
+    const toolDescriptions = (task.tools || []).map((tool) => [
+        `- ${tool.function.name}: ${tool.function.description || ''}`.trim(),
+        `  参数 JSON Schema: ${JSON.stringify(tool.function.parameters || {})}`,
+    ].join('\n')).join('\n');
+
+    const toolChoice = String(task.toolChoice || 'auto').trim() || 'auto';
+    const toolChoiceInstruction = toolChoice === 'required'
+        ? '本轮必须调用工具，不得只返回正文。'
+        : toolChoice === 'none'
+            ? '本轮不得调用工具，不得输出 <tool_call> 标签。'
+            : toolChoice === 'auto'
+                ? '请根据任务判断是否需要调用工具。'
+                : `本轮必须调用工具 ${toolChoice}，不得调用其他工具，也不得只返回正文。`;
+
+    return [
+        task.systemPrompt || '',
+        '如果你需要调用工具，不要使用原生 tool calling 字段。',
+        toolChoiceInstruction,
+        '用 <tool_call> 和 </tool_call> 明确 JSON 范围，请严格输出如下边界标记和包裹的 JSON，不要改写边界标记：',
+        '<tool_call>{"name":"工具名","arguments":{...}}</tool_call>',
+        '如果需要多个工具调用，可以连续输出多段 <tool_call> ... </tool_call>。',
+        '在输出第一个 <tool_call> 之前，可根据任务复杂度决定是否需要先说明：简单查询可直接输出 <tool_call>；复杂任务可先简要说明你准备查什么或怎么查。',
+        '一旦开始输出第一个 <tool_call>，就不要再继续输出面向用户的正文、解释、总结或补充；把本轮需要的 tool_call 连续输出完就结束。',
+        toolDescriptions ? `可用工具:\n${toolDescriptions}` : '',
+    ].filter(Boolean).join('\n\n');
+}
+
+export function buildTaggedMessages(task, model = '') {
+    const toolNameById = new Map();
+    const messages = [];
+    const sourceMessages = Array.isArray(task.messages) ? task.messages : [];
+
+    sourceMessages.forEach((message) => {
+        if (message.role === 'assistant') {
+            const toolCalls = getReplayableToolCalls(message);
+            if (toolCalls.length) {
+                const preserved = normalizeOpenAICompatibleMessage(message);
+                const content = typeof preserved?.content === 'string'
+                    ? preserved.content
+                    : String(message.content || '');
+                const taggedBlocks = toolCalls.map((toolCall, index) => {
+                    const toolName = toolCall.function?.name || '';
+                    const toolId = toolCall.id || `tool-call-${index + 1}`;
+                    if (toolName) {
+                        toolNameById.set(toolId, toolName);
+                    }
+                    return `<tool_call>${JSON.stringify({
+                        id: toolId,
+                        name: toolName,
+                        arguments: parseArgumentsForTaggedReplay(toolCall.function.arguments),
+                    })}</tool_call>`;
+                }).join('\n');
+
+                messages.push({
+                    role: 'assistant',
+                    content: [content, taggedBlocks].filter(Boolean).join('\n\n'),
+                });
+                return;
+            }
+        }
+
+        if (message.role === 'tool') {
+            const toolName = String(message.toolName || message.tool_name || '').trim()
+                || toolNameById.get(message.tool_call_id || '')
+                || 'unknown_tool';
+            if (message.tool_call_id) toolNameById.delete(message.tool_call_id);
+            const toolContent = String(message.content || '');
+            messages.push({
+                role: 'user',
+                content: [
+                    '<tool_result>',
+                    '这是系统工具执行结果，不是用户新发言。',
+                    `name: ${toolName}`,
+                    'content:',
+                    toolContent,
+                    '</tool_result>',
+                ].join('\n'),
+            });
+            return;
+        }
+
+        messages.push({
+            role: message.role,
+            content: message.content,
+        });
+    });
+
+    if (!messages.length || messages[0].role !== 'system') {
+        messages.unshift({
+            role: 'system',
+            content: buildTaggedProtocolPrompt(task),
+        });
+    } else {
+        const firstSystemContent = String(messages[0].content || '').trim();
+        const staticSystemPrompt = String(task.systemPrompt || '').trim();
+        messages[0] = {
+            ...messages[0],
+            content: [
+                buildTaggedProtocolPrompt(task),
+                firstSystemContent === staticSystemPrompt ? '' : firstSystemContent,
+            ].filter(Boolean).join('\n\n'),
+        };
+    }
+
+    return normalizeFinalClaudeLikeMessageRole(messages, model);
+}
+
+function emitStreamProgress(task, payload, effectiveReasoning) {
+    if (typeof task.onStreamProgress !== 'function') return;
+    task.onStreamProgress({
+        ...(typeof payload.text === 'string' ? { text: payload.text } : {}),
+        ...(Array.isArray(payload.thoughts)
+            ? { thoughts: isReasoningOutputVisible(effectiveReasoning) ? payload.thoughts : [] }
+            : {}),
+        ...(Array.isArray(payload.toolCalls) ? { toolCalls: payload.toolCalls } : {}),
+        ...(payload.toolCallDraft ? { toolCallDraft: true } : {}),
+    });
+}
+
+function visibleThoughts(effectiveReasoning, thoughts = []) {
+    return isReasoningOutputVisible(effectiveReasoning) ? thoughts : [];
+}
+
+export function summarizeReplayMessageForDebug(message) {
+    const normalized = isPlainObject(message) ? message : {};
+    return {
+        role: normalized.role || '',
+        keys: Object.keys(normalized).sort(),
+        hasReasoningContent: typeof normalized.reasoning_content === 'string' && normalized.reasoning_content.length > 0,
+        hasReasoning: !!normalized.reasoning,
+        hasThinking: !!normalized.thinking,
+        toolCallCount: Array.isArray(normalized.tool_calls) ? normalized.tool_calls.length : 0,
+        contentPreview: typeof normalized.content === 'string'
+            ? normalized.content.slice(0, 120)
+            : '',
+    };
+}
+
+function appendStreamField(target, key, value) {
+    if (!target || !key || value === undefined) return;
+    target[key] = mergeReplayValue(target[key], value, key);
+}
+
+// 流式增量必须原样拼接：mergeReplayValue 的前缀去重是给「累积快照 + 最终完整消息」合并用的，
+// 用在逐块增量上会把 "哈" + "哈" 这类重复分片吞掉。
+function appendStreamDeltaField(target, key, value) {
+    if (!target || !key || value === undefined) return;
+    if (isPlainObject(value)) {
+        const nestedTarget = isPlainObject(target[key]) ? { ...target[key] } : {};
+        Object.entries(value).forEach(([nestedKey, nestedValue]) => {
+            appendStreamDeltaField(nestedTarget, nestedKey, nestedValue);
+        });
+        target[key] = nestedTarget;
+        return;
+    }
+    if (typeof value === 'string' && APPENDABLE_STRING_FIELDS.has(key)) {
+        target[key] = typeof target[key] === 'string' ? `${target[key]}${value}` : value;
+        return;
+    }
+    // 续传增量里的空字符串（常见于 tool_calls[].id/type）不携带信息，不能覆盖首块给出的值。
+    if (value === '' && target[key]) return;
+    appendStreamField(target, key, value);
+}
+
+function appendStreamToolCalls(target, toolCalls = []) {
+    if (!Array.isArray(toolCalls) || !toolCalls.length) return;
+    if (!Array.isArray(target.tool_calls)) {
+        target.tool_calls = [];
+    }
+    toolCalls.forEach((toolCallDelta) => {
+        const index = Number(toolCallDelta?.index ?? 0);
+        const current = target.tool_calls[index] || {};
+        const nextToolCall = { ...current };
+
+        Object.entries(toolCallDelta || {}).forEach(([key, value]) => {
+            if (key === 'index') return;
+            if (key === 'function' && (value === null || value === undefined)) return;
+            if (key === 'function' && isPlainObject(value)) {
+                nextToolCall.function = isPlainObject(nextToolCall.function)
+                    ? { ...nextToolCall.function }
+                    : {};
+                Object.entries(value).forEach(([fnKey, fnValue]) => {
+                    appendStreamDeltaField(nextToolCall.function, fnKey, fnValue);
+                });
+                return;
+            }
+            appendStreamDeltaField(nextToolCall, key, value);
+        });
+
+        target.tool_calls[index] = nextToolCall;
+    });
+}
+
+export function accumulateStreamedAssistantSnapshot(target, choice = {}) {
+    if (!target || !choice || typeof choice !== 'object') return;
+
+    Object.entries(choice).forEach(([key, value]) => {
+        if (key === 'delta' || key === 'finish_reason' || key === 'index' || key === 'logprobs') return;
+        appendStreamField(target, key, value);
+    });
+
+    const delta = isPlainObject(choice.delta) ? choice.delta : {};
+    Object.entries(delta).forEach(([key, value]) => {
+        if (key === 'tool_calls') {
+            appendStreamToolCalls(target, value);
+            return;
+        }
+        appendStreamDeltaField(target, key, value);
+    });
+}
+
+// 流式响应只维护 assistantSnapshot 这一份完整快照：可执行的 toolCalls 与回放用的
+// providerPayload 都从它派生，避免两套累加器在数量/内容上分叉。
+export function getStreamedSnapshotText(assistantSnapshot = {}) {
+    return flattenTextContent(assistantSnapshot?.content);
+}
+
+export function getStreamedSnapshotToolCalls(assistantSnapshot = {}) {
+    return buildToolCallResultsFromOpenAI(assistantSnapshot?.tool_calls || []);
+}
+
+function isRestorableToolArguments(rawArguments) {
+    // 签名绑定的是供应商返回的原始调用；对象在这里再 stringify 虽能生成合法 JSON，
+    // 却已经不是被签名的字节序列。未签名调用仍由 normalizeToolCallForReplay 宽松归一化。
+    if (typeof rawArguments !== 'string' || !rawArguments.trim()) return false;
+    try {
+        return isPlainObject(JSON.parse(rawArguments));
+    } catch {
+        return false;
+    }
+}
+
+function findSignedToolCallBatchCorruption(toolCalls) {
+    if (!Array.isArray(toolCalls)
+        || !toolCalls.some((toolCall) => hasThoughtSignatureField(toolCall))) {
+        return null;
+    }
+
+    for (let index = 0; index < toolCalls.length; index += 1) {
+        const toolCall = toolCalls[index];
+        const toolFunction = isPlainObject(toolCall?.function) ? toolCall.function : null;
+        const toolName = String(toolFunction?.name || '').trim();
+        let reason = '';
+        if (!isPlainObject(toolCall) || !toolFunction) {
+            reason = 'invalid_function_shape';
+        } else if (!toolName) {
+            reason = 'missing_function_name';
+        } else if (!isRestorableToolArguments(toolFunction.arguments)) {
+            reason = 'invalid_function_arguments';
+        } else if (hasInvalidThoughtSignature(toolCall)) {
+            reason = 'invalid_thought_signature';
+        }
+        if (reason) {
+            return { index, toolName, reason };
+        }
+    }
+    return null;
+}
+
+/**
+ * thoughtSignature 约束整个并行调用批次，而不只是携带签名的那一项。
+ * 必须在任何补默认值或过滤无效调用之前校验原始批次；一旦结构或参数损坏，
+ * 唯一安全的处理是以失败结束本轮，绝不能先执行再留下无法回放的历史；用户或调用方
+ * 可以随后重新发起请求，但这里不承诺也不触发自动重试。
+ */
+export function assertSignedToolCallsIntact(assistantSnapshot = {}) {
+    const corrupted = findSignedToolCallBatchCorruption(assistantSnapshot?.tool_calls);
+    if (!corrupted) return;
+    const error = new Error('openai_compatible_signed_tool_call_corrupted');
+    error.toolIndex = corrupted.index;
+    error.toolName = corrupted.toolName;
+    error.reason = corrupted.reason;
+    throw error;
+}
+
+async function readSseEventsFromResponse(response, onEvent) {
+    const reader = response.body?.getReader?.();
+    if (!reader) {
+        throw new Error('openai_compatible_stream_missing_body');
+    }
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const boundaryPattern = /\r?\n\r?\n/;
+
+    const consume = (rawEvent) => {
+        const data = rawEvent
+            .split(/\r?\n/)
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart())
+            .join('\n')
+            .trim();
+        if (data && data !== '[DONE]') {
+            onEvent(JSON.parse(data));
+        }
+    };
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            while (true) {
+                const boundaryMatch = buffer.match(boundaryPattern);
+                if (!boundaryMatch || typeof boundaryMatch.index !== 'number') break;
+                const boundaryIndex = boundaryMatch.index;
+                const rawEvent = buffer.slice(0, boundaryIndex);
+                buffer = buffer.slice(boundaryIndex + boundaryMatch[0].length);
+                consume(rawEvent);
+            }
+        }
+
+        const trailing = buffer.trim();
+        if (trailing) consume(trailing);
+    } catch (error) {
+        try {
+            await reader.cancel();
+        } catch {
+            // A failed stream can also reject cancellation; preserve the original failure.
+        }
+        throw error;
+    } finally {
+        reader.releaseLock();
+    }
+}
+
+function describeOpenAICompatibleHttpError(rawText, status) {
+    const source = String(rawText || '').trim();
+    if (source && (source.startsWith('{') || source.startsWith('['))) {
+        try {
+            const payload = JSON.parse(source);
+            const message = payload?.error?.message || payload?.message;
+            if (typeof message === 'string' && message.trim()) {
+                return message.trim();
+            }
+        } catch {
+            // Keep the provider response below when it is not valid JSON.
+        }
+    }
+    return source || `OpenAI 兼容流式请求失败（HTTP ${status}）`;
+}
+
+export class OpenAICompatibleAdapter {
+    constructor(config) {
+        this.config = config;
+        this.auth = resolveAgentAuth('openai-compatible', config.apiKey);
+        this.client = new OpenAI({
+            ...this.auth.sdkOptions,
+            baseURL: String(config.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, ''),
+            timeout: Number(config.timeoutMs) || 15 * 60 * 1000,
+            maxRetries: 0,
+            dangerouslyAllowBrowser: true,
+        });
+    }
+
+    buildRequestBody(
+        task,
+        effectiveReasoning = resolveTaskReasoning('openai-compatible', this.config, task.reasoning),
+    ) {
+        const reasoning = effectiveReasoning;
+        const toolMode = this.config.toolMode || 'native';
+        const isTaggedMode = toolMode === 'tagged-json' && Array.isArray(task.tools) && task.tools.length > 0;
+        const nativeTools = !isTaggedMode && Array.isArray(task.tools) && task.tools.length
+            ? task.tools
+            : null;
+        const deepSeekThinkingWithTools = shouldPreserveHistoricalReasoning(
+            { ...this.config, provider: 'openai-compatible' }, nativeTools, reasoning,
+        );
+        const body = {
+            model: this.config.model,
+            messages: isTaggedMode ? buildTaggedMessages(task, this.config.model) : buildNativeMessages(task, this.config.model, {
+                preserveReasoningContent: deepSeekThinkingWithTools,
+            }),
+            ...(nativeTools ? { tools: nativeTools, tool_choice: task.toolChoice || 'auto' } : {}),
+            ...(task.maxTokens
+                ? (usesMaxCompletionTokens(this.config.model)
+                    ? { max_completion_tokens: task.maxTokens }
+                    : { max_tokens: task.maxTokens })
+                : {}),
+        };
+        // Inherit can enable thinking too. Only an explicit off permits forced tools;
+        // the separate SillyTavern adapter cannot guarantee delivery of that control.
+        if (deepSeekThinkingWithTools && (body.tool_choice === 'required' || body.tool_choice?.type === 'function')) {
+            body.tool_choice = 'auto';
+        }
+        if (!shouldOmitTemperatureForReasoning(
+            { ...this.config, provider: 'openai-compatible' },
+            reasoning,
+        ) && typeof task.temperature === 'number') {
+            body.temperature = task.temperature;
+        }
+        return applyOpenAICompatibleReasoningControls(body, reasoning);
+    }
+
+    inspectRequest(task, options = {}) {
+        const stream = typeof task.onStreamProgress === 'function';
+        const effectiveReasoning = options.effectiveReasoning
+            || resolveTaskReasoning('openai-compatible', this.config, task.reasoning);
+        const body = {
+            ...(options.body || this.buildRequestBody(task, effectiveReasoning)),
+            ...(stream ? { stream: true } : {}),
+        };
+        const baseUrl = String(this.config.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
+        const controlFields = {
+            ...(Object.hasOwn(body, 'reasoning_effort') ? { reasoning_effort: body.reasoning_effort } : {}),
+            ...(Object.hasOwn(body, 'thinking') ? { thinking: body.thinking } : {}),
+        };
+        return {
+            ...buildSdkRequestInspection({
+                provider: 'openai-compatible',
+                model: this.config.model,
+                transport: 'openai-compatible',
+                url: `${baseUrl}/chat/completions`,
+                headers: this.auth.requestHeaders,
+                body,
+                sdk: stream
+                    ? 'client.chat.completions.create(..., { stream: true })'
+                    : 'client.chat.completions.create',
+                effectiveConfig: {
+                    ...buildEffectiveReasoningConfig(task, {
+                        reasoning: effectiveReasoning,
+                        effort: body.reasoning_effort,
+                        controlFields,
+                    }),
+                    ...(body.tool_choice !== undefined ? { toolChoice: body.tool_choice } : {}),
+                },
+            }),
+        };
+    }
+
+    async streamNativeChatCompletions(task, body, effectiveReasoning) {
+        const url = `${String(this.config.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '')}/chat/completions`;
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: this.auth.requestHeaders,
+            body: JSON.stringify({
+                ...body,
+                stream: true,
+            }),
+            signal: task.signal,
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text().catch(() => '');
+            const error = new Error(describeOpenAICompatibleHttpError(errorText, response.status));
+            error.status = response.status;
+            error.body = errorText;
+            throw error;
+        }
+        const assistantSnapshot = {
+            role: 'assistant',
+        };
+        let lastFinishReason;
+        let lastModel = this.config.model;
+
+        await readSseEventsFromResponse(response, (payload) => {
+            if (payload?.error) {
+                // Match the SDK's tagged-stream error contract without inventing an HTTP status.
+                throw new OpenAI.APIError(undefined, payload.error, undefined, response.headers);
+            }
+            lastModel = payload?.model || lastModel;
+            const choice = payload?.choices?.[0];
+            accumulateStreamedAssistantSnapshot(assistantSnapshot, choice);
+            if (choice?.finish_reason) {
+                lastFinishReason = choice.finish_reason;
+            }
+
+            const thinkTagged = extractThinkTaggedContent(getStreamedSnapshotText(assistantSnapshot));
+            const standardToolCalls = getStreamedSnapshotToolCalls(assistantSnapshot);
+            const progressToolCalls = standardToolCalls.length
+                ? standardToolCalls
+                : buildTaggedToolCallDraft(thinkTagged.cleaned);
+            const cleanedText = standardToolCalls.length
+                ? thinkTagged.cleaned
+                : stripTaggedToolCallsForDisplay(thinkTagged.cleaned, { streaming: true });
+            emitStreamProgress(task, {
+                text: cleanedText,
+                thoughts: visibleThoughts(
+                    effectiveReasoning,
+                    extractThoughtsFromMessage(assistantSnapshot, choice).concat(thinkTagged.thoughts),
+                ),
+                ...(progressToolCalls.length ? { toolCalls: progressToolCalls } : {}),
+                ...(!standardToolCalls.length && progressToolCalls.length ? { toolCallDraft: true } : {}),
+            }, effectiveReasoning);
+        });
+
+        requireResponseCompletion('openai', lastFinishReason, !!assistantSnapshot.refusal, extractThinkTaggedContent(getStreamedSnapshotText(assistantSnapshot)).cleaned);
+        assertSignedToolCallsIntact(assistantSnapshot);
+        const providerPayload = buildProviderPayload(assistantSnapshot);
+        const standardToolCalls = getStreamedSnapshotToolCalls(assistantSnapshot);
+        const thinkTagged = extractThinkTaggedContent(getStreamedSnapshotText(assistantSnapshot));
+        const thoughts = extractThoughtsFromMessage(assistantSnapshot, {});
+        thinkTagged.thoughts.forEach((item) => thoughts.push(item));
+        const taggedToolCalls = standardToolCalls.length ? [] : extractResponseTaggedToolCalls(task, thinkTagged.cleaned, assistantSnapshot);
+        const toolCalls = [...standardToolCalls, ...taggedToolCalls];
+        const cleanedText = standardToolCalls.length
+            ? thinkTagged.cleaned
+            : stripTaggedToolCallsForDisplay(thinkTagged.cleaned);
+
+        return {
+            text: cleanedText,
+            toolCalls,
+            thoughts: visibleThoughts(effectiveReasoning, thoughts),
+            finishReason: lastFinishReason,
+            model: lastModel,
+            provider: 'openai-compatible',
+            providerPayload,
+            ...captureRawAssistantMessage(task, assistantSnapshot),
+        };
+    }
+
+    async chat(task) {
+        const effectiveReasoning = resolveTaskReasoning('openai-compatible', this.config, task.reasoning);
+        const toolMode = this.config.toolMode || 'native';
+        const isTaggedMode = toolMode === 'tagged-json' && Array.isArray(task.tools) && task.tools.length > 0;
+        const shouldUseStreaming = typeof task.onStreamProgress === 'function';
+        const body = this.buildRequestBody(task, effectiveReasoning);
+        const requestInspection = this.inspectRequest(task, { body, effectiveReasoning });
+        const createRequest = async (request) => {
+            try {
+                return await request(body);
+            } catch (error) {
+                if (error && typeof error === 'object') {
+                    error.requestInspection = requestInspection;
+                }
+                throw error;
+            }
+        };
+        if (shouldUseStreaming) {
+            if (!isTaggedMode) {
+                const result = await createRequest((requestBody) => (
+                    this.streamNativeChatCompletions(task, requestBody, effectiveReasoning)
+                ));
+                return {
+                    ...result,
+                    requestInspection,
+                };
+            }
+            const stream = await createRequest((requestBody) => this.client.chat.completions.create({
+                    ...requestBody,
+                    stream: true,
+                }, {
+                    signal: task.signal,
+                }));
+            const assistantSnapshot = {
+                role: 'assistant',
+            };
+            let lastFinishReason;
+            let lastModel = this.config.model;
+            let providerPayload;
+
+            for await (const chunk of stream) {
+                lastModel = chunk.model || lastModel;
+                const choice = chunk.choices?.[0];
+                accumulateStreamedAssistantSnapshot(assistantSnapshot, choice);
+                if (choice?.finish_reason) {
+                    lastFinishReason = choice.finish_reason;
+                }
+
+                const thinkTagged = extractThinkTaggedContent(getStreamedSnapshotText(assistantSnapshot));
+                const standardToolCalls = getStreamedSnapshotToolCalls(assistantSnapshot);
+                const progressToolCalls = standardToolCalls.length
+                    ? standardToolCalls
+                    : buildTaggedToolCallDraft(thinkTagged.cleaned);
+                const cleanedText = standardToolCalls.length
+                    ? thinkTagged.cleaned
+                    : stripTaggedToolCallsForDisplay(thinkTagged.cleaned, { streaming: true });
+                emitStreamProgress(task, {
+                    text: cleanedText,
+                    thoughts: visibleThoughts(
+                        effectiveReasoning,
+                        extractThoughtsFromMessage(assistantSnapshot, choice).concat(thinkTagged.thoughts),
+                    ),
+                    ...(progressToolCalls.length ? { toolCalls: progressToolCalls } : {}),
+                    ...(!standardToolCalls.length && progressToolCalls.length ? { toolCallDraft: true } : {}),
+                }, effectiveReasoning);
+            }
+            requireResponseCompletion('openai', lastFinishReason, !!assistantSnapshot.refusal, extractThinkTaggedContent(getStreamedSnapshotText(assistantSnapshot)).cleaned);
+            const finalCompletion = typeof stream.finalChatCompletion === 'function'
+                ? await stream.finalChatCompletion()
+                : null;
+            const finalChoice = finalCompletion?.choices?.[0] || null;
+            const finalMessage = finalChoice?.message || assistantSnapshot;
+            assertSignedToolCallsIntact(finalMessage);
+            const replayableFinalMessage = mergeReplayMessages(
+                assistantSnapshot,
+                buildReplayableAssistantMessage(finalMessage, finalChoice || {}),
+            );
+            assertSignedToolCallsIntact(replayableFinalMessage);
+            providerPayload = buildProviderPayload(replayableFinalMessage);
+            const standardToolCalls = getStreamedSnapshotToolCalls(replayableFinalMessage);
+            const thinkTagged = extractThinkTaggedContent(getStreamedSnapshotText(replayableFinalMessage));
+            const thoughts = extractThoughtsFromMessage(replayableFinalMessage, finalChoice || {});
+            thinkTagged.thoughts.forEach((item) => thoughts.push(item));
+            const taggedToolCalls = standardToolCalls.length ? [] : extractResponseTaggedToolCalls(task, thinkTagged.cleaned, finalMessage, requestInspection);
+            const toolCalls = [...standardToolCalls, ...taggedToolCalls];
+            const cleanedText = standardToolCalls.length
+                ? thinkTagged.cleaned
+                : stripTaggedToolCallsForDisplay(thinkTagged.cleaned);
+
+            return {
+                text: cleanedText,
+                toolCalls,
+                thoughts: visibleThoughts(effectiveReasoning, thoughts),
+                finishReason: lastFinishReason,
+                model: lastModel,
+                provider: 'openai-compatible',
+                providerPayload,
+                requestInspection,
+                ...captureRawAssistantMessage(task, finalMessage),
+            };
+        }
+
+        const response = await createRequest((requestBody) => this.client.chat.completions.create(requestBody, {
+                signal: task.signal,
+            }));
+
+        const choice = response.choices?.[0] || {};
+        const message = choice.message || {};
+        requireResponseCompletion('openai', choice.finish_reason, !!message.refusal, extractThinkTaggedContent(flattenTextContent(message.content)).cleaned);
+        assertSignedToolCallsIntact(message);
+        const thoughts = extractThoughtsFromMessage(message, choice);
+        const standardToolCalls = buildToolCallResultsFromOpenAI(message.tool_calls || []);
+        const contentText = flattenTextContent(message.content);
+        const thinkTagged = extractThinkTaggedContent(contentText);
+        thinkTagged.thoughts.forEach((item) => thoughts.push(item));
+        const taggedToolCalls = standardToolCalls.length ? [] : extractResponseTaggedToolCalls(task, thinkTagged.cleaned, message, requestInspection);
+        const toolCalls = [...standardToolCalls, ...taggedToolCalls];
+        const cleanedText = standardToolCalls.length
+            ? thinkTagged.cleaned
+            : stripTaggedToolCallsForDisplay(thinkTagged.cleaned);
+        const replayableMessage = buildReplayableAssistantMessage(message, choice);
+
+        return {
+            text: cleanedText,
+            toolCalls,
+            thoughts: visibleThoughts(effectiveReasoning, thoughts),
+            finishReason: choice.finish_reason,
+            model: response.model || this.config.model,
+            provider: 'openai-compatible',
+            providerPayload: buildProviderPayload(replayableMessage),
+            requestInspection,
+            ...captureRawAssistantMessage(task, message),
+        };
+    }
+}

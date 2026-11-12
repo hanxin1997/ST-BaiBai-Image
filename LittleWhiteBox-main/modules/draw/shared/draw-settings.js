@@ -1,0 +1,257 @@
+// 共享画图设置与 NovelAI Provider 设置共用现行 settings 根对象；此模块只拥有通用字段。
+const SERVER_FILE_KEY = 'settings';
+export const DEFAULT_SHARED_GALLERY_CACHE_DAYS = 3;
+
+// 图片标题显示模式：none 不显示 / overlay 图顶幼细悬浮条（默认）/ collapse 可点击折叠
+export const IMAGE_TITLE_MODES = Object.freeze(['none', 'overlay', 'collapse']);
+export const DEFAULT_IMAGE_TITLE_MODE = 'overlay';
+
+export function normalizeImageTitleMode(value, fallback = DEFAULT_IMAGE_TITLE_MODE) {
+    const mode = String(value || '').trim();
+    return IMAGE_TITLE_MODES.includes(mode) ? mode : fallback;
+}
+
+const DEFAULT_SHARED_DRAW_SETTINGS = {
+    cacheDays: DEFAULT_SHARED_GALLERY_CACHE_DAYS,
+    useWorldInfo: false,
+    timeout: 120000,
+    // 回复中的绘图标签是否自动排队生图；关闭后改为楼层内手动点「生成」
+    autoGenerateImages: true,
+    imageTitleMode: DEFAULT_IMAGE_TITLE_MODE,
+    // 要求出图数（全局，不跟随预设）；0 = 不指定
+    maxImages: 2,
+    characterTags: [],
+    characterGroups: [],
+    characterGroupPresets: [],
+    characterGroupPresetApplied: null,
+    plannerMaxRetries: 3,
+    danbooruLocalDB: false,
+    messageFilterRules: [],
+    worldbooks: { enabled: false, uploadedBooks: [], keywordFilterMode: 'auto' },
+    // 生成後自動轉存為 JPEG 以節省快取/伺服器空間（PNG→JPEG 約縮 80-90%）
+    saveAsJpeg: false,
+    jpegQuality: 0.8,
+    // 自動保存新生成的圖片到酒館（效果同手動點「保存」）；autoSaveImagesSince 記錄開啟時刻，之前的舊圖不自動保存
+    autoSaveImages: false,
+    autoSaveImagesSince: 0,
+    updatedAt: 0,
+};
+
+const NOVEL_DRAW_PROVIDER_SETTING_KEYS = new Set([
+    'configVersion',
+    'mode',
+    'apiKey',
+    'apiBaseUrl',
+    'sendMode',
+    'useImageBackendJobs',
+    'insecureTLS',
+    'apiPresets',
+    'selectedApiPresetId',
+    'selectedParamsPresetId',
+    'paramsPresets',
+    'requestDelay',
+    'autoLearnCharacters',
+    'autoLearnMode',
+    'overrideSize',
+    'showFloorButton',
+    'showFloatingButton',
+    'advancedMode',
+    'promptPresets',
+    'selectedPromptPresetId',
+    '_promptTemplateVersion',
+    '_proPresetVersion',
+    'continuityEnabled',
+    'vibeLibrary',
+]);
+
+let settingsCache = null;
+let settingsLoaded = false;
+let storagePromise = null;
+
+async function getStorage() {
+    storagePromise ||= import('../../../core/server-storage.js')
+        .then((module) => module.NovelDrawStorage);
+    return storagePromise;
+}
+
+function cloneSettingsObject(obj) {
+    if (typeof structuredClone === 'function') {
+        return structuredClone(obj);
+    }
+    return JSON.parse(JSON.stringify(obj));
+}
+
+function normalizeNamedTagList(list = []) {
+    return (Array.isArray(list) ? list : [])
+        .map(item => ({
+            name: String(item?.name || '').trim(),
+            tags: String(item?.tags || '').trim(),
+        }))
+        .filter(item => item.name || item.tags);
+}
+
+export function normalizeSharedCacheDays(value, fallback = DEFAULT_SHARED_GALLERY_CACHE_DAYS) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return fallback;
+    return Math.min(30, Math.max(1, Math.round(number)));
+}
+
+export function normalizeSharedDrawSettings(saved = {}) {
+    const source = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    const rawWorldbooks = source.worldbooks && typeof source.worldbooks === 'object'
+        && !Array.isArray(source.worldbooks)
+        ? source.worldbooks
+        : {};
+    const messageFilterRules = (Array.isArray(source.messageFilterRules) ? source.messageFilterRules : [])
+        .filter(rule => rule && typeof rule === 'object')
+        .map(rule => ({ start: String(rule.start || ''), end: String(rule.end || '') }));
+    const characterTags = (Array.isArray(source.characterTags) ? source.characterTags : [])
+        .filter(char => char && typeof char === 'object')
+        .map(char => ({
+            id: String(char.id || `char-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`),
+            enabled: char.enabled !== false,
+            name: String(char.name || ''),
+            aliases: (Array.isArray(char.aliases) ? char.aliases : [])
+                .map(alias => String(alias || '').trim())
+                .filter(Boolean),
+            type: String(char.type || 'girl'),
+            appearance: String(char.appearance || char.tags || ''),
+            negativeTags: String(char.negativeTags || ''),
+            danbooruTag: String(char.danbooruTag || ''),
+            outfits: normalizeNamedTagList(char.outfits || char.costumes || char.clothes || []),
+            dynamicStates: normalizeNamedTagList(char.dynamicStates || []),
+            ...(char.groupId ? { groupId: String(char.groupId) } : {}),
+        }));
+    const characterGroups = (Array.isArray(source.characterGroups) ? source.characterGroups : [])
+        .filter(group => group && typeof group === 'object')
+        .map(group => ({
+            id: String(group.id || `group-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`),
+            name: String(group.name || '未命名分组'),
+            enabled: group.enabled !== false,
+        }));
+    const characterGroupPresets = (Array.isArray(source.characterGroupPresets) ? source.characterGroupPresets : [])
+        .filter(preset => preset && typeof preset === 'object');
+    const plannerMaxRetriesRaw = Number(source.plannerMaxRetries);
+    const plannerMaxRetries = Number.isFinite(plannerMaxRetriesRaw) && plannerMaxRetriesRaw >= 0
+        ? Math.min(10, Math.floor(plannerMaxRetriesRaw))
+        : DEFAULT_SHARED_DRAW_SETTINGS.plannerMaxRetries;
+    const timeout = Number(source.timeout);
+
+    return {
+        cacheDays: normalizeSharedCacheDays(source.cacheDays),
+        useWorldInfo: source.useWorldInfo === true,
+        timeout: Number.isFinite(timeout) && timeout > 0
+            ? Math.min(600000, Math.max(10000, Math.floor(timeout)))
+            : DEFAULT_SHARED_DRAW_SETTINGS.timeout,
+        autoGenerateImages: source.autoGenerateImages !== false,
+        imageTitleMode: normalizeImageTitleMode(source.imageTitleMode),
+        // maxImages 允许 0（= 不指定数量，LLM 写多少是多少），不能走 `|| 默认值` 否则 0 会被吞回默认
+        maxImages: Number.isFinite(Number(source.maxImages))
+            ? Math.max(0, Math.min(20, Math.floor(Number(source.maxImages))))
+            : DEFAULT_SHARED_DRAW_SETTINGS.maxImages,
+        characterTags,
+        characterGroups,
+        characterGroupPresets,
+        characterGroupPresetApplied: source.characterGroupPresetApplied || null,
+        plannerMaxRetries,
+        danbooruLocalDB: source.danbooruLocalDB === true,
+        messageFilterRules,
+        worldbooks: {
+            enabled: rawWorldbooks.enabled === true,
+            uploadedBooks: Array.isArray(rawWorldbooks.uploadedBooks) ? rawWorldbooks.uploadedBooks : [],
+            keywordFilterMode: rawWorldbooks.keywordFilterMode === 'all_active' ? 'all_active' : 'auto',
+        },
+        saveAsJpeg: source.saveAsJpeg === true,
+        jpegQuality: Math.max(0.1, Math.min(1, Number(source.jpegQuality) || DEFAULT_SHARED_DRAW_SETTINGS.jpegQuality)),
+        autoSaveImages: source.autoSaveImages === true,
+        autoSaveImagesSince: Number.isFinite(Number(source.autoSaveImagesSince))
+            ? Math.max(0, Math.floor(Number(source.autoSaveImagesSince)))
+            : 0,
+        updatedAt: Number(source.updatedAt) || 0,
+    };
+}
+
+function pickNovelDrawProviderSettings(value) {
+    const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    return Object.fromEntries(
+        Object.entries(source).filter(([key]) => NOVEL_DRAW_PROVIDER_SETTING_KEYS.has(key)),
+    );
+}
+
+export function mergeSharedDrawSettingsIntoStorageRoot(storageValue, sharedSettings) {
+    return {
+        ...pickNovelDrawProviderSettings(storageValue),
+        ...normalizeSharedDrawSettings(sharedSettings),
+    };
+}
+
+export function mergeNovelDrawProviderSettingsIntoStorageRoot(storageValue, providerSettings) {
+    return {
+        ...pickNovelDrawProviderSettings(providerSettings),
+        ...normalizeSharedDrawSettings(storageValue),
+    };
+}
+
+export async function loadSharedDrawSettings() {
+    if (settingsLoaded && settingsCache) return settingsCache;
+
+    try {
+        const storage = await getStorage();
+        const saved = await storage.getStrict(SERVER_FILE_KEY, null);
+        settingsCache = normalizeSharedDrawSettings(saved || {});
+    } catch (error) {
+        console.error('[DrawSettings] 加载共享画图设置失败:', error);
+        settingsCache = null;
+        settingsLoaded = false;
+        if (window.toastr) toastr.error('无法读取共享画图配置，已禁止保存，请稍后重试');
+        throw error;
+    }
+
+    settingsLoaded = true;
+    return settingsCache;
+}
+
+export function getSharedDrawSettings() {
+    if (!settingsCache) {
+        settingsCache = normalizeSharedDrawSettings({});
+    }
+    return settingsCache;
+}
+
+export async function updateSharedDrawSettingsPersistent(mutator, okText = '已保存', options = {}) {
+    const { notify = false, silent = true } = options;
+    if (!settingsLoaded || !settingsCache) {
+        console.error('[DrawSettings] 配置尚未成功加载，拒绝保存');
+        if (window.toastr) toastr.error('共享画图配置尚未成功加载，已禁止保存');
+        return false;
+    }
+    const previous = cloneSettingsObject(settingsCache);
+
+    try {
+        const storage = await getStorage();
+        const ok = await storage.updateAndSave(async (storageRoot) => {
+            const saved = storageRoot[SERVER_FILE_KEY];
+            const current = normalizeSharedDrawSettings(saved || settingsCache);
+            const draft = cloneSettingsObject(current);
+            if (typeof mutator === 'function') {
+                await mutator(draft);
+            }
+            const next = normalizeSharedDrawSettings(draft);
+            next.updatedAt = Date.now();
+            settingsCache = next;
+            storageRoot[SERVER_FILE_KEY] = mergeSharedDrawSettingsIntoStorageRoot(saved, next);
+        }, { silent });
+        if (ok !== false) {
+            if (notify && window.toastr) toastr.success(okText);
+            return true;
+        }
+        if (notify && window.toastr) toastr.error('保存失败');
+        settingsCache = previous;
+        return false;
+    } catch (error) {
+        console.error('[DrawSettings] 保存共享画图设置失败:', error);
+        settingsCache = previous;
+        if (notify && window.toastr) toastr.error(`保存失败：${error?.message || '网络异常'}`);
+        return false;
+    }
+}

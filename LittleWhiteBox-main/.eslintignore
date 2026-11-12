@@ -1,0 +1,12 @@
+libs/**
+**/libs/**
+**/*.min.js
+modules/agent-core/dist/**
+modules/agent-core/ui/dist/**
+modules/assistant/dist/**
+modules/ebook/dist/**
+modules/xiaobai-os/dist/**
+modules/tavern/dist/**
+
+# Local verification artifacts and previews
+/output/**

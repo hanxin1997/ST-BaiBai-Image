@@ -1,0 +1,295 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import { useAppBack } from '../../../shell/app-src/navigation/app-navigation.js';
+import type { XiaobaiOsFrameBridge } from '../../../shell/app-src/frame-bridge.js';
+import type { FourthWallMessageData } from '../types.js';
+import FourthWallContent from './FourthWallContent.js';
+import { parseFourthWallContent, type FourthWallMediaSegment } from './message-content.js';
+
+interface MediaState {
+    status: 'idle' | 'loading' | 'ready' | 'playing' | 'error' | 'unavailable';
+    source?: string;
+    message?: string;
+    requestId?: string;
+}
+
+const props = defineProps<{
+    message: FourthWallMessageData;
+    messageIndex: number;
+    chatIdentity: string;
+    sessionId: string;
+    userAvatar: string;
+    characterAvatar: string;
+    imageAvailable: boolean;
+    voiceAvailable: boolean;
+    bridge: XiaobaiOsFrameBridge;
+    editable: boolean;
+    editDraft?: string;
+}>();
+
+const emit = defineEmits<{
+    edit: [messageIndex: number, content: string];
+    delete: [messageIndex: number];
+    draft: [content: string];
+    editCancel: [];
+}>();
+
+const editing = computed(() => props.editDraft !== undefined);
+useAppBack(() => { emit('editCancel'); return true; }, () => editing.value);
+const draft = computed({ get: () => props.editDraft || '', set: value => emit('draft', value) });
+const root = ref<HTMLElement | null>(null);
+let observer: IntersectionObserver | null = null;
+const media = reactive<Record<number, MediaState>>({});
+const activeMediaIds = new Set<string>();
+let unsubscribe = () => {};
+
+const content = computed(() => parseFourthWallContent(props.message.content));
+const displayTime = computed(() => {
+    if (!props.message.ts) {
+        return '';
+    }
+    return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(props.message.ts);
+});
+
+function createMediaId(kind: string, index: number): string {
+    return `fw-${kind}-${Date.now()}-${props.messageIndex}-${index}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function unwrap<T>(response: unknown): T {
+    return (response as { result: T }).result;
+}
+
+function isCurrentMedia(index: number, requestId: string): boolean {
+    return activeMediaIds.has(requestId) && media[index]?.requestId === requestId;
+}
+
+async function loadImage(segment: FourthWallMediaSegment, index: number): Promise<void> {
+    if (media[index]?.status === 'loading' || media[index]?.status === 'ready') {
+        return;
+    }
+    if (!props.imageAvailable) {
+        media[index] = { status: 'unavailable', message: '请先开启画图功能' };
+        return;
+    }
+    const mediaRequestId = createMediaId('image', index);
+    activeMediaIds.add(mediaRequestId);
+    media[index] = { status: 'loading', message: '正在加载图片', requestId: mediaRequestId };
+    const binding = { chatIdentity: props.chatIdentity, sessionId: props.sessionId };
+    try {
+        const checked = unwrap<{ available: boolean; cached?: string | null }>(await props.bridge.request(
+            'fourth-wall/image-check',
+            { ...binding, tags: segment.value, mediaRequestId },
+            30_000,
+        ));
+        if (!isCurrentMedia(index, mediaRequestId)) {
+            return;
+        }
+        if (!checked.available) {
+            media[index] = { status: 'unavailable', message: '请先开启画图功能', requestId: mediaRequestId };
+            return;
+        }
+        let source = checked.cached || '';
+        if (!source) {
+            media[index] = { status: 'loading', message: '正在生成图片', requestId: mediaRequestId };
+            const generated = unwrap<{ base64: string }>(await props.bridge.request(
+                'fourth-wall/image-generate',
+                { ...binding, tags: segment.value, mediaRequestId },
+                180_000,
+            ));
+            if (!isCurrentMedia(index, mediaRequestId)) {
+                return;
+            }
+            source = generated.base64;
+        }
+        media[index] = {
+            status: 'ready',
+            source: /^(?:data:|blob:|https?:)/i.test(source) ? source : `data:image/png;base64,${source}`,
+        };
+    } catch (error) {
+        if (isCurrentMedia(index, mediaRequestId)) {
+            media[index] = {
+                status: 'error',
+                message: error instanceof Error ? error.message : String(error),
+                requestId: mediaRequestId,
+            };
+        }
+    } finally {
+        activeMediaIds.delete(mediaRequestId);
+    }
+}
+
+async function playVoice(segment: FourthWallMediaSegment, index: number): Promise<void> {
+    if (!props.voiceAvailable) {
+        media[index] = { status: 'unavailable', message: '请先开启 TTS 语音' };
+        return;
+    }
+    const current = media[index];
+    if (current?.status === 'loading') {
+        return;
+    }
+    if (current?.status === 'playing' && current.requestId) {
+        props.bridge.post('fourth-wall/voice-stop', {
+            chatIdentity: props.chatIdentity,
+            mediaRequestId: current.requestId,
+        });
+        media[index] = { status: 'idle' };
+        return;
+    }
+    const mediaRequestId = createMediaId('voice', index);
+    activeMediaIds.add(mediaRequestId);
+    media[index] = { status: 'loading', message: '正在准备语音', requestId: mediaRequestId };
+    try {
+        await props.bridge.request('fourth-wall/voice-play', {
+            chatIdentity: props.chatIdentity,
+            sessionId: props.sessionId,
+            mediaRequestId,
+            text: segment.value,
+            emotion: segment.emotion,
+        });
+    } catch (error) {
+        if (isCurrentMedia(index, mediaRequestId)) {
+            media[index] = {
+                status: 'error',
+                message: error instanceof Error ? error.message : String(error),
+                requestId: mediaRequestId,
+            };
+        }
+        activeMediaIds.delete(mediaRequestId);
+    }
+}
+
+function beginEdit(): void {
+    emit('draft', props.message.content);
+}
+
+function saveEdit(): void {
+    const content = draft.value.trim();
+    if (!content) {
+        return;
+    }
+    emit('edit', props.messageIndex, content);
+}
+
+function cancelMedia(): void {
+    activeMediaIds.forEach((mediaRequestId) => {
+        props.bridge.post('fourth-wall/image-cancel', { chatIdentity: props.chatIdentity, mediaRequestId });
+        props.bridge.post('fourth-wall/voice-stop', { chatIdentity: props.chatIdentity, mediaRequestId });
+    });
+    activeMediaIds.clear();
+}
+
+function observeImages(): void {
+    observer?.disconnect();
+    root.value?.querySelectorAll<HTMLElement>('[data-image-index]').forEach(figure => observer?.observe(figure));
+}
+
+onMounted(() => {
+    unsubscribe = props.bridge.subscribe((message) => {
+        if (message.type === 'fourth-wall/image-progress') {
+            const payload = message.payload as { mediaRequestId?: string; status?: string; position?: number };
+            const index = Object.keys(media).map(Number).find(key => media[key]?.requestId === payload.mediaRequestId);
+            if (index !== undefined) {
+                media[index].message = payload.status === 'queued'
+                    ? `图片队列第 ${payload.position || 1} 位`
+                    : '正在生成图片';
+            }
+        }
+        if (message.type === 'fourth-wall/voice-state') {
+            const payload = message.payload as { requestId?: string; state?: string; message?: string };
+            const index = Object.keys(media).map(Number).find(key => media[key]?.requestId === payload.requestId);
+            if (index === undefined) {
+                return;
+            }
+            if (payload.state === 'playing') {
+                media[index].status = 'playing';
+            }
+            if (payload.state === 'ended' || payload.state === 'stopped') {
+                activeMediaIds.delete(String(payload.requestId || ''));
+                media[index] = { status: 'idle' };
+            }
+            if (payload.state === 'error') {
+                activeMediaIds.delete(String(payload.requestId || ''));
+                media[index] = { status: 'error', message: payload.message || '语音播放失败' };
+            }
+        }
+    });
+    if (root.value && typeof IntersectionObserver !== 'undefined') {
+        observer = new IntersectionObserver(entries => {
+            for (const entry of entries) {
+                if (!entry.isIntersecting) { continue; }
+                const index = Number((entry.target as HTMLElement).dataset.imageIndex);
+                const segment = content.value.media[index];
+                if (segment?.kind === 'image') { void loadImage(segment, index); }
+                observer?.unobserve(entry.target);
+            }
+        }, { root: root.value.closest('.fourth-wall-conversation') });
+        observeImages();
+    }
+});
+
+watch(() => props.message.content, () => {
+    cancelMedia();
+    Object.keys(media).forEach(key => delete media[Number(key)]);
+});
+
+watch([content, editing], observeImages, { flush: 'post' });
+
+onBeforeUnmount(() => {
+    unsubscribe();
+    observer?.disconnect();
+    cancelMedia();
+});
+</script>
+
+<template>
+    <article ref="root" class="fourth-wall-message" :data-message-index="messageIndex" :class="message.role === 'user' ? 'is-user' : 'is-ai'">
+        <img
+            v-if="message.role === 'user' ? userAvatar : characterAvatar"
+            class="fourth-wall-avatar"
+            :src="message.role === 'user' ? userAvatar : characterAvatar"
+            alt=""
+        >
+        <span v-else class="fourth-wall-avatar is-placeholder" aria-hidden="true" />
+        <div class="fourth-wall-message-stack">
+            <details v-if="message.thinking" class="fourth-wall-thinking">
+                <summary>思考过程</summary>
+                <div>{{ message.thinking }}</div>
+            </details>
+            <div class="fourth-wall-bubble">
+                <textarea v-if="editing" v-model="draft" class="fourth-wall-edit" rows="3" />
+                <FourthWallContent v-else :content="content">
+                    <template #media="{ segment, index }">
+                        <span v-if="segment.kind === 'image'" class="fourth-wall-image-card" :data-image-index="index">
+                            <img v-if="media[index]?.status === 'ready'" :src="media[index].source" :alt="segment.value">
+                            <button v-else-if="media[index]?.status === 'error'" type="button" @click="loadImage(segment, index)">
+                                {{ segment.raw }}<small>{{ media[index].message }}，点此重试</small>
+                            </button>
+                            <span v-else-if="media[index]?.status === 'unavailable'" class="fourth-wall-image-unavailable">
+                                {{ segment.raw }}<small>{{ media[index].message }}</small>
+                            </span>
+                            <button v-else type="button" :disabled="media[index]?.status === 'loading'" @click="loadImage(segment, index)">
+                                {{ segment.raw }}<small>{{ media[index]?.message || '生成图片' }}</small>
+                            </button>
+                        </span>
+                        <button v-else class="fourth-wall-voice" type="button" @click="playVoice(segment, index)">
+                            <span aria-hidden="true">{{ media[index]?.status === 'playing' ? '■' : '▶' }}</span>
+                            <span>{{ segment.value }}</span>
+                            <small v-if="media[index]?.message">{{ media[index].message }}</small>
+                        </button>
+                    </template>
+                </FourthWallContent>
+                <div class="fourth-wall-message-actions">
+                    <template v-if="editing">
+                        <button type="button" :disabled="!editable" @click="saveEdit">保存</button>
+                        <button type="button" @click="emit('editCancel')">取消</button>
+                    </template>
+                    <template v-else>
+                        <button type="button" :disabled="!editable" @click="beginEdit">编辑</button>
+                        <button type="button" :disabled="!editable" @click="emit('delete', messageIndex)">删除</button>
+                    </template>
+                </div>
+            </div>
+            <time v-if="displayTime">{{ displayTime }}</time>
+        </div>
+    </article>
+</template>
