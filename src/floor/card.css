@@ -364,6 +364,118 @@
   color: var(--bbi-accent-ink);
 }
 
+/* ——— 画师串快捷切换浮层:右上角菜单下方,缩略图网格 ——— */
+
+.bbi-figure__artist-picker {
+  position: absolute;
+  top: 46px;
+  right: 8px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  width: min(320px, calc(100% - 16px));
+  max-height: calc(100% - 54px);
+  border: 1px solid var(--bbi-line-strong);
+  border-radius: var(--bbi-radius);
+  background: var(--bbi-surface);
+  box-shadow: var(--bbi-shadow);
+  overflow: hidden;
+}
+
+.bbi-figure__artist-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--bbi-line);
+}
+
+.bbi-figure__artist-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--bbi-ink);
+}
+
+.bbi-figure__artist-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius-pill);
+  background: var(--bbi-surface);
+  color: var(--bbi-ink-muted);
+  cursor: pointer;
+}
+
+.bbi-figure__artist-close:hover {
+  color: var(--bbi-accent);
+  border-color: var(--bbi-accent);
+}
+
+.bbi-figure__artist-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
+  gap: 8px;
+  padding: 8px;
+  overflow-y: auto;
+}
+
+.bbi-figure__artist-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 4px;
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-surface-2);
+  color: var(--bbi-ink);
+  font-family: var(--bbi-font-sans);
+  cursor: pointer;
+  transition:
+    border-color var(--bbi-dur) var(--bbi-ease),
+    box-shadow var(--bbi-dur) var(--bbi-ease);
+}
+
+.bbi-figure__artist-card:hover {
+  border-color: var(--bbi-accent);
+}
+
+.bbi-figure__artist-card.is-active {
+  border-color: var(--bbi-accent);
+  box-shadow: 0 0 0 1px var(--bbi-accent);
+}
+
+.bbi-figure__artist-thumb {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: calc(var(--bbi-radius-sm) - 2px);
+  background: var(--bbi-surface);
+}
+
+.bbi-figure__artist-thumb--none {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--bbi-ink-muted);
+}
+
+.bbi-figure__artist-name {
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.35;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ——— 翻页器:叠在图片右下角的胶囊 ——— */
 
 .bbi-figure__pager {

@@ -1,6 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { matchArtist, planArtistRemoval } from '@/backends/naiArtistLib';
+import {
+  applyNaiPresetParams,
+  matchArtist,
+  planArtistRemoval,
+  snapshotNaiPresetParams,
+} from '@/backends/naiArtistLib';
+import { buildPresetExportFile, importPresetFile } from '@/backends/naiPresetFile';
 import { BUILTIN_NAI_ARTISTS } from '@/backends/nai';
 import BbiTextarea from '@/components/BbiTextarea.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
@@ -123,9 +129,104 @@ function duplicate(item: ManagerItem) {
     prompt: src.prompt,
     quality: src.quality,
     negative: src.negative,
+    vibes: src.vibes?.map(ref => ({ ...ref })),
+    params: src.params ? { ...src.params } : undefined,
   };
   conn.value.artistPresets.push(preset);
   toastr.success(`已复制为「${preset.name}」`, '画师串');
+}
+
+/* ============ 预设文件导入/导出(与智绘姬互通) ============ */
+
+const importing = ref(false);
+const exporting = ref(false);
+const importFileInput = ref<HTMLInputElement | null>(null);
+
+function exportFileName(): string {
+  return `柏宝绘-画师串-${new Date().toISOString().slice(0, 10)}.json`;
+}
+
+function downloadJson(text: string, filename: string) {
+  const blob = new Blob([text], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
+}
+
+async function exportPresets() {
+  const presets = conn.value.artistPresets;
+  if (!presets.length) {
+    toastr.warning('还没有画师串可导出', '画师串');
+    return;
+  }
+  exporting.value = true;
+  try {
+    const result = await buildPresetExportFile({
+      presets,
+      vibes: conn.value.vibes,
+      fallbackParams: snapshotNaiPresetParams(conn.value),
+    });
+    downloadJson(result.json, exportFileName());
+    const parts = [`${result.counts.presets} 个画师串`];
+    if (result.counts.vibes) parts.push(`${result.counts.vibes} 条 Vibe`);
+    if (result.counts.previews) parts.push(`${result.counts.previews} 张预览图`);
+    toastr.success(`已导出 ${parts.join('、')}`, '画师串');
+    if (result.warnings.length) toastr.warning(result.warnings[0], '导出提示');
+  } catch (error) {
+    toastr.error(errorMessage(error), '导出失败');
+  } finally {
+    exporting.value = false;
+  }
+}
+
+function pickImportFile() {
+  if (importing.value) return;
+  importFileInput.value?.click();
+}
+
+async function onImportFileChange(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  importing.value = true;
+  try {
+    const result = await importPresetFile({
+      text: await file.text(),
+      existingPresets: conn.value.artistPresets,
+      existingVibes: conn.value.vibes,
+      model: conn.value.model,
+    });
+    conn.value.artistPresets = result.presets;
+    conn.value.vibes = result.vibes;
+    // 覆盖导入可能换掉同名预览图,URL 不变时浏览器会继续显示旧图;统一 bump 破缓存
+    const versions = new Map(previewVersions.value);
+    for (const preset of result.presets) {
+      if (preset.previewPath) versions.set(preset.id, Date.now());
+    }
+    previewVersions.value = versions;
+    const parts = [`新增 ${result.imported} 个`, `覆盖 ${result.overwritten} 个`];
+    if (result.skipped) parts.push(`跳过 ${result.skipped} 个`);
+    if (result.importedVibes) parts.push(`新增 ${result.importedVibes} 条 Vibe`);
+    toastr.success(`导入完成：${parts.join('，')}`, '画师串');
+    if (result.warnings.length) toastr.warning(result.warnings[0], '导入提示');
+  } catch (error) {
+    toastr.error(errorMessage(error), '导入失败');
+  } finally {
+    importing.value = false;
+  }
+}
+
+/** 显式应用预设携带的模型参数;切换画师串本身不会静默改模型。 */
+function applyParams(preset: NaiArtistPreset) {
+  if (!preset.params) return;
+  applyNaiPresetParams(conn.value, preset.params);
+  toastr.success(`已应用「${preset.name}」的模型参数`, '画师串');
 }
 
 /* ============ 预览图 ============ */
@@ -293,6 +394,12 @@ function duplicateFromEdit() {
           aria-label="搜索画师串"
         />
         <span class="am-count">共 {{ items.length }} 条</span>
+        <button class="bbi-btn bbi-btn-sm" type="button" :disabled="exporting" @click="exportPresets">
+          <Icon name="download" :size="12" /> {{ exporting ? '导出中…' : '导出' }}
+        </button>
+        <button class="bbi-btn bbi-btn-sm" type="button" :disabled="importing" @click="pickImportFile">
+          <Icon name="upload" :size="12" /> {{ importing ? '导入中…' : '导入' }}
+        </button>
         <button class="bbi-btn bbi-btn-primary" type="button" @click="addArtist">
           <Icon name="plus" /> 新建
         </button>
@@ -539,6 +646,17 @@ function duplicateFromEdit() {
         }}」;要改它们,先在面板里把这条设为当前画师串,再点提示词区的对应行。
       </p>
 
+      <p v-if="!editItem.builtin && editItem.preset.params" class="bbi-modal-label">
+        携带模型参数:{{ editItem.preset.params.model }} · {{ editItem.preset.params.sampler }} ·
+        {{ editItem.preset.params.steps }} 步 · CFG {{ editItem.preset.params.scale }}。
+        应用会切换当前渠道的模型与采样参数。
+      </p>
+      <p v-if="!editItem.builtin && editItem.preset.vibes" class="bbi-modal-label">
+        Vibe 绑定:{{
+          editItem.preset.vibes.length ? `已绑定 ${editItem.preset.vibes.length} 条` : '明确不使用 Vibe'
+        }};切换画师串时自动套用。
+      </p>
+
       <footer class="bbi-modal-foot">
         <button class="bbi-btn" type="button" @click="toggleActive(editItem)">
           {{ editItem.preset.id === activeId ? '停用这条' : '设为当前画师串' }}
@@ -551,6 +669,15 @@ function duplicateFromEdit() {
           <button class="bbi-btn bbi-btn-primary" type="button" @click="closeEdit">关闭</button>
         </template>
         <template v-else>
+          <button
+            v-if="editItem.preset.params"
+            class="bbi-btn"
+            type="button"
+            title="把预设携带的模型与采样参数应用到当前渠道"
+            @click="applyParams(editItem.preset)"
+          >
+            <Icon name="settings" :size="12" /> 应用参数
+          </button>
           <span class="bbi-modal-foot-spacer"></span>
           <button class="bbi-btn" type="button" @click="closeEdit">取消</button>
           <button class="bbi-btn bbi-btn-primary" type="button" @click="saveEdit">完成</button>
@@ -565,6 +692,13 @@ function duplicateFromEdit() {
     accept="image/*"
     hidden
     @change="onPreviewFileChange"
+  />
+  <input
+    ref="importFileInput"
+    type="file"
+    accept=".json,application/json"
+    hidden
+    @change="onImportFileChange"
   />
 </template>
 
@@ -582,6 +716,7 @@ function duplicateFromEdit() {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 .am-search {
   flex: 1 1 auto;

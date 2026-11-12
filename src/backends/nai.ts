@@ -11,6 +11,7 @@ import {
 import { buildPromptSections, joinSections } from '@/backends/promptSections';
 import { parseSize, pickSize, type Orientation } from '@/backends/size';
 import { clampVibeStrength, loadVibeData } from '@/backends/vibeStore';
+import { decodeMessagePack, type MessagePackValue } from '@/msgpack';
 import type { GenerationArtist, GenerationMeta, GenerationParams, GenerationVibe } from '@/generationMeta';
 import type {
   NaiArtistPreset,
@@ -24,12 +25,20 @@ import type {
  * NovelAI 生图后端(浏览器直连,协议与官方 image.novelai.net 一致)。
  * url 可指向任意兼容站:官方/镜像/第三方转发,端点自动补 /ai 前缀。
  *
- * 参考 st-chatu8 的实现口径:
- * - 生图 POST {base}/ai/generate-image,body {input, model, action:'generate', parameters}。
- * - 响应是 zip(stream: 'msgpack'),解出第一张图。
- * - NAI3 的 vibe 直接发参考原图;NAI4/4.5 必须先经 /ai/encode-vibe 编码,
- *   生成时以 reference_image_multiple_cached(uuid + 编码数据) 形式叠加。
- * - .naiv4vibe 文件格式与官方互通(encodings 按模型 key 分组)。
+ * 协议分两条:
+ * - V5(nativeV5):POST {base}/ai/generate-image-stream,multipart 字段 request 装 JSON,
+ *   响应是 MessagePack 流(4 字节大端帧长 + 事件对象),取 final 事件的 image。
+ *   字段口径对齐官方 V5:qualityPresetId / ucPresetId / straight_alpha / use_coords 等。
+ * - 旧链路(V3/V4/V4.5,以及 V5 端点明确不支持流式时的回落):
+ *   POST {base}/ai/generate-image,body {input, model, action:'generate', parameters},
+ *   响应是 zip,解出第一张图。
+ *
+ * Vibe:NAI3 直接发参考原图;NAI4/4.5/V5 必须先经 /ai/encode-vibe 编码,
+ * 生成时以 reference_image_multiple_cached(uuid + 编码数据) 形式叠加。
+ * .naiv4vibe 文件格式与官方互通(encodings 按模型 key 分组)。
+ *
+ * latent.moe 走的是 latentApi.ts,与本文件的传输层无关;本文件只按 flatten 标志
+ * 决定提示词形态,不改变 latent 渠道的接口。
  */
 
 export class NaiError extends Error {
@@ -184,6 +193,22 @@ export function naiEndpoint(url: string, path: string): string {
   const seg = path.replace(/^\/+/, '');
   if (base.endsWith(`/ai/${seg}`) || base.endsWith(`/${seg}`)) return base;
   return `${base}/ai/${seg}`;
+}
+
+/**
+ * 生图端点。用户的地址可能写成 base(https://image.novelai.net)、
+ * 完整旧端点(.../ai/generate-image)或完整流端点(.../ai/generate-image-stream),
+ * 三种都要能互换,不能简单拼 /ai。
+ */
+function naiImageEndpoint(url: string, stream: boolean): string {
+  const base = url.trim().replace(/\/+$/, '');
+  if (!base) throw new NaiError('请先填写 NAI 接口地址');
+  const target = stream ? 'generate-image-stream' : 'generate-image';
+  const fullEndpoint = /\/ai\/generate-image(?:-stream)?$/i;
+  if (fullEndpoint.test(base)) return base.replace(fullEndpoint, `/ai/${target}`);
+  const bareEndpoint = /\/generate-image(?:-stream)?$/i;
+  if (bareEndpoint.test(base)) return base.replace(bareEndpoint, `/${target}`);
+  return `${base}/ai/${target}`;
 }
 
 export interface NaiSize {
@@ -455,6 +480,11 @@ export function fullNegativePrompt(nai: NaiSettings): string {
  * 构造 parameters。v4 系模型带 v4_prompt/v4_negative_prompt 结构;NAI3 不带。
  * vibe 不在此叠加(见 applyVibes),保持「一次生成 = build + applyVibes」两步。
  */
+/** V5 原生链路 = 模型是 V5 且不是 latent 的摊平模式(latent 仍走旧协议)。 */
+function usesNativeV5(nai: NaiSettings, flatten: boolean | undefined): boolean {
+  return isNai5(nai.model) && !flatten;
+}
+
 export function buildNaiParameters(nai: NaiSettings, values: NaiGenerateValues): JsonObject {
   // 画幅按方向取用户配的那一格;没填回落竖屏默认
   const orientation = values.size ?? 'portrait';
@@ -468,6 +498,7 @@ export function buildNaiParameters(nai: NaiSettings, values: NaiGenerateValues):
   const negative = fullNegativePrompt(nai);
   const skipCfg = skipCfgAboveSigma(width, height, nai.model, nai.varietyBoost);
   const sampler = isNai5(nai.model) && !NAI_V5_SAMPLERS.has(nai.sampler) ? 'k_euler_ancestral' : nai.sampler;
+  const nativeV5 = usesNativeV5(nai, values.flatten);
 
   const params: JsonObject = {
     params_version: isNai5(nai.model) ? 4 : 3,
@@ -477,9 +508,6 @@ export function buildNaiParameters(nai: NaiSettings, values: NaiGenerateValues):
     sampler,
     steps: nai.steps,
     n_samples: 1,
-    // 提示词已由本地固定默认拼好；协议字段保持官方前端口径。
-    ucPreset: 3,
-    qualityToggle: true,
     dynamic_thresholding: false,
     controlnet_strength: 1,
     legacy: false,
@@ -487,7 +515,6 @@ export function buildNaiParameters(nai: NaiSettings, values: NaiGenerateValues):
     add_original_image: true,
     cfg_rescale: nai.cfgRescale,
     noise_schedule: nai.noiseSchedule,
-    skip_cfg_above_sigma: skipCfg,
     legacy_v3_extend: false,
     stream: 'msgpack',
     seed,
@@ -495,6 +522,23 @@ export function buildNaiParameters(nai: NaiSettings, values: NaiGenerateValues):
     reference_strength_multiple: [],
     normalize_reference_strength_multiple: nai.normalizeRefStrength,
     use_coords: false,
+    // V5 官方字段与旧版互斥:发 ucPreset/qualityToggle 会被当成旧协议,
+    // 发 skip_cfg_above_sigma: null 也不在 V5 契约里(LWB 直接省略)。
+    ...(nativeV5
+      ? {
+          qualityPresetId: 'standard',
+          ucPresetId: 'heavy',
+          autoSmea: false,
+          inpaintImg2ImgStrength: 1,
+          straight_alpha: true,
+          image_format: 'png',
+        }
+      : {
+          // 提示词已由本地固定默认拼好;协议字段保持官方前端口径。
+          ucPreset: 3,
+          qualityToggle: true,
+          skip_cfg_above_sigma: skipCfg,
+        }),
   };
 
   if (isNai3(nai.model)) {
@@ -508,14 +552,23 @@ export function buildNaiParameters(nai: NaiSettings, values: NaiGenerateValues):
     params.reference_image_multiple_cached = [];
     // flatten(latent)时清空:角色已在正向串的角色段里,再发一遍结构化 Character Prompts
     // 等于把同一个角色喂两遍,模型会当成画面里有两个同样的人。
-    const captions = characterCaptions(
-      naiSupportsCharacterPrompts(nai.model) && !values.flatten ? (values.characters ?? []) : [],
-    );
-    params.characterPrompts = [];
-    params.use_coords = captions.useCoords;
+    const characters =
+      naiSupportsCharacterPrompts(nai.model) && !values.flatten ? (values.characters ?? []) : [];
+    const captions = characterCaptions(characters);
+    // LWB/官方 V5 都发结构化角色数组;只靠 v4_prompt.char_captions 时部分第三方
+    // 转发会丢掉角色特征,这是「鬼画符」的主要来源之一。
+    params.characterPrompts = characters.map((_, index) => ({
+      prompt: captions.positive[index].char_caption,
+      uc: captions.negative[index].char_caption,
+      center: captions.positive[index].centers[0],
+      enabled: true,
+    }));
+    // V5 官方前端恒为 true;4.5 沿用「有角色指定位置才开」的旧口径。
+    const useCoords = nativeV5 ? true : captions.useCoords;
+    params.use_coords = useCoords;
     params.v4_prompt = {
       caption: { base_caption: prompt, char_captions: captions.positive },
-      use_coords: captions.useCoords,
+      use_coords: useCoords,
       use_order: true,
     };
     params.v4_negative_prompt = {
@@ -524,7 +577,8 @@ export function buildNaiParameters(nai: NaiSettings, values: NaiGenerateValues):
     };
   }
 
-  if (sampler === 'k_euler_ancestral') {
+  // V5 的修正字段与采样器无关(官方/LWB 恒发);旧模型只在 ancestral 时发。
+  if (nativeV5 || sampler === 'k_euler_ancestral') {
     params.deliberate_euler_ancestral_bug = false;
     params.prefer_brownian = true;
   }
@@ -680,10 +734,10 @@ export async function testNaiConnection(
 }
 
 /** 解 NAI 返回的 zip,取第一张图转 base64。 */
-export function unzipNaiImage(buffer: ArrayBuffer): { base64: string; filename: string } {
+export function unzipNaiImage(buffer: ArrayBuffer | Uint8Array): { base64: string; filename: string } {
   let files: Record<string, Uint8Array>;
   try {
-    files = unzipSync(new Uint8Array(buffer));
+    files = unzipSync(buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer));
   } catch {
     throw new NaiError('响应不是有效的 zip 包(第三方站可能返回了其他格式)');
   }
@@ -752,7 +806,13 @@ export async function generateNaiImage(
     parameters: params,
     use_new_shared_trial: true,
   };
-  const result = await requestNaiImage(nai, body, signal, opts.onRetry);
+  const result = await requestNaiImage(
+    nai,
+    body,
+    signal,
+    opts.onRetry,
+    usesNativeV5(nai, values.flatten),
+  );
   const usage = {
     positive,
     negative: fullNegativePrompt(nai),
@@ -779,6 +839,160 @@ function naiParamsSnapshot(params: JsonObject, nai: NaiSettings): GenerationPara
   };
 }
 
+/* ---- 传输层:V5 msgpack 流 + 旧 JSON/zip 回落 ---- */
+
+/** V5 流每帧 = 4 字节大端长度 + 该长度的 MessagePack 对象。 */
+const NAI_STREAM_FRAME_BYTES = 4;
+/** 单帧上限与 LWB 一致;超过即视为异常响应,避免坏帧吃掉内存。 */
+const NAI_STREAM_MAX_FRAME_BYTES = 64 * 1024 * 1024;
+/** 这些状态说明端点根本没有流式接口,退回旧 JSON 端点。 */
+const NAI_STREAM_FALLBACK_STATUSES = new Set([404, 405, 415]);
+
+const ZIP_MAGIC = [0x50, 0x4b, 0x03, 0x04] as const;
+const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] as const;
+const JPEG_MAGIC = [0xff, 0xd8, 0xff] as const;
+const GIF_MAGIC = [0x47, 0x49, 0x46] as const;
+const RIFF_MAGIC = [0x52, 0x49, 0x46, 0x46] as const;
+
+function matchesMagic(bytes: Uint8Array, magic: readonly number[]): boolean {
+  return bytes.length >= magic.length && magic.every((value, index) => bytes[index] === value);
+}
+
+/** 图片文件头 → 扩展名;请求里固定 image_format: 'png',认不出就按 png 处理。 */
+function detectImageFormat(bytes: Uint8Array): string {
+  if (matchesMagic(bytes, PNG_MAGIC)) return 'png';
+  if (matchesMagic(bytes, JPEG_MAGIC)) return 'jpg';
+  if (matchesMagic(bytes, GIF_MAGIC)) return 'gif';
+  const isWebp =
+    matchesMagic(bytes, RIFF_MAGIC) &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50;
+  return isWebp ? 'webp' : 'png';
+}
+
+function naiImageResult(base64: string, filename: string): ComfyImageResult {
+  const format = filename.split('.').pop()?.toLowerCase() || 'png';
+  return {
+    url: `data:image/${format === 'jpg' ? 'jpeg' : format};base64,${base64}`,
+    filename: `nai-${Date.now()}.${format}`,
+    format,
+    revoke() {},
+  };
+}
+
+function isMessagePackMap(value: MessagePackValue): value is { [key: string]: MessagePackValue } {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    !(value instanceof Uint8Array)
+  );
+}
+
+/** final 事件的 image 可能是二进制,也可能是第三方代理转成的 base64 / data URI。 */
+function coerceImageBytes(value: MessagePackValue | undefined): Uint8Array | null {
+  if (value instanceof Uint8Array) return value;
+  if (typeof value !== 'string' || !value) return null;
+  const payload = value
+    .replace(/^data:[^,]*,/, '')
+    .replace(/\s+/g, '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
+  try {
+    return base64ToUint8(payload);
+  } catch {
+    return null;
+  }
+}
+
+/** 解析一个流事件;intermediate 返回 null,final 返回图片,error/未知事件直接抛。 */
+function readNaiStreamEvent(event: MessagePackValue): Uint8Array | null {
+  if (!isMessagePackMap(event)) throw new NaiError('NAI V5 流事件不是对象');
+  const type = typeof event.event_type === 'string' ? event.event_type : '';
+  if (type === 'error') {
+    const message = typeof event.message === 'string' && event.message ? event.message : 'NAI V5 生成失败';
+    throw new NaiError(message);
+  }
+  if (type === 'intermediate') return null;
+  if (type !== 'final') throw new NaiError(`NAI V5 返回了未知事件:${type || '(空)'}`);
+  const image = coerceImageBytes(event.image);
+  if (!image?.length) throw new NaiError('NAI V5 final 事件没有有效的图片数据');
+  return image;
+}
+
+/** 把整段响应按帧拆开,返回 final 事件的图片。 */
+function decodeNaiStreamImage(bytes: Uint8Array): Uint8Array {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 0;
+  while (offset + NAI_STREAM_FRAME_BYTES <= bytes.length) {
+    const frameLength = view.getUint32(offset, false);
+    offset += NAI_STREAM_FRAME_BYTES;
+    if (!frameLength || frameLength > NAI_STREAM_MAX_FRAME_BYTES) {
+      throw new NaiError('NAI V5 返回了无效的 MessagePack 帧长度');
+    }
+    if (offset + frameLength > bytes.length) throw new NaiError('NAI V5 响应在帧结束前被截断');
+    const image = readNaiStreamEvent(decodeMessagePack(bytes.subarray(offset, offset + frameLength)));
+    offset += frameLength;
+    if (image) return image;
+  }
+  if (offset !== bytes.length) throw new NaiError('NAI V5 响应在帧结束前被截断');
+  throw new NaiError('NAI V5 响应结束但没有返回图片');
+}
+
+/**
+ * V5 原生传输:multipart 的 request 字段装 JSON,响应是 msgpack 流。
+ * 端点明确不支持(404/405/415)、返回 HTML 或空体时返回 null,由调用方退回旧链路;
+ * 其余错误照常抛,避免把 401/402 误判成「不支持流式」再白打一次旧端点。
+ */
+async function requestNaiStreamImage(
+  nai: NaiSettings,
+  body: JsonObject,
+  signal: AbortSignal | undefined,
+): Promise<ComfyImageResult | null> {
+  const form = new FormData();
+  form.append('request', new Blob([JSON.stringify(body)], { type: 'application/json' }), 'blob');
+  const resp = await fetch(naiImageEndpoint(nai.url, true), {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${nai.key.trim()}` },
+    body: form,
+    signal,
+  });
+  if (NAI_STREAM_FALLBACK_STATUSES.has(resp.status)) return null;
+  if (!resp.ok) throw await naiHttpError(resp, 'NAI 生图失败');
+  const contentType = resp.headers.get('content-type') ?? '';
+  if (contentType.includes('text/html')) return null;
+  const bytes = new Uint8Array(await resp.arrayBuffer());
+  if (!bytes.length) return null;
+  // 部分第三方站对 -stream 端点仍回 zip,顺手兼容。
+  if (matchesMagic(bytes, ZIP_MAGIC)) {
+    const { base64, filename } = unzipNaiImage(bytes);
+    return naiImageResult(base64, filename);
+  }
+  const image = decodeNaiStreamImage(bytes);
+  return naiImageResult(uint8ToBase64(image), `nai.${detectImageFormat(image)}`);
+}
+
+async function requestNaiLegacyImage(
+  nai: NaiSettings,
+  body: JsonObject,
+  signal: AbortSignal | undefined,
+): Promise<ComfyImageResult> {
+  const resp = await fetch(naiImageEndpoint(nai.url, false), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${nai.key.trim()}`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!resp.ok) throw await naiHttpError(resp, 'NAI 生图失败');
+  const { base64, filename } = unzipNaiImage(await resp.arrayBuffer());
+  return naiImageResult(base64, filename);
+}
+
 /**
  * 发请求 + 解包。只把这一步包进重试:拼参数、读 vibe 数据的活是一次性的,
  * 重跑它们既白费功夫,也会把 vibe 缺编码的 toastr 警告重复弹出来。
@@ -788,28 +1002,15 @@ function requestNaiImage(
   body: JsonObject,
   signal: AbortSignal | undefined,
   onRetry: ((info: NaiRetryInfo) => void) | undefined,
+  nativeV5: boolean,
 ): Promise<ComfyImageResult> {
   return runNaiWithRetry(
     async () => {
-      const resp = await fetch(naiEndpoint(nai.url, 'generate-image'), {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${nai.key.trim()}`,
-        },
-        body: JSON.stringify(body),
-        signal,
-      });
-      if (!resp.ok) throw await naiHttpError(resp, 'NAI 生图失败');
-
-      const { base64, filename } = unzipNaiImage(await resp.arrayBuffer());
-      const format = filename.split('.').pop()?.toLowerCase() || 'png';
-      return {
-        url: `data:image/${format === 'jpg' ? 'jpeg' : format};base64,${base64}`,
-        filename: `nai-${Date.now()}.${format}`,
-        format,
-        revoke() {},
-      };
+      if (nativeV5) {
+        const streamed = await requestNaiStreamImage(nai, body, signal);
+        if (streamed) return streamed;
+      }
+      return requestNaiLegacyImage(nai, body, signal);
     },
     { signal, onRetry },
   );

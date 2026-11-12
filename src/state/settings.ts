@@ -200,6 +200,32 @@ export interface NaiVibe {
   group: string;
 }
 
+/** 画师串绑定的单条 Vibe 状态:id 指向 NaiSettings.vibes。 */
+export interface NaiArtistVibeRef {
+  id: string;
+  enabled: boolean;
+  strength: number;
+}
+
+/**
+ * 画师串携带的模型参数快照。
+ *
+ * 只在导出/导入与「应用参数」时使用;切换画师串不会自动改模型参数——
+ * 模型切换会连带改变 Vibe 编码 key,静默切换的代价太大,必须由用户显式点「应用」。
+ */
+export interface NaiPresetParams {
+  model: NaiModel;
+  sampler: string;
+  steps: number;
+  scale: number;
+  cfgRescale: number;
+  noiseSchedule: string;
+  varietyBoost: boolean;
+  normalizeRefStrength: boolean;
+  portraitSize: string;
+  landscapeSize: string;
+}
+
 /**
  * 一条具名画风配方:画师串 + 可选绑定的正面质量词/负面提示词。
  * 下拉切换时三者一起生效——一套配方即用户的一套完整画风搭配。
@@ -230,6 +256,13 @@ export interface NaiArtistPreset {
    * 删条目时按此路径删文件;复制条目不带走(否则两条目共指一个文件,删一边另一边破图)。
    */
   previewPath?: string;
+  /**
+   * 绑定的 Vibe 状态。undefined = 未绑定(旧数据,切换时不动 Vibe);
+   * 空数组 = 明确绑定「不使用任何 Vibe」(切换时全部关掉)。
+   */
+  vibes?: NaiArtistVibeRef[];
+  /** 导出/导入携带的模型参数快照;切换画师串时不自动应用。 */
+  params?: NaiPresetParams;
 }
 
 /**
@@ -2263,6 +2296,60 @@ function foldLegacyNegative(o: Partial<NaiSettings>, model: NaiModel, def: strin
   return [legacy, naiDefaultUndesired(model)].filter(Boolean).join(', ');
 }
 
+/** 预设参数快照缺字段时的回退值(与 naiDefaults 同口径,单列一份供清洗用)。 */
+const PRESET_PARAM_FALLBACK = {
+  sampler: 'k_euler',
+  steps: 28,
+  scale: 5.5,
+  cfgRescale: 0,
+  noiseSchedule: 'karras',
+} as const;
+
+/** 预设参数快照清洗:model 必须命中当前支持的模型,其余字段按范围夹取。 */
+export function normalizePresetParams(raw: unknown): NaiPresetParams | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const o = raw as Partial<NaiPresetParams>;
+  if (typeof o.model !== 'string' || !NAI_MODEL_VALUES.has(o.model)) return undefined;
+  return {
+    model: o.model as NaiModel,
+    sampler:
+      typeof o.sampler === 'string' && o.sampler ? o.sampler : PRESET_PARAM_FALLBACK.sampler,
+    steps: Math.round(clampNumber(o.steps, PRESET_PARAM_FALLBACK.steps, 1, 50)),
+    scale: clampNumber(o.scale, PRESET_PARAM_FALLBACK.scale, 0, 35),
+    cfgRescale: clampNumber(o.cfgRescale, PRESET_PARAM_FALLBACK.cfgRescale, 0, 1),
+    noiseSchedule:
+      typeof o.noiseSchedule === 'string' && o.noiseSchedule
+        ? o.noiseSchedule
+        : PRESET_PARAM_FALLBACK.noiseSchedule,
+    varietyBoost: typeof o.varietyBoost === 'boolean' ? o.varietyBoost : false,
+    normalizeRefStrength:
+      typeof o.normalizeRefStrength === 'boolean' ? o.normalizeRefStrength : true,
+    portraitSize:
+      typeof o.portraitSize === 'string' && o.portraitSize ? o.portraitSize : DEFAULT_PORTRAIT_SIZE,
+    landscapeSize:
+      typeof o.landscapeSize === 'string' && o.landscapeSize
+        ? o.landscapeSize
+        : DEFAULT_LANDSCAPE_SIZE,
+  };
+}
+
+/** 预设 Vibe 绑定清洗:数组即视为「已绑定」,空数组保留其语义(明确不使用 Vibe)。 */
+export function normalizeArtistVibeRefs(raw: unknown): NaiArtistVibeRef[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  return raw
+    .map(item => {
+      if (!item || typeof item !== 'object') return null;
+      const o = item as Partial<NaiArtistVibeRef>;
+      if (typeof o.id !== 'string' || !o.id) return null;
+      return {
+        id: o.id,
+        enabled: typeof o.enabled === 'boolean' ? o.enabled : true,
+        strength: clampVibeStrength(o.strength),
+      };
+    })
+    .filter((item): item is NaiArtistVibeRef => item !== null);
+}
+
 /** 单条配方清洗:缺字段/类型不符逐项回退;prompt 允许空串(空槽位不是垃圾数据)。 */
 function normalizeArtistPreset(raw: unknown, seq: number): NaiArtistPreset {
   const o = (raw ?? {}) as Partial<NaiArtistPreset>;
@@ -2276,7 +2363,16 @@ function normalizeArtistPreset(raw: unknown, seq: number): NaiArtistPreset {
     // 可选键:非字符串/空串一律视为无预览(不落 undefined 以外的脏数据)
     previewPath:
       typeof o.previewPath === 'string' && o.previewPath ? o.previewPath : undefined,
+    vibes: normalizeArtistVibeRefs(o.vibes),
+    params: normalizePresetParams(o.params),
   };
+}
+
+/** 绑定引用指向已删 Vibe 时剔除;过滤后仍保留空数组(= 明确不使用 Vibe)。 */
+function prunePresetVibeRefs(preset: NaiArtistPreset, vibes: readonly NaiVibe[]): NaiArtistPreset {
+  if (!preset.vibes) return preset;
+  const ids = new Set(vibes.map(vibe => vibe.id));
+  return { ...preset, vibes: preset.vibes.filter(ref => ids.has(ref.id)) };
 }
 
 /** 单条站点清洗:缺字段/类型不符逐项回退。url/key 允许空串(未填完的站点不是垃圾数据)。 */
@@ -2312,9 +2408,15 @@ function normalizeNai(raw: unknown, def: NaiSettings): NaiSettings {
     console.warn(`[柏宝绘] NAI 模型「${stored}」已下线,本次回落为 ${model}`);
   }
 
+  const vibes = Array.isArray(o.vibes)
+    ? o.vibes.map((v, i) => normalizeVibe(v, i)).filter((v): v is NaiVibe => v !== null)
+    : def.vibes;
+
   // 画师串库:允许为空,故没有「恒非空」兜底(与 normalizeComfyUI 刻意不同)
   const artistPresets = Array.isArray(o.artistPresets)
-    ? o.artistPresets.map(normalizeArtistPreset)
+    ? o.artistPresets
+        .map(normalizeArtistPreset)
+        .map(preset => prunePresetVibeRefs(preset, vibes))
     : def.artistPresets;
   // 悬空 id 一律清成空串(= 不使用)。**不**照抄 normalizeComfyUI 的「回落第一条」:
   // 用户删掉当前画师串后本该「什么都不加」,回落会给他静默换一套画风,而下拉显示的
@@ -2367,9 +2469,7 @@ function normalizeNai(raw: unknown, def: NaiSettings): NaiSettings {
     normalizeRefStrength:
       typeof o.normalizeRefStrength === 'boolean' ? o.normalizeRefStrength : def.normalizeRefStrength,
     concurrency: Math.round(clampNumber(o.concurrency, def.concurrency, 1, 4)),
-    vibes: Array.isArray(o.vibes)
-      ? o.vibes.map((v, i) => normalizeVibe(v, i)).filter((v): v is NaiVibe => v !== null)
-      : def.vibes,
+    vibes,
     artistPresets,
     activeArtistId,
     // 老配置缺这两个字段:回落默认 = 开着自然语言、不锁方向,即改动前的行为

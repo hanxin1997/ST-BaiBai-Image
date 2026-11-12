@@ -4,6 +4,8 @@ import { computed, onMounted, ref, watch } from 'vue';
 import type { ImageCharacterPrompt } from '@/autoTag/protocol';
 import { cancelFloorTags } from '@/autoTag/runner';
 import { LatentPromptTooLongError } from '@/backends/latentApi';
+import { applyArtistVibeState } from '@/backends/naiArtistLib';
+import { BUILTIN_NAI_ARTISTS } from '@/backends/nai';
 import { effectiveOrientation, type Orientation } from '@/backends/size';
 import Icon from '@/components/Icon.vue';
 import { confirmDialog } from '@/components/confirm';
@@ -36,7 +38,13 @@ import {
 } from '@/floor/storage';
 import { isTagPlanning } from '@/floor/tagPlanState';
 import { formatGenerationMeta } from '@/generationMeta';
-import { activeOrientationLock, imageDisplayMaxHeight, settings } from '@/state/settings';
+import {
+  activeNaiArtist,
+  activeOrientationLock,
+  imageDisplayMaxHeight,
+  settings,
+  type NaiArtistPreset,
+} from '@/state/settings';
 import { beginImage, failImage, finishImage, safeHistory, type ImageBackend } from '@/state/history';
 import { copyText } from '@/st/clipboard';
 import { getContext } from '@/st/context';
@@ -124,6 +132,8 @@ const collapsed = computed<boolean>({
 
 /** 触屏收纳菜单(⋯ 钮)的展开态;桌面 hover 一排直达,不用它。 */
 const menuOpen = ref(false);
+/** 楼层面板里的画师串快捷切换浮层。 */
+const artistPickerOpen = ref(false);
 
 /** 运行态记录(可能为 undefined = 无在途任务)。 */
 const record = computed(() => getGenRecord(key.value));
@@ -154,6 +164,44 @@ const naiActive = computed(() => settings.defaultBackend === 'nai');
 const latentActive = computed(() => settings.defaultBackend === 'latent');
 const imgRouterActive = computed(() => settings.defaultBackend === 'imgrouter');
 const latentApiActive = computed(() => settings.defaultBackend === 'latentapi');
+
+/**
+ * 楼层快捷切换只服务 NAI / latent 渠道:画师串库是这两个渠道自己的属性,
+ * 其它渠道没有「当前画师串」这个概念。
+ */
+const artistConn = computed(() => {
+  if (settings.defaultBackend === 'nai') return settings.nai;
+  if (settings.defaultBackend === 'latent') return settings.latent;
+  return null;
+});
+
+const artistChoices = computed(() => {
+  const conn = artistConn.value;
+  if (!conn) return [];
+  return [
+    ...BUILTIN_NAI_ARTISTS.map(preset => ({ preset, builtin: true })),
+    ...conn.artistPresets.map(preset => ({ preset, builtin: false })),
+  ];
+});
+
+/** 悬空 id 与「不使用」同显,与设置面板下拉口径一致。 */
+const currentArtistId = computed(() => {
+  const conn = artistConn.value;
+  return conn ? (activeNaiArtist(conn)?.id ?? '') : '';
+});
+
+/** 楼层面板快捷切换:与设置面板同口径,切换即套用该画师串的 Vibe 绑定。 */
+function pickArtist(preset: NaiArtistPreset | null): void {
+  const conn = artistConn.value;
+  if (!conn) return;
+  conn.activeArtistId = preset?.id ?? '';
+  if (preset) applyArtistVibeState(conn.vibes, preset);
+  artistPickerOpen.value = false;
+  toastr.success(
+    preset ? `已切换到「${preset.name || '未命名画师串'}」` : '已停用画师串',
+    '柏宝绘',
+  );
+}
 
 /**
  * 实际出图方向:当前渠道锁了就按锁(settings.ts 的 activeOrientationLock),否则按 tag 里记的。
@@ -626,6 +674,17 @@ watch(hash, () => maybeAutoGenerate());
             <Icon name="trash" :size="15" />
           </button>
           <button
+            v-if="artistConn"
+            class="bbi-fab"
+            :class="{ 'bbi-fab--on': artistPickerOpen }"
+            type="button"
+            title="切换画师串"
+            :aria-expanded="artistPickerOpen"
+            @click="menuOpen = false; artistPickerOpen = !artistPickerOpen"
+          >
+            <Icon name="palette" :size="15" />
+          </button>
+          <button
             class="bbi-fab"
             type="button"
             title="编辑提示词"
@@ -646,6 +705,62 @@ watch(hash, () => maybeAutoGenerate());
           </button>
         </span>
       </span>
+
+      <!-- 画师串快捷切换:楼层面板直接换配方,不用跳设置页;预览图帮助认风格 -->
+      <div
+        v-if="artistPickerOpen && artistConn && !busy && !planning"
+        class="bbi-figure__artist-picker"
+      >
+        <div class="bbi-figure__artist-head">
+          <span class="bbi-figure__artist-title">画师串</span>
+          <button
+            class="bbi-figure__artist-close"
+            type="button"
+            title="关闭"
+            aria-label="关闭画师串面板"
+            @click="artistPickerOpen = false"
+          >
+            <Icon name="close" :size="12" />
+          </button>
+        </div>
+        <div class="bbi-figure__artist-grid">
+          <button
+            class="bbi-figure__artist-card"
+            :class="{ 'is-active': !currentArtistId }"
+            type="button"
+            @click="pickArtist(null)"
+          >
+            <span class="bbi-figure__artist-thumb bbi-figure__artist-thumb--none">
+              <Icon name="close" :size="14" />
+            </span>
+            <span class="bbi-figure__artist-name">不使用</span>
+          </button>
+          <button
+            v-for="choice in artistChoices"
+            :key="choice.preset.id"
+            class="bbi-figure__artist-card"
+            :class="{ 'is-active': choice.preset.id === currentArtistId }"
+            type="button"
+            :title="choice.preset.prompt || choice.preset.name"
+            @click="pickArtist(choice.preset)"
+          >
+            <img
+              v-if="choice.preset.previewPath"
+              class="bbi-figure__artist-thumb"
+              :src="choice.preset.previewPath"
+              :alt="choice.preset.name"
+              loading="lazy"
+              decoding="async"
+            />
+            <span v-else class="bbi-figure__artist-thumb bbi-figure__artist-thumb--none">
+              <Icon name="palette" :size="14" />
+            </span>
+            <span class="bbi-figure__artist-name">
+              {{ choice.preset.name || '未命名画师串' }}<template v-if="choice.builtin">(内置)</template>
+            </span>
+          </button>
+        </div>
+      </div>
 
       <!-- 翻页器:叠在图片右下角的胶囊 -->
       <span v-if="pageable" class="bbi-figure__pager">

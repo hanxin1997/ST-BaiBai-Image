@@ -33,6 +33,7 @@ import {
   vibeFingerprint,
   vibeMetaFromData,
 } from '@/backends/vibeStore';
+import { applyArtistVibeState } from '@/backends/naiArtistLib';
 import NaiArtistManager from '@/pages/backend/panels/NaiArtistManager.vue';
 import { acquireNaiSlot } from '@/floor/genQueue';
 import { makeJpegThumbnail } from '@/st/imageFile';
@@ -243,13 +244,23 @@ const artistOptions = computed(() => [
 ]);
 
 /**
+ * 切换当前画师串并套用其 Vibe 绑定。
+ * undefined = 旧数据未绑定(切换时不动 Vibe);[] = 明确不使用(全部关闭)。
+ */
+function selectArtist(id: string) {
+  conn.value.activeArtistId = id;
+  const next = activeNaiArtist(conn.value);
+  if (next) applyArtistVibeState(conn.value.vibes, next);
+}
+
+/**
  * 下拉的值取「实际生效的那一条」而非存的 id:存的 id 悬空时 activeNaiArtist 返回 null,
  * 下拉也该跟着显示「不使用」,不能显示空白。
  */
 const activeArtistId = computed<string>({
   get: () => artist.value?.id ?? NO_ARTIST,
   set: id => {
-    conn.value.activeArtistId = id;
+    selectArtist(id);
   },
 });
 
@@ -285,7 +296,7 @@ function commitRenameArtist() {
 function addArtist() {
   const preset = newNaiArtist(`画师串 ${conn.value.artistPresets.length + 1}`);
   conn.value.artistPresets.push(preset);
-  conn.value.activeArtistId = preset.id;
+  selectArtist(preset.id);
 }
 
 function duplicateArtist() {
@@ -294,15 +305,18 @@ function duplicateArtist() {
   // 只换 id 与名字;id 生成仍由 settings 统一口径。
   // 内置配方也走这里:复制出来的副本是普通用户条目,随便改——这是内置条唯一的自定义路径。
   // 显式逐字段拷贝,不带 previewPath:预览文件随原条目删除,共指一个路径会让副本日后破图。
+  // Vibe 绑定与参数快照跟着走:它们只是引用/纯数据,不拥有文件。
   const preset: NaiArtistPreset = {
     id: newNaiArtist().id,
     name: `${src.name} 副本`,
     prompt: src.prompt,
     quality: src.quality,
     negative: src.negative,
+    vibes: src.vibes?.map(ref => ({ ...ref })),
+    params: src.params ? { ...src.params } : undefined,
   };
   conn.value.artistPresets.push(preset);
-  conn.value.activeArtistId = preset.id;
+  selectArtist(preset.id);
 }
 
 async function confirmRemoveArtist() {
@@ -322,7 +336,36 @@ async function confirmRemoveArtist() {
   list.splice(index, 1);
   // 接位到原位置那一条(已是最后一条则退一格);删空了就回「不使用」——
   // `?? ''` 正是画师串库与工作流库的分水岭(那边恒非空、回落 [0]),不能省。
-  conn.value.activeArtistId = list[Math.min(index, list.length - 1)]?.id ?? '';
+  selectArtist(list[Math.min(index, list.length - 1)]?.id ?? '');
+}
+
+/* ============ 画师串的 Vibe 绑定 ============ */
+
+const artistVibeSummary = computed(() => {
+  const a = artist.value;
+  if (!a || a.vibes === undefined) return '未绑定 Vibe;切换画师串时不动 Vibe。';
+  if (!a.vibes.length) return '已绑定:不使用任何 Vibe。';
+  const enabled = a.vibes.filter(ref => ref.enabled).length;
+  return `已绑定 ${a.vibes.length} 条(启用 ${enabled} 条);切换时整套覆盖。`;
+});
+
+/** 把当前 Vibe 库的启用状态与强度快照到画师串上。 */
+function saveArtistVibeState() {
+  const a = artist.value;
+  if (!a || isBuiltinArtist.value) return;
+  a.vibes = conn.value.vibes.map(vibe => ({
+    id: vibe.id,
+    enabled: vibe.enabled,
+    strength: vibe.strength,
+  }));
+  toastr.success(`已保存 ${a.vibes.length} 条 Vibe 状态到「${a.name}」`, '画师串');
+}
+
+function unbindArtistVibes() {
+  const a = artist.value;
+  if (!a || isBuiltinArtist.value) return;
+  delete a.vibes;
+  toastr.success(`已解除「${a.name}」的 Vibe 绑定`, '画师串');
 }
 
 /* ============ 从智绘姬迁移提示词预设 ============ */
@@ -372,7 +415,7 @@ function runArtistImport() {
     }
   }
   if (switchActiveArtist.value && result.activeArtistId) {
-    conn.value.activeArtistId = result.activeArtistId;
+    selectArtist(result.activeArtistId);
   }
   const parts = [`新增 ${result.imported} 个`];
   if (result.overwritten) parts.push(`覆盖更新 ${result.overwritten} 个`);
@@ -648,6 +691,26 @@ function onGroupPick(vibe: NaiVibe, value: string) {
   if (name) vibe.group = name;
 }
 
+/** 管理态多选:只服务于「保存为组」,与单条启用状态无关。 */
+const vibeSelected = ref<ReadonlySet<string>>(new Set());
+
+function toggleVibeSelected(id: string) {
+  const next = new Set(vibeSelected.value);
+  if (!next.delete(id)) next.add(id);
+  vibeSelected.value = next;
+}
+
+/** 把勾选的 Vibe 归进同一个组;组名可复用已有组,也可现场新建。 */
+function saveSelectedAsGroup() {
+  const chosen = conn.value.vibes.filter(vibe => vibeSelected.value.has(vibe.id));
+  if (!chosen.length) return;
+  const name = window.prompt('分组名称(输入已有组名即并入该组)')?.trim();
+  if (!name) return;
+  for (const vibe of chosen) vibe.group = name;
+  vibeSelected.value = new Set();
+  toastr.success(`已把 ${chosen.length} 条 Vibe 保存为组「${name}」`, 'Vibe');
+}
+
 function isGroupCollapsed(key: string): boolean {
   return collapsedGroups.value.has(key);
 }
@@ -831,6 +894,17 @@ async function removeVibe(vibe: NaiVibe) {
   }
   const index = conn.value.vibes.indexOf(vibe);
   if (index >= 0) conn.value.vibes.splice(index, 1);
+  // 绑定引用同步清掉,避免画师串上留下指向已删 Vibe 的悬空项
+  for (const preset of conn.value.artistPresets) {
+    if (preset.vibes?.some(ref => ref.id === vibe.id)) {
+      preset.vibes = preset.vibes.filter(ref => ref.id !== vibe.id);
+    }
+  }
+  if (vibeSelected.value.has(vibe.id)) {
+    const next = new Set(vibeSelected.value);
+    next.delete(vibe.id);
+    vibeSelected.value = next;
+  }
   if (deleteError) toastr.warning(`索引已删除，但文件清理失败：${errorMessage(deleteError)}`, 'Vibe');
 }
 </script>
@@ -1109,6 +1183,27 @@ async function removeVibe(vibe: NaiVibe) {
           <p class="bbi-field-hint art-hint">
             这里设置的提示词会覆盖下面的，随画师串一起切换;这里没设置，就会用下面的。
           </p>
+
+          <div v-if="!isBuiltinArtist" class="art-vibe-bind">
+            <button
+              class="bbi-btn bbi-btn-sm"
+              type="button"
+              title="把当前 Vibe 库的启用状态与强度存进这条画师串"
+              @click="saveArtistVibeState"
+            >
+              <Icon name="checklist" :size="12" /> 保存当前 Vibe 状态
+            </button>
+            <button
+              v-if="artist.vibes"
+              class="bbi-btn bbi-btn-sm"
+              type="button"
+              title="删除绑定;之后切换这条画师串不再动 Vibe"
+              @click="unbindArtistVibes"
+            >
+              解除绑定
+            </button>
+            <span class="bbi-field-hint art-vibe-summary">{{ artistVibeSummary }}</span>
+          </div>
         </template>
         <!-- 不选画师串时无提示:下拉里「不使用」已自明 -->
 
@@ -1352,6 +1447,16 @@ async function removeVibe(vibe: NaiVibe) {
             </button>
           </div>
 
+          <div v-if="vibeSelected.size" class="vibe-batch">
+            <span class="vibe-batch-count">已选 {{ vibeSelected.size }} 条</span>
+            <button class="bbi-btn bbi-btn-sm" type="button" @click="saveSelectedAsGroup">
+              <Icon name="checklist" :size="12" /> 保存为组
+            </button>
+            <button class="bbi-btn bbi-btn-sm" type="button" @click="vibeSelected = new Set()">
+              清空
+            </button>
+          </div>
+
           <p v-if="!matchedCount" class="bbi-field-hint">没有匹配「{{ vibeSearch }}」的 Vibe。</p>
 
           <div v-for="group in vibeGroups" :key="group.key" class="vibe-group">
@@ -1429,6 +1534,15 @@ async function removeVibe(vibe: NaiVibe) {
 
             <div v-show="!isGroupCollapsed(group.key)" class="vibe-group-body">
               <div v-for="vibe in group.items" :key="vibe.id" class="vibe-item">
+                <label class="vibe-select" title="勾选后可保存为组" @click.stop>
+                  <input
+                    type="checkbox"
+                    class="bbi-checkbox"
+                    :checked="vibeSelected.has(vibe.id)"
+                    aria-label="选择此 Vibe"
+                    @change="toggleVibeSelected(vibe.id)"
+                  />
+                </label>
                 <img
                   v-if="vibe.thumbnailPath"
                   class="vibe-thumb"
@@ -1822,6 +1936,17 @@ async function removeVibe(vibe: NaiVibe) {
 .art-hint {
   margin-top: 8px;
 }
+/* Vibe 绑定行:按钮与状态说明同一行,窄屏自动换行 */
+.art-vibe-bind {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.art-vibe-summary {
+  margin: 0;
+}
 
 /* V5 画师串差异提醒:警示色,与常规说明区分开 */
 .art-hint-warn {
@@ -2043,6 +2168,12 @@ async function removeVibe(vibe: NaiVibe) {
   padding: 10px 0;
   border-top: 1px solid var(--bbi-border, rgba(127, 127, 127, 0.2));
 }
+.vibe-select {
+  display: flex;
+  align-items: flex-start;
+  flex: 0 0 auto;
+  padding-top: 2px;
+}
 .vibe-thumb {
   width: 56px;
   height: 56px;
@@ -2144,6 +2275,23 @@ async function removeVibe(vibe: NaiVibe) {
   min-width: 0;
   padding: 6px 10px;
   font-size: 13px;
+}
+/* 勾选批量条:有勾选时才出现,与画师串管理器的批量条同观感 */
+.vibe-batch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 10px;
+  margin-bottom: 6px;
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-accent-soft);
+  font-size: 12px;
+}
+.vibe-batch-count {
+  font-weight: 600;
+  color: var(--bbi-accent);
+  white-space: nowrap;
 }
 .vibe-count {
   font-size: 12px;

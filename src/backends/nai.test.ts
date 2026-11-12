@@ -321,7 +321,16 @@ describe('NAI V5 support', () => {
       const params = buildNaiParameters(nai({ model }), { prompt: '1girl', seed: 42 });
       expect(params.params_version).toBe(4);
       expect(params.v4_prompt).toBeTruthy();
-      expect(params.skip_cfg_above_sigma).toBeNull();
+      // V5 契约:旧字段不发,改用官方 preset id;skip_cfg 不在 V5 参数里。
+      expect(params.skip_cfg_above_sigma).toBeUndefined();
+      expect(params.ucPreset).toBeUndefined();
+      expect(params.qualityToggle).toBeUndefined();
+      expect(params.qualityPresetId).toBe('standard');
+      expect(params.ucPresetId).toBe('heavy');
+      expect(params.use_coords).toBe(true);
+      expect(params.straight_alpha).toBe(true);
+      expect(params.image_format).toBe('png');
+      expect(params.characterPrompts).toEqual([]);
       expect(params.sampler).toBe('k_euler');
     }
     const fallback = buildNaiParameters(nai({ model: 'nai-diffusion-5-full', sampler: 'ddim_v3' }), {
@@ -393,8 +402,41 @@ describe('NAI V5 support', () => {
       { char_caption: '', centers: [{ x: 0.5, y: 0.5 }] },
       { char_caption: '', centers: [{ x: 0.5, y: 0.5 }] },
     ]);
-    expect(positive.use_coords).toBe(false);
+    // V5 官方/LWB 都恒开 use_coords,并同时发结构化 characterPrompts。
+    expect(positive.use_coords).toBe(true);
     expect(positive.use_order).toBe(true);
+    expect(params.characterPrompts).toEqual([
+      {
+        prompt: 'girl, black hair, white dress. On the left, waving.',
+        uc: '',
+        center: { x: 0.5, y: 0.5 },
+        enabled: true,
+      },
+      {
+        prompt: 'girl, silver hair, red dress',
+        uc: '',
+        center: { x: 0.5, y: 0.5 },
+        enabled: true,
+      },
+    ]);
+
+    // latent 的摊平模式仍走旧协议:角色不再结构化发一遍,旧字段原样保留。
+    const flattened = buildNaiParameters(settings, {
+      prompt: '2girls, classroom, sunset',
+      nl: 'Two girls in a sunset classroom.',
+      characters: [
+        { name: 'A', tag: '1girl, black hair, white dress', nl: 'On the left, waving.' },
+        { name: 'B', tag: 'girl, silver hair, red dress', nl: '' },
+      ],
+      seed: 42,
+      flatten: true,
+    });
+    expect(flattened.characterPrompts).toEqual([]);
+    expect(flattened.use_coords).toBe(false);
+    expect(flattened.ucPreset).toBe(3);
+    expect(flattened.qualityToggle).toBe(true);
+    expect(flattened.skip_cfg_above_sigma).toBeNull();
+    expect(flattened.qualityPresetId).toBeUndefined();
   });
 
   it('uses model-specific V5 vibe encodings', () => {

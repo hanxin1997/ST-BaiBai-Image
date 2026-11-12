@@ -1,9 +1,58 @@
-import type { NaiArtistPreset } from '@/state/settings';
+import type {
+  NaiArtistPreset,
+  NaiPresetParams,
+  NaiSettings,
+  NaiVibe,
+} from '@/state/settings';
 
 /**
- * 画师串库的管理态纯逻辑(搜索匹配 / 删除接位规划)。
+ * 画师串库的管理态纯逻辑(搜索匹配 / 删除接位规划 / Vibe 绑定)。
  * 与交互解耦,便于单测;NaiArtistManager.vue 只做交互与落盘。
  */
+
+/** 切换画师串时套用其 Vibe 绑定:undefined = 未绑定,不动;[] = 明确不使用,全部关闭。 */
+export function applyArtistVibeState(
+  vibes: readonly NaiVibe[],
+  preset: Pick<NaiArtistPreset, 'vibes'>,
+): void {
+  if (!preset.vibes) return;
+  const refs = new Map(preset.vibes.map(ref => [ref.id, ref]));
+  for (const vibe of vibes) {
+    const ref = refs.get(vibe.id);
+    vibe.enabled = ref?.enabled ?? false;
+    if (ref) vibe.strength = ref.strength;
+  }
+}
+
+/** 把当前渠道参数拍成快照(导出与「保存当前参数」共用)。 */
+export function snapshotNaiPresetParams(conn: NaiSettings): NaiPresetParams {
+  return {
+    model: conn.model,
+    sampler: conn.sampler,
+    steps: conn.steps,
+    scale: conn.scale,
+    cfgRescale: conn.cfgRescale,
+    noiseSchedule: conn.noiseSchedule,
+    varietyBoost: conn.varietyBoost,
+    normalizeRefStrength: conn.normalizeRefStrength,
+    portraitSize: conn.portraitSize,
+    landscapeSize: conn.landscapeSize,
+  };
+}
+
+/** 把预设参数写回渠道;只由用户显式点「应用参数」触发,切换画师串不自动调用。 */
+export function applyNaiPresetParams(conn: NaiSettings, params: NaiPresetParams): void {
+  conn.model = params.model;
+  conn.sampler = params.sampler;
+  conn.steps = params.steps;
+  conn.scale = params.scale;
+  conn.cfgRescale = params.cfgRescale;
+  conn.noiseSchedule = params.noiseSchedule;
+  conn.varietyBoost = params.varietyBoost;
+  conn.normalizeRefStrength = params.normalizeRefStrength;
+  conn.portraitSize = params.portraitSize;
+  conn.landscapeSize = params.landscapeSize;
+}
 
 /**
  * 搜索匹配:名称 + 画师串内容,大小写不敏感的子串匹配;空词恒真(= 不过滤)。
