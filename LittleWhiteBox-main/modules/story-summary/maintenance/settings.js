@@ -1,1 +1,0 @@
-export const DEFAULT_MEMORY_MAINTENANCE_ENABLED = false;

@@ -11,3 +11,9 @@ CLAUDE.md
 AGENTS.md
 .pi/
 data/
+
+# 参考实现与方案文档：不进仓库，只提交项目代码
+LittleWhiteBox-main/
+st-chatu8-main/
+ST-BaiBai-Image-main/
+PLAN-*.md
