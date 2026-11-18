@@ -107,22 +107,42 @@ export function retryDelayMs(
   return Math.min(Math.max(jittered, retryAfterMs ?? 0), MAX_WAIT_MS);
 }
 
-/* ============ 全局节奏状态 ============ */
+/* ============ 按闸门分账的节奏状态 ============ */
 
-let cooldownUntil = 0;
 /**
- * 上一次请求发出的时刻。初值 -Infinity 而非 0:0 的语义是「1970 年发过一次」,
- * 只在 now 远大于最小间隔时才碰巧等价于「没发过」。-Infinity 让「从未发过 → 无需等待」
- * 与时钟取值无关地成立。
+ * 不指名闸门时用的那一本账(单测与历史调用)。生产路径一律传接入点 id。
+ * 空串不会与真实接入点撞:接入点 id 恒非空(normalize 兜底)。
  */
-let lastStartAt = Number.NEGATIVE_INFINITY;
+export const DEFAULT_NAI_GATE = '';
+
+interface PacingState {
+  cooldownUntil: number;
+  /**
+   * 上一次请求发出的时刻。初值 -Infinity 而非 0:0 的语义是「1970 年发过一次」,
+   * 只在 now 远大于最小间隔时才碰巧等价于「没发过」。-Infinity 让「从未发过 → 无需等待」
+   * 与时钟取值无关地成立。
+   */
+  lastStartAt: number;
+}
+
+const pacing = new Map<string, PacingState>();
+
+function pacingOf(gate: string): PacingState {
+  let state = pacing.get(gate);
+  if (!state) {
+    state = { cooldownUntil: 0, lastStartAt: Number.NEGATIVE_INFINITY };
+    pacing.set(gate, state);
+  }
+  return state;
+}
+
 let minIntervalMs = NAI_MIN_INTERVAL_MS;
 
 /** 429 冷却的下界:见 noteNaiRateLimited。 */
 const MIN_COOLDOWN_MS = 1000;
 
 /**
- * 记一次 429:给整个闸门上冷却。
+ * 记一次 429:给该闸门上冷却(别的接入点不受影响)。
  *
  * **只延后不提前** —— 并发 ≥2 时几个槽位可能接连撞上,后来的短冷却不该把前面的长冷却冲掉。
  * **下界 1s** —— 哪怕对方给的是 `Retry-After: 0`(或一个已过期的日期),429 也总该让闸门
@@ -131,25 +151,28 @@ const MIN_COOLDOWN_MS = 1000;
 export function noteNaiRateLimited(
   retryAfterMs: number | null,
   now: number = Date.now(),
+  gate: string = DEFAULT_NAI_GATE,
 ): void {
+  const state = pacingOf(gate);
   const requested = retryAfterMs ?? NAI_RATE_LIMIT_COOLDOWN_MS;
   const until = now + Math.min(Math.max(requested, MIN_COOLDOWN_MS), MAX_WAIT_MS);
-  if (until > cooldownUntil) cooldownUntil = until;
+  if (until > state.cooldownUntil) state.cooldownUntil = until;
 }
 
 /** 记一次请求发出的时刻(最小间隔的基准)。取槽后与每次重试前都要记。 */
-export function noteNaiRequestStart(now: number = Date.now()): void {
-  lastStartAt = now;
+export function noteNaiRequestStart(now: number = Date.now(), gate: string = DEFAULT_NAI_GATE): void {
+  pacingOf(gate).lastStartAt = now;
 }
 
 /** 现在还得等多久才允许发下一个请求:冷却剩余与最小间隔剩余取大。 */
-export function naiPacingDelayMs(now: number = Date.now()): number {
-  return Math.max(0, cooldownUntil - now, lastStartAt + minIntervalMs - now);
+export function naiPacingDelayMs(now: number = Date.now(), gate: string = DEFAULT_NAI_GATE): number {
+  const state = pacingOf(gate);
+  return Math.max(0, state.cooldownUntil - now, state.lastStartAt + minIntervalMs - now);
 }
 
 /** 冷却剩余(仅供展示/诊断;闸门判断用 naiPacingDelayMs)。 */
-export function naiCooldownRemainingMs(now: number = Date.now()): number {
-  return Math.max(0, cooldownUntil - now);
+export function naiCooldownRemainingMs(now: number = Date.now(), gate: string = DEFAULT_NAI_GATE): number {
+  return Math.max(0, pacingOf(gate).cooldownUntil - now);
 }
 
 /**
@@ -160,10 +183,9 @@ export function setNaiMinInterval(ms: number): void {
   minIntervalMs = Math.max(0, ms);
 }
 
-/** 复位节奏状态(不动最小间隔,那是 setNaiMinInterval 的事)。 */
+/** 复位所有闸门的节奏状态(不动最小间隔,那是 setNaiMinInterval 的事)。 */
 export function resetNaiPacing(): void {
-  cooldownUntil = 0;
-  lastStartAt = Number.NEGATIVE_INFINITY;
+  pacing.clear();
 }
 
 /* ============ 可取消的等待 ============ */
@@ -212,6 +234,8 @@ export interface NaiRetryOptions {
   onRetry?: (info: NaiRetryInfo) => void;
   /** 等待实现。留给单测注入,免得跑一遍测试真睡几十秒。 */
   delay?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** 记账到哪个闸门(接入点 id);须与调用方取槽时的闸门一致。 */
+  gate?: string;
 }
 
 /** 鸭子类型取状态码与 Retry-After:不 import NaiError,免成环(见 shouldRetryNai)。 */
@@ -238,7 +262,7 @@ export async function runNaiWithRetry<T>(
   run: () => Promise<T>,
   opts: NaiRetryOptions = {},
 ): Promise<T> {
-  const { signal, onRetry, delay = abortableDelay } = opts;
+  const { signal, onRetry, delay = abortableDelay, gate = DEFAULT_NAI_GATE } = opts;
   const maxRetries = NAI_MAX_ATTEMPTS - 1;
 
   for (let attempt = 1; ; attempt++) {
@@ -251,18 +275,18 @@ export async function runNaiWithRetry<T>(
       if (attempt > maxRetries || !shouldRetryNai(error, status)) throw error;
 
       const retryAfterMs = errorRetryAfterMs(error);
-      // 429 = 对方明确说「太快了」。除了自己退避,还要给整个闸门上冷却,
+      // 429 = 对方明确说「太快了」。除了自己退避,还要给该闸门上冷却,
       // 否则队列里其余任务会在同一秒接着撞上去 —— 那串密集失败才是封号风险所在。
-      if (status === 429) noteNaiRateLimited(retryAfterMs);
+      if (status === 429) noteNaiRateLimited(retryAfterMs, Date.now(), gate);
 
-      const waitMs = Math.max(retryDelayMs(attempt, retryAfterMs), naiPacingDelayMs());
+      const waitMs = Math.max(retryDelayMs(attempt, retryAfterMs), naiPacingDelayMs(Date.now(), gate));
       onRetry?.({ attempt, max: maxRetries, waitMs, error });
       console.warn(
         `[柏宝绘] NAI 请求失败,${Math.round(waitMs / 1000)}s 后重试(第 ${attempt}/${maxRetries} 次):`,
         error,
       );
       await delay(waitMs, signal);
-      noteNaiRequestStart();
+      noteNaiRequestStart(Date.now(), gate);
     }
   }
 }

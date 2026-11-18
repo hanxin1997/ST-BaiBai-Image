@@ -22,7 +22,10 @@ import { isAiStoryMessage, isStoryMessage, type STContext } from '@/st/context';
 import type { AutoTagSettings } from '@/state/settings';
 import {
   activeComfyPreset,
+  activeComfyPromptSet,
+  activeLatentApiProfile,
   activeOrientationLock,
+  BUILTIN_COMFY_ILLUST_ID,
   DEFAULT_COMFY_NL_SPEC,
   DEFAULT_COMFY_SPEC,
   DEFAULT_COMFY_THINKING,
@@ -58,14 +61,14 @@ export interface AutoTagProfile {
   squareSize: boolean;
 }
 
-/** 当前渠道是否走 NAI 协议(nai / latent)。两者的规范、思维链、角色分区口径完全相同。 */
+/** 当前渠道是否走 NAI 协议(只有 nai)。 */
 function naiProtocolBackend(): boolean {
-  return settings.defaultBackend === 'nai' || settings.defaultBackend === 'latent';
+  return settings.defaultBackend === 'nai';
 }
 
-/** 当前 NAI 系渠道的设置对象(模型判据要读对那一份)。 */
+/** 当前 NAI 渠道的设置对象。 */
 function naiProtocolConn() {
-  return settings.defaultBackend === 'latent' ? settings.latent : settings.nai;
+  return settings.nai;
 }
 
 /** 当前渠道的「生成自然语言」开关(非 NAI 系)。 */
@@ -82,8 +85,7 @@ export function autoTagProfile(): AutoTagProfile {
   const naiProtocol = naiProtocolBackend() && naiSupportsCharacterPrompts(naiProtocolConn().model);
   const naiCharPrompts = naiProtocol || latentApi;
   // NAI 系只有 4.5/V5(角色分区)才有 nl 这回事;单串分支的协议本来就不写 nl
-  const nl = naiProtocol ? naiProtocolConn().naturalLanguage : !naiProtocolBackend() && backendNlSwitch();
-  const lock = activeOrientationLock();
+  const nl = naiProtocol ? naiProtocolConn().naturalLanguage : !naiProtocolBackend() && backendNlSwitch();  const lock = activeOrientationLock();
   // square 锁只在新渠道有意义;别的渠道手改出来的 square 当作未锁,出图端 pickSize 自会落竖屏
   const lockedSize = lock === 'auto' || (lock === 'square' && !latentApi) ? null : lock;
   return { naiCharPrompts, nl, characterNl: naiProtocol && nl, lockedSize, squareSize: latentApi };
@@ -136,14 +138,20 @@ function backendPromptSpec(options: AutoTagSettings, nlOn: boolean, naiCharPromp
   const prompts = options.prompts;
   const backend = settings.defaultBackend;
   if (backend === 'imgrouter' || backend === 'comfyui') {
+    // ComfyUI:方案引用的用户提示词集优先;引用内置(= 没选)时回落设置页全局,再回落内置。
+    const promptSet = backend === 'comfyui' ? activeComfyPromptSet() : null;
+    const setSpec = promptSet && promptSet.id !== BUILTIN_COMFY_ILLUST_ID ? promptSet.spec.trim() : '';
     const template =
       backend === 'imgrouter'
         ? customOrBuiltin(prompts?.imgRouterSpec, DEFAULT_IMGROUTER_SPEC)
-        : customOrBuiltin(prompts?.comfySpec, DEFAULT_COMFY_SPEC);
+        : customOrBuiltin(setSpec || prompts?.comfySpec, DEFAULT_COMFY_SPEC);
     return resolveNlMacro(expandNlSections(template, nlOn), nlOn);
   }
   if (backend === 'latentapi') {
-    return expandNlSections(customOrBuiltin(prompts?.latentApiSpec, DEFAULT_LATENT_API_SPEC), nlOn);
+    // 三级回落:配置里的规范 → 设置页全局 → 内置默认
+    const profileSpec = activeLatentApiProfile().spec.trim();
+    const template = profileSpec || customOrBuiltin(prompts?.latentApiSpec, DEFAULT_LATENT_API_SPEC);
+    return expandNlSections(template, nlOn);
   }
   if (naiProtocolBackend()) {
     const template = naiCharPromptsOn
@@ -169,12 +177,23 @@ function backendThinkingPrompt(options: AutoTagSettings, nlOn: boolean, naiCharP
   const backend = settings.defaultBackend;
   let template: string;
   if (backend === 'imgrouter') template = customOrBuiltin(prompts?.imgRouterThinking, DEFAULT_IMGROUTER_THINKING);
-  else if (backend === 'latentapi') template = customOrBuiltin(prompts?.latentApiThinking, DEFAULT_LATENT_API_THINKING);
-  else if (naiProtocolBackend()) {
+  else if (backend === 'latentapi') {
+    // 三级回落:配置里的思维链 → 设置页全局 → 内置默认
+    const profileThinking = activeLatentApiProfile().thinking.trim();
+    template = profileThinking || customOrBuiltin(prompts?.latentApiThinking, DEFAULT_LATENT_API_THINKING);
+  } else if (naiProtocolBackend()) {
     template = naiCharPromptsOn
       ? customOrBuiltin(prompts?.naiV5Thinking, DEFAULT_NAI_V5_THINKING)
       : customOrBuiltin(prompts?.naiThinking, DEFAULT_NAI_THINKING);
-  } else template = customOrBuiltin(prompts?.comfyThinking, DEFAULT_COMFY_THINKING);
+  } else {
+    const promptSet = activeComfyPromptSet();
+    const setThinking =
+      promptSet.id !== BUILTIN_COMFY_ILLUST_ID ? promptSet.thinking.trim() : '';
+    template = customOrBuiltin(
+      setThinking || prompts?.comfyThinking,
+      DEFAULT_COMFY_THINKING,
+    );
+  }
   return expandNlSections(template, nlOn);
 }
 

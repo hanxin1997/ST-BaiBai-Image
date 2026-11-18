@@ -41,8 +41,12 @@ import { acquireLatentApiSlot, acquireNaiSlot } from '@/floor/genQueue';
 import type { GenerationMeta } from '@/generationMeta';
 import {
   activeComfyPreset,
+  activeComfyServer,
+  activeNaiGateId,
+  activeNaiPlan,
   activeOrientationLock,
   effectiveComfyConn,
+  effectiveNai,
   settings,
   type BackendId,
 } from '@/state/settings';
@@ -101,26 +105,22 @@ export interface GenerateOutput {
 export interface BackendStatus {
   backend: BackendId;
   configured: boolean;
-  /** NAI/Latent 为模型名;ComfyUI 为当前工作流预设名;ImgRouter 为模型 id 或 '(渠道默认)'。 */
+  /** NAI 为模型名;ComfyUI 为当前工作流预设名;ImgRouter 为模型 id 或 '(渠道默认)';Latent 原生 API 固定模型名。 */
   model: string;
-  /** 当前后端是否支持 characters(NAI/Latent 4.5/V5 为 true,ComfyUI / ImgRouter 恒 false)。 */
+  /** 当前后端是否支持 characters(NAI 4.5/V5 与 Latent 原生 API 为 true,ComfyUI / ImgRouter 恒 false)。 */
   supportsCharacters: boolean;
   /** configured=false 时的人话原因;已就绪为空串。 */
   reason: string;
 }
 
-/** nai 与 latent 走同一条 NAI 协议 + 同一道客户端闸门。 */
+/** nai 走 NAI 协议 + 同一道客户端闸门。 */
 export function isNaiProtocol(backend: BackendId): boolean {
-  return backend === 'nai' || backend === 'latent';
+  return backend === 'nai';
 }
 
 /** 该后端是否有客户端并发闸门(取槽可能先排队,卡片/公开接口据此先报 queued)。 */
 export function hasClientGate(backend: BackendId): boolean {
   return isNaiProtocol(backend) || backend === 'latentapi';
-}
-
-function naiConnOf(backend: 'nai' | 'latent') {
-  return backend === 'latent' ? settings.latent : settings.nai;
 }
 
 function urlKeyReason(url: string, key: string, urlLabel: string, keyLabel: string): string {
@@ -132,7 +132,7 @@ function urlKeyReason(url: string, key: string, urlLabel: string, keyLabel: stri
 function comfyStatus(): BackendStatus {
   const preset = activeComfyPreset();
   const base = { backend: 'comfyui' as const, model: preset.name, supportsCharacters: false };
-  if (!settings.comfyui.url.trim()) {
+  if (!activeComfyServer().url.trim()) {
     return { ...base, configured: false, reason: '未填写 ComfyUI 服务地址' };
   }
   if (preset.mode === 'simple') {
@@ -151,24 +151,19 @@ function comfyStatus(): BackendStatus {
  *
  * ComfyUI 要按模式分别校验(custom 要工作流 JSON;simple 要模型/VAE/CLIP 选齐,
  * 与出图组装同一口径 validateSimpleConfig,避免「卡片能点、出图才报错」);
- * NAI / Latent / ImgRouter 要 url + key。
+ * NAI / ImgRouter / Latent 原生 API 要 url + key。
  */
 export function backendStatus(): BackendStatus {
   const backend = settings.defaultBackend;
 
-  if (backend === 'nai' || backend === 'latent') {
-    const conn = naiConnOf(backend);
-    const reason = urlKeyReason(
-      conn.url,
-      conn.key,
-      backend === 'nai' ? 'NAI 服务地址' : 'Latent 服务地址',
-      backend === 'nai' ? 'NAI API Key' : 'Latent API Key',
-    );
+  if (backend === 'nai') {
+    const conn = settings.nai;
+    const reason = urlKeyReason(conn.url, conn.key, 'NAI 服务地址', 'NAI API Key');
     return {
       backend,
-      model: conn.model,
+      model: activeNaiPlan().model,
       // 支持与否只看模型,与配没配齐无关:第三方要在出图前就知道该不该传 characters
-      supportsCharacters: naiSupportsCharacterPrompts(conn.model),
+      supportsCharacters: naiSupportsCharacterPrompts(activeNaiPlan().model),
       configured: !reason,
       reason,
     };
@@ -212,15 +207,15 @@ export function backendStatus(): BackendStatus {
  * 定本次种子。**必须在发请求前定好**:一是部分采样器节点不接受 -1 自动随机,
  * 二是埋点与落盘(entry.seed)都要记下它,事后「同种子再来一张」才有依据。
  *
- * 口径:显式指定 > ImgRouter 恒 0 > NAI/Latent/Latent 原生 API 面板固定种子(>0) > 随机。
+ * 口径:显式指定 > ImgRouter 恒 0 > NAI/Latent 原生 API 面板固定种子(>0) > 随机。
  * ImgRouter 协议没有 seed,记 0 —— 不用 -1:BbiImageEntry.seed 明确不支持该值。
  */
 export function decideSeed(backend: BackendId, override?: number): number {
   if (override !== undefined && Number.isFinite(override) && override > 0) return Math.floor(override);
   if (backend === 'imgrouter') return 0;
-  if (backend === 'nai' || backend === 'latent') {
-    const conn = naiConnOf(backend);
-    return conn.seed > 0 ? conn.seed : naiRandomSeed();
+  if (backend === 'nai') {
+    const seed = activeNaiPlan().seed;
+    return seed > 0 ? seed : naiRandomSeed();
   }
   // 接口种子范围 0 ~ 2^53-1;随机复用 NAI 那份(正整数,足够用)
   if (backend === 'latentapi') return settings.latentApi.seed > 0 ? settings.latentApi.seed : naiRandomSeed();
@@ -240,7 +235,7 @@ function pickedPixels(pair: SizePair, size: Orientation): { width: number; heigh
 }
 
 async function runNai(
-  status: BackendStatus & { backend: 'nai' | 'latent' },
+  status: BackendStatus & { backend: 'nai' },
   input: GenerateInput,
   size: Orientation,
   signal: AbortSignal | undefined,
@@ -249,14 +244,13 @@ async function runNai(
   // characters 原样透传:不支持的模型由 buildNaiParameters 自己滤掉(同一口径
   // naiSupportsCharacterPrompts),在这儿再滤一遍只会多一处会漂的判据
   const output = await generateNaiImage(
-    naiConnOf(status.backend),
+    effectiveNai(),
     {
       prompt: input.prompt,
       nl: input.nl ?? '',
       characters: input.characters ?? [],
       seed: input.seed,
       size,
-      flatten: status.backend === 'latent',
     },
     signal,
     { onRetry: info => progress.onRetry?.({ attempt: info.attempt, max: info.max }) },
@@ -353,7 +347,7 @@ function dispatchGenerate(
   progress: GenerateProgress,
 ): Promise<BackendRun> {
   const backend = status.backend;
-  if (backend === 'nai' || backend === 'latent') return runNai({ ...status, backend }, input, size, signal, progress);
+  if (backend === 'nai') return runNai({ ...status, backend }, input, size, signal, progress);
   if (backend === 'imgrouter') return runImgRouter(status, input, size, signal);
   if (backend === 'latentapi') return runLatentApi(status, input, size, signal);
   return runComfy(status, input, size, signal, progress);
@@ -365,7 +359,7 @@ function dispatchGenerate(
  * 不负责落盘、不负责显示、不登记运行态、不做埋点 —— 那些是调用方的事。
  * signal 一路透传到 fetch/轮询;取消时抛 AbortError(DOMException)。
  *
- * 闸门纪律(见 floor/genQueue.ts):NAI 系与 Latent 原生 API 路径必须持槽发请求,
+ * 闸门纪律(见 floor/genQueue.ts):NAI 与 Latent 原生 API 路径必须持槽发请求,
  * release 放在 finally,漏一格就永久少一格并发。
  */
 export async function generateImage(
@@ -384,7 +378,7 @@ export async function generateImage(
 
   let release: (() => void) | null = null;
   try {
-    if (isNaiProtocol(status.backend)) release = await acquireNaiSlot(signal);
+    if (isNaiProtocol(status.backend)) release = await acquireNaiSlot(signal, activeNaiGateId());
     else if (status.backend === 'latentapi') release = await acquireLatentApiSlot(signal);
     progress.onStart?.();
     // 画幅锁在这里统一生效(卡片与公开接口同走本函数):只决定这一次用哪格尺寸,

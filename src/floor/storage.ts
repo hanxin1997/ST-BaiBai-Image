@@ -4,8 +4,9 @@ import { normalizeImagePath } from '@/floor/missingImages';
 import { deleteUploadedFile, uploadBase64File } from '@/floor/upload';
 import type { GenerationMeta } from '@/generationMeta';
 import { getContext, type STContext, type STMessage } from '@/st/context';
-import { deleteUserImage, uploadUserImage } from '@/st/images';
-import { settings } from '@/state/settings';
+import { makeJpegThumbnail } from '@/st/imageFile';
+import { deleteUserImage, LATENT_PROFILE_PREVIEW_FOLDER, uploadUserImage } from '@/st/images';
+import { activeLatentApiProfile, settings } from '@/state/settings';
 
 /**
  * 楼层卡片结果存储层（DESIGN-FLOOR-UI.md §7）。
@@ -405,6 +406,46 @@ export async function saveExternalImage(
  * 图片二进制落盘 → extra 写指针（先文件后指针，避免孤儿指针）；
  * 指针写失败则文件留作孤儿，由后续清理兜底。
  */
+/**
+ * 出图顺手给当前 Latent 配置存一张封面(不额外请求接口)。
+ *
+ * 只在「当前配置还没有预览图」时写:用户手动生成/上传过的封面不会被聊天图顶掉。
+ * 失败只警告——封面是附属物,不能因为缩略图失败让整次存图失败。
+ */
+async function maybeSaveLatentProfilePreview(
+  result: ComfyImageResult,
+  meta?: GenerationMeta,
+): Promise<void> {
+  if (meta?.backend !== 'latentapi') return;
+  const profile = activeLatentApiProfile();
+  if (profile.previewPath) return;
+  try {
+    const dataUrl = result.url.startsWith('data:')
+      ? result.url
+      : await fetch(result.url)
+          .then(response => response.blob())
+          .then(
+            blob =>
+              new Promise<string>((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result ?? ''));
+                reader.onerror = () => reject(reader.error ?? new Error('读取图片失败'));
+                reader.readAsDataURL(blob);
+              }),
+          );
+    const jpeg = await makeJpegThumbnail(dataUrl, 512, 0.85);
+    const base64 = jpeg.split(',')[1] ?? '';
+    profile.previewPath = await uploadUserImage(
+      LATENT_PROFILE_PREVIEW_FOLDER,
+      profile.id,
+      base64,
+      'jpg',
+    );
+  } catch (error) {
+    console.warn('[柏宝绘] 自动保存 Latent 配置封面失败（不影响出图）', error);
+  }
+}
+
 export async function saveImageResult(
   messageId: number,
   swipeId: number,
@@ -430,6 +471,8 @@ export async function saveImageResult(
     result,
     meta,
   );
+  // 顺手给当前 Latent 配置存封面:不额外调接口,用户不用为「预览图」单独消耗额度。
+  await maybeSaveLatentProfilePreview(result, meta);
 
   const entry: BbiImageEntry = {
     generationId: genId,

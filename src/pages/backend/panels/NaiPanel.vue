@@ -15,12 +15,15 @@ import {
   BUILTIN_NAI_ARTISTS,
   encodeVibeImage,
   isBuiltinNaiArtist,
+  isNai45,
   isNai5,
   naiDefaultQualityTags,
   naiDefaultUndesired,
+  naiFixedSettings,
   naiSamplers,
   naiSupportsVibes,
   NAI_NOISE_SCHEDULES,
+  NAI_SAMPLERS,
   parseNaiv4vibe,
   testNaiConnection,
   vibeModelKey,
@@ -34,7 +37,7 @@ import {
   vibeMetaFromData,
 } from '@/backends/vibeStore';
 import { applyArtistVibeState } from '@/backends/naiArtistLib';
-import NaiArtistManager from '@/pages/backend/panels/NaiArtistManager.vue';
+import NaiArtistLibrary from '@/pages/backend/panels/NaiArtistLibrary.vue';
 import { acquireNaiSlot } from '@/floor/genQueue';
 import { makeJpegThumbnail } from '@/st/imageFile';
 import { deleteUserImage } from '@/st/images';
@@ -58,40 +61,36 @@ import { getContext } from '@/st/context';
 import {
   activeNaiArtist,
   activeNaiEndpoint,
+  activeNaiPlan,
   newNaiArtist,
   newNaiEndpoint,
+  newNaiPlan,
+  NAI_CONCURRENCY_MAX,
   NAI_MODELS,
   ORIENTATION_LOCKS,
+  setActiveNaiPlan,
   settings,
   type NaiArtistPreset,
   type NaiEndpoint,
+  type NaiModel,
+  type NaiPlan,
   type NaiVibe,
 } from '@/state/settings';
 import { computed, nextTick, onMounted, ref } from 'vue';
 
 /**
- * 本面板同时服务 NAI 与 latent 两条渠道。
- *
- * 为什么参数化而不另写一份:latent 的协议与 NAI 完全相同(端点、鉴权、parameters、
- * vibe、画师配方、zip 解包),唯一差异是提示词打包方式,而那落在 backends/nai.ts 里,
- * 与本面板无关。本文件 2000 行、NaiArtistManager 另有 900 行,照抄一份等于把
- * 全部控件逻辑维护两遍——以后加个 NAI 参数就得记着改两处,漏一处就静默不一致。
- *
- * target 默认 'nai',故 <NaiPanel /> 的既有用法一字不用改。
+ * NAI 渠道面板(旧 latent 渠道已移除,Latent 只剩原生 API 面板)。
  */
-const props = withDefaults(defineProps<{ target?: 'nai' | 'latent' }>(), { target: 'nai' });
+const conn = computed(() => settings.nai);
 
-/**
- * 本渠道的设置对象。**所有读写一律走它**,不要再直接碰 settings 上的具体渠道字段 ——
- * 漏一处就会变成「在 latent 页签里改,却写进了 NAI 的配置」这种静默串档。
- */
-const conn = computed(() => (props.target === 'latent' ? settings.latent : settings.nai));
+/** 当前方案(唯一真源);平铺字段只是它的镜像,面板参数区直接编辑方案。 */
+const plan = computed<NaiPlan>(() => activeNaiPlan(conn.value));
 
 /** 渠道显示名(标题、toastr 标题、按钮文案共用)。 */
-const label = computed(() => (props.target === 'latent' ? 'Latent' : 'NAI'));
+const label = 'NAI';
 
 /** 本渠道是否为当前出图渠道;「使用此渠道」按钮与设置页选择器、页签徽标同属一个开关。 */
-const inUse = computed(() => settings.defaultBackend === props.target);
+const inUse = computed(() => settings.defaultBackend === 'nai');
 
 const testing = ref(false);
 const showKey = ref(false);
@@ -99,11 +98,14 @@ const showKey = ref(false);
 /* ============ 站点库:官方 + 各镜像站的「地址 + Key」 ============ */
 
 /**
- * 当前站点。恒非空(见 settings.ts 的 activeNaiEndpoint)。
+ * 当前站点(按当前方案的 endpointId 取;悬空回落第一条)。
  * settings 是 reactive,直接改它的字段即可就地编辑 —— 但 url/key 两项必须走下面的
  * endpointUrl / endpointKey,不能直接绑,否则活值镜像不会跟着更新。
  */
-const endpoint = computed<NaiEndpoint>(() => activeNaiEndpoint(conn.value));
+const endpoint = computed<NaiEndpoint>(() => {
+  const id = plan.value.endpointId;
+  return conn.value.endpoints.find(e => e.id === id) ?? activeNaiEndpoint(conn.value);
+});
 
 const endpointOptions = computed(() =>
   conn.value.endpoints.map(e => ({ value: e.id, label: e.name || '未命名站点' })),
@@ -128,9 +130,12 @@ const canRemoveEndpoint = computed(() => conn.value.endpoints.length > 1);
 function switchEndpoint(id: string) {
   const target = conn.value.endpoints.find(e => e.id === id);
   if (!target) return;
+  // 换站 = 只改当前方案引用的接入点;方案参数不动
+  plan.value.endpointId = id;
   conn.value.activeEndpointId = id;
   conn.value.url = target.url;
   conn.value.key = target.key;
+  conn.value.concurrency = target.concurrency;
 }
 
 /**
@@ -213,9 +218,9 @@ async function onTestConnection() {
   testing.value = true;
   try {
     const result = await testNaiConnection(conn.value);
-    toastr.success(result.message, `${label.value} 连接`);
+    toastr.success(result.message, `${label} 连接`);
   } catch (error) {
-    toastr.error(errorMessage(error), `${label.value} 连接失败`);
+    toastr.error(errorMessage(error), `${label} 连接失败`);
   } finally {
     testing.value = false;
   }
@@ -230,7 +235,48 @@ async function onTestConnection() {
 const artist = computed<NaiArtistPreset | null>(() => activeNaiArtist(conn.value));
 
 /** 当前是否 V5 模型:控制画师串编辑区的 V5 差异提醒。 */
-const isV5Model = computed(() => isNai5(conn.value.model));
+const isV5Model = computed(() => isNai5(plan.value.model));
+
+/**
+ * 官方锁死的采样参数(目前只有 V5 Full Medium):步数/采样器/负面词由官方固定,
+ * 面板把这几项换成只读显示,避免「改了却不生效」的错觉。
+ */
+const planFixed = computed(() => naiFixedSettings(plan.value.model));
+
+/** 采样器值 → 显示名(官方固定的那几项用文本行展示,需要与下拉同一套标签)。 */
+function samplerLabel(value: string): string {
+  return NAI_SAMPLERS.find(s => s.value === value)?.label ?? value;
+}
+
+/**
+ * 当前接入点的并发数。限流是站/账号级的事,故输入框改的是**当前站点**,
+ * 切到别的站点看到的是那一份;顶层 conn.concurrency 只作镜像与新建默认值。
+ */
+const endpointConcurrency = computed<number>({
+  get: () => activeNaiEndpoint(conn.value).concurrency,
+  set: value => {
+    const endpoint = activeNaiEndpoint(conn.value);
+    endpoint.concurrency = Math.min(NAI_CONCURRENCY_MAX, Math.max(1, Math.floor(value) || 1));
+    conn.value.concurrency = endpoint.concurrency;
+  },
+});
+
+/**
+ * 模型下拉的 change:从非 4.5 进 4.5 且「生成自然语言」开着 → 自动关并告知。
+ * 4.5 的提示词预算(约 512 token,画面与全部角色共用)比 V5 紧,nl 是最大头。
+ * 只在用户手点下拉时触发:切方案、加载设置、4.5 家族内换档都不经过这里,
+ * 故不会覆盖用户已有选择。
+ */
+let lastModel: NaiModel = plan.value.model;
+function onModelChange(event: Event): void {
+  const next = (event.target as HTMLSelectElement).value as NaiModel;
+  const prev = lastModel;
+  lastModel = next;
+  if (!isNai45(prev) && isNai45(next) && plan.value.naturalLanguage) {
+    plan.value.naturalLanguage = false;
+    toastr.info('NAI 4.5 的提示词预算较紧,已关闭「生成自然语言」;需要时可重新打开。', '柏宝绘');
+  }
+}
 
 /** 「不使用」的下拉值。preset id 恒为 art_* / bi_* 形状,空串不会与任何一条相撞,无需装箱。 */
 const NO_ARTIST = '';
@@ -248,6 +294,7 @@ const artistOptions = computed(() => [
  * undefined = 旧数据未绑定(切换时不动 Vibe);[] = 明确不使用(全部关闭)。
  */
 function selectArtist(id: string) {
+  plan.value.artistId = id;
   conn.value.activeArtistId = id;
   const next = activeNaiArtist(conn.value);
   if (next) applyArtistVibeState(conn.value.vibes, next);
@@ -267,6 +314,64 @@ const activeArtistId = computed<string>({
 /** 改名/复制/删除都只对「真的选中了一条」有意义;选「不使用」时一律禁用。 */
 const hasArtist = computed(() => artist.value !== null);
 
+/* ============ 出图方案库 ============ */
+
+const plans = computed(() => conn.value.plans);
+
+/** 下拉/列表共用的当前方案 id;切换时把方案里的 vibe 勾选套回库。 */
+const planId = computed<string>({
+  get: () => plan.value.id,
+  set: id => {
+    setActiveNaiPlan(id, conn.value);
+    applyPlanVibes(plan.value);
+  },
+});
+
+/** 方案切换 = 把该方案勾选的 vibe 套回库(库内 enabled 是 vibe 库的唯一开关)。 */
+function applyPlanVibes(target: NaiPlan) {
+  const ids = new Set(target.vibeIds);
+  for (const vibe of conn.value.vibes) vibe.enabled = ids.has(vibe.id);
+}
+
+function addPlan() {
+  const preset = newNaiPlan(`方案 ${conn.value.plans.length + 1}`);
+  preset.endpointId = plan.value.endpointId;
+  preset.artistId = plan.value.artistId;
+  conn.value.plans.push(preset);
+  setActiveNaiPlan(preset.id, conn.value);
+  applyPlanVibes(preset);
+  toastr.success(`已新建「${preset.name}」`, '出图方案');
+}
+
+function duplicatePlan(source: NaiPlan) {
+  const copy: NaiPlan = {
+    ...source,
+    id: newNaiPlan().id,
+    name: `${source.name} 副本`,
+    vibeIds: [...source.vibeIds],
+  };
+  const index = conn.value.plans.findIndex(p => p.id === source.id);
+  conn.value.plans.splice(index + 1, 0, copy);
+  setActiveNaiPlan(copy.id, conn.value);
+  applyPlanVibes(copy);
+  toastr.success(`已复制为「${copy.name}」`, '出图方案');
+}
+
+function deletePlan(target: NaiPlan) {
+  if (conn.value.plans.length <= 1) return;
+  const index = conn.value.plans.findIndex(p => p.id === target.id);
+  conn.value.plans.splice(index, 1);
+  const next = conn.value.plans[Math.min(index, conn.value.plans.length - 1)];
+  setActiveNaiPlan(next.id, conn.value);
+  applyPlanVibes(next);
+  toastr.success(`已删除「${target.name}」`, '出图方案');
+}
+
+/** 用户手动勾选 vibe 时同步进当前方案:方案记住「叠加哪几张」,切走再切回来还在。 */
+function syncPlanVibes() {
+  plan.value.vibeIds = conn.value.vibes.filter(vibe => vibe.enabled).map(vibe => vibe.id);
+}
+
 /** 当前选中的是内置配方:只读(改名/删除/内容编辑禁用),「复制」是自定义的唯一入口。 */
 const isBuiltinArtist = computed(() =>
   artist.value ? isBuiltinNaiArtist(artist.value.id) : false,
@@ -277,8 +382,8 @@ const renamingArtist = ref(false);
 const artistNameDraft = ref('');
 const artistNameInput = ref<HTMLInputElement | null>(null);
 const artistDeleteOpen = ref(false);
-/** 管理器弹窗:搜索/预览图/勾选批量删除都在那边,下拉这里只留高频切换。 */
-const artistManagerOpen = ref(false);
+/** 画师串库就地展开态:搜索/预览图/多选删都在库组件里,下拉这里只留高频切换。 */
+const artistLibraryOpen = ref(false);
 
 function startRenameArtist() {
   if (!artist.value || isBuiltinArtist.value) return; // 内置只读(按钮已禁用,双保险)
@@ -392,7 +497,7 @@ const chatu8ActiveRef = computed(() => artistImportResult.value?.plans.find(p =>
 
 function openArtistImport() {
   const chatu8 = getContext()?.extensionSettings?.[CHATU8_SETTINGS_KEY];
-  artistImportResult.value = importArtistsFromChatu8(conn.value.artistPresets, chatu8, conn.value.model);
+  artistImportResult.value = importArtistsFromChatu8(conn.value.artistPresets, chatu8, plan.value.model);
   switchActiveArtist.value = true;
   artistImportOpen.value = true;
 }
@@ -456,7 +561,7 @@ const CHANNEL_PROMPT_TARGETS: NaiPromptTarget[] = [
     key: 'quality',
     label: '正面质量词',
     hint: '拼在画面 tag 之后(整体顺序:画师串 → 画面 tag → 质量词)。画师串里设置了质量词时,会用画师串那份,这里的不生效。',
-    fallback: () => naiDefaultQualityTags(conn.value.model),
+    fallback: () => naiDefaultQualityTags(plan.value.model),
     read: () => conn.value.qualityTags,
     write: v => (conn.value.qualityTags = v),
   },
@@ -464,7 +569,7 @@ const CHANNEL_PROMPT_TARGETS: NaiPromptTarget[] = [
     key: 'negative',
     label: '负面提示词',
     hint: '留空 = 按模型取官方负面词;要额外排除什么,直接往这一份里接。画师串里设置了负面词时,会用画师串那份,这里的不生效。',
-    fallback: () => naiDefaultUndesired(conn.value.model),
+    fallback: () => naiDefaultUndesired(plan.value.model),
     read: () => conn.value.undesiredContent,
     write: v => (conn.value.undesiredContent = v),
   },
@@ -486,7 +591,7 @@ const artistBoundTargets = computed<NaiPromptTarget[]>(() => {
       hint: readonly
         ? '内置画师串的绑定位随插件版本更新,不可改;复制为我的画师串后可自定义。留空 = 用渠道级设置(渠道级也留空,则按模型取官方词)。'
         : '这份质量词随当前画师串一起切换。留空 = 用渠道级设置(渠道级也留空,则按模型取官方词)。',
-      fallback: () => conn.value.qualityTags.trim() || naiDefaultQualityTags(conn.value.model),
+      fallback: () => conn.value.qualityTags.trim() || naiDefaultQualityTags(plan.value.model),
       read: () => a.quality,
       write: v => (a.quality = v),
     },
@@ -498,7 +603,7 @@ const artistBoundTargets = computed<NaiPromptTarget[]>(() => {
         ? '内置画师串的绑定位随插件版本更新,不可改;复制为我的画师串后可自定义。留空 = 用渠道级设置(渠道级也留空,则按模型取官方负面词)。'
         : '这份负面词随当前画师串一起切换。留空 = 用渠道级设置(渠道级也留空,则按模型取官方负面词)。',
       fallback: () =>
-        conn.value.undesiredContent.trim() || naiDefaultUndesired(conn.value.model),
+        conn.value.undesiredContent.trim() || naiDefaultUndesired(plan.value.model),
       read: () => a.negative,
       write: v => (a.negative = v),
     },
@@ -552,9 +657,9 @@ const vibeImportInput = ref<HTMLInputElement | null>(null);
 let vibeSeq = 0;
 
 /** 当前模型的 vibe 编码 key;vibe 缺此 key 时生成会被跳过,列表里给「补编码」入口。 */
-const currentVibeKey = computed(() => vibeModelKey(conn.value.model));
-const vibesSupported = computed(() => naiSupportsVibes(conn.value.model));
-const samplerOptions = computed(() => naiSamplers(conn.value.model));
+const currentVibeKey = computed(() => vibeModelKey(plan.value.model));
+const vibesSupported = computed(() => naiSupportsVibes(plan.value.model));
+const samplerOptions = computed(() => naiSamplers(plan.value.model));
 
 /** 生成 vibe 列表缩略图(最长边 96px 的 jpeg dataURL);失败回空串,由入库方按「无缩略图」处理。 */
 async function makeThumbnail(dataUrl: string): Promise<string> {
@@ -573,9 +678,10 @@ async function makeThumbnail(dataUrl: string): Promise<string> {
  * 代价是出图在跑时点编码会先等出图完 —— 这是对的,按钮那边有 vibeEncoding 转圈提示。
  */
 async function encodeVibeGated(imageBase64: string): Promise<string> {
-  const release = await acquireNaiSlot();
+  const gate = activeNaiEndpoint(conn.value).id;
+  const release = await acquireNaiSlot(undefined, gate);
   try {
-    return await encodeVibeImage(conn.value, imageBase64, conn.value.model);
+    return await encodeVibeImage(conn.value, imageBase64, plan.value.model, 1, undefined, { gate });
   } finally {
     release();
   }
@@ -616,7 +722,7 @@ async function onVibeFileChange(event: Event) {
         true,
       ),
     );
-    toastr.success(`已按 ${conn.value.model} 编码并加入 Vibe 库`, 'Vibe');
+    toastr.success(`已按 ${plan.value.model} 编码并加入 Vibe 库`, 'Vibe');
   } catch (error) {
     toastr.error(errorMessage(error), 'Vibe 编码失败');
   } finally {
@@ -638,7 +744,7 @@ async function reencodeVibe(vibe: NaiVibe) {
     vibe.thumbnailPath = paths.thumbnailPath;
     vibe.modelKeys = Object.keys(data.encodings);
     vibe.fingerprint = vibeFingerprint(data.encodings);
-    toastr.success(`「${vibe.name}」已补 ${conn.value.model} 编码`, 'Vibe');
+    toastr.success(`「${vibe.name}」已补 ${plan.value.model} 编码`, 'Vibe');
   } catch (error) {
     toastr.error(errorMessage(error), 'Vibe 编码失败');
   } finally {
@@ -911,12 +1017,7 @@ async function removeVibe(vibe: NaiVibe) {
 
 <template>
   <div class="panel">
-    <p v-if="target === 'latent'" class="bbi-page-intro">
-      Latent 渠道:协议与 NovelAI 完全一致(参数、Vibe、画师配方都照 NAI 那套),
-      唯一差异是提示词按<strong>请求历史那套分段格式</strong>打包成一整串发出——
-      正向 tag、自然语言、每个角色各占一段,而不是走 NAI 原生的 Character Prompts 结构。
-    </p>
-    <p v-else class="bbi-page-intro">
+    <p class="bbi-page-intro">
       NovelAI 生图接口。地址默认为官方,填第三方兼容站(镜像/转发)即走第三方,协议一致。
     </p>
 
@@ -1003,13 +1104,7 @@ async function removeVibe(vibe: NaiVibe) {
             placeholder="https://image.novelai.net"
             spellcheck="false"
           />
-          <p class="bbi-field-hint">
-            {{
-              target === 'latent'
-                ? '填你的 latent 上游地址,自动补全 /ai 端点。'
-                : '默认官方;第三方站填域名即可,自动补全 /ai 端点。'
-            }}
-          </p>
+          <p class="bbi-field-hint">默认官方;第三方站填域名即可,自动补全 /ai 端点。</p>
         </div>
 
         <div class="bbi-field">
@@ -1043,7 +1138,7 @@ async function removeVibe(vibe: NaiVibe) {
             class="bbi-btn conn-use"
             type="button"
             :title="`tag 书写规范会切到 ${label}`"
-            @click="settings.defaultBackend = target"
+            @click="settings.defaultBackend = 'nai'"
           >
             使用此渠道出图
           </button>
@@ -1082,9 +1177,10 @@ async function removeVibe(vibe: NaiVibe) {
             <button
               class="bbi-icon-btn art-op"
               type="button"
-              title="管理画师串库:搜索、预览图、批量删除"
-              aria-label="管理画师串库"
-              @click="artistManagerOpen = true"
+              title="展开/收起画师串库:搜索、预览图、批量删除、导入导出"
+              aria-label="展开画师串库"
+              :aria-expanded="artistLibraryOpen"
+              @click="artistLibraryOpen = !artistLibraryOpen"
             >
               <Icon name="grid" :size="14" />
             </button>
@@ -1207,6 +1303,9 @@ async function removeVibe(vibe: NaiVibe) {
         </template>
         <!-- 不选画师串时无提示:下拉里「不使用」已自明 -->
 
+        <!-- 画师串库:就地展开(搜索/预览图/多选删/导入导出/Vibe 绑定/参数快照) -->
+        <NaiArtistLibrary v-if="artistLibraryOpen" />
+
         <hr class="art-divider" />
 
         <!-- 渠道级质量词/负面词:只读列表行,点行进弹窗编辑(与设置页「自定义提示词」同款) -->
@@ -1214,7 +1313,10 @@ async function removeVibe(vibe: NaiVibe) {
           <li v-for="t in CHANNEL_PROMPT_TARGETS" :key="t.key" class="bbi-prompt-item">
             <button class="bbi-prompt-open" type="button" @click="openNaiPrompt(t)">
               <span class="bbi-prompt-name">{{ t.label }}</span>
-              <span v-if="isShadowedByArtist(t.key)" class="bbi-prompt-state is-shadowed">
+              <span v-if="t.key === 'negative' && planFixed" class="bbi-prompt-state">
+                官方固定
+              </span>
+              <span v-else-if="isShadowedByArtist(t.key)" class="bbi-prompt-state is-shadowed">
                 已被画师串覆盖
               </span>
               <span v-else class="bbi-prompt-state" :class="{ 'is-custom': isTargetCustom(t) }">
@@ -1230,19 +1332,53 @@ async function removeVibe(vibe: NaiVibe) {
       </Collapsible>
 
       <Collapsible title="默认参数" :open="false">
+        <!-- 出图方案:点行整套切换;名字直接改,复制/删除在行尾 -->
+        <div class="plan-list">
+          <div
+            v-for="p in plans"
+            :key="p.id"
+            class="plan-row"
+            :class="{ 'is-on': p.id === plan.id }"
+            @click="planId = p.id"
+          >
+            <span class="plan-dot" aria-hidden="true" />
+            <input class="bbi-input plan-name" v-model="p.name" @click.stop />
+            <span class="plan-meta">{{ p.model }} · {{ p.portraitSize }}</span>
+            <button class="bbi-icon-btn" type="button" title="复制方案" @click.stop="duplicatePlan(p)">
+              <Icon name="copy" :size="13" />
+            </button>
+            <button
+              class="bbi-icon-btn"
+              type="button"
+              title="删除方案"
+              :disabled="plans.length <= 1"
+              @click.stop="deletePlan(p)"
+            >
+              <Icon name="trash" :size="13" />
+            </button>
+          </div>
+          <button class="bbi-btn bbi-btn-sm" type="button" @click="addPlan">
+            <Icon name="plus" :size="12" /> 新建方案
+          </button>
+        </div>
+
         <!-- 语义配对紧凑行:双字段行两列、数字参数行四列;说明统一收进行下的一行 hint -->
         <div class="bbi-field">
           <div class="bbi-field-head">
             <span class="bbi-field-label">模型</span>
           </div>
-          <select class="bbi-input bbi-select" v-model="conn.model">
+          <select class="bbi-input bbi-select" v-model="plan.model" @change="onModelChange">
             <option v-for="m in NAI_MODELS" :key="m.value" :value="m.value">{{ m.label }}</option>
           </select>
+          <p v-if="planFixed" class="bbi-field-hint">
+            官方固定:步数 {{ planFixed.steps }}、采样器 {{ samplerLabel(planFixed.sampler) }}、负面词为官方 Heavy 预设;
+            这几项在下面只读显示,改不了。
+          </p>
         </div>
 
         <label class="bbi-switch-row">
           <span class="bbi-field-label">生成自然语言</span>
-          <input v-model="conn.naturalLanguage" type="checkbox" class="bbi-checkbox" />
+          <input v-model="plan.naturalLanguage" type="checkbox" class="bbi-checkbox" />
         </label>
         <p class="bbi-field-hint">
           开:自动 tag 为画面与每个角色额外写一段英文描述;关:只写 tag。4.5 的提示词上限约 512 token
@@ -1259,7 +1395,7 @@ async function removeVibe(vibe: NaiVibe) {
             <input
               class="bbi-input"
               type="text"
-              v-model="conn.portraitSize"
+              v-model="plan.portraitSize"
               list="nai-portrait-presets"
               placeholder="832×1216"
               spellcheck="false"
@@ -1277,7 +1413,7 @@ async function removeVibe(vibe: NaiVibe) {
             <input
               class="bbi-input"
               type="text"
-              v-model="conn.landscapeSize"
+              v-model="plan.landscapeSize"
               list="nai-landscape-presets"
               placeholder="1216×832"
               spellcheck="false"
@@ -1296,11 +1432,11 @@ async function removeVibe(vibe: NaiVibe) {
               v-for="opt in ORIENTATION_LOCKS"
               :key="opt.value"
               class="bbi-seg"
-              :class="{ 'is-on': conn.orientationLock === opt.value }"
+              :class="{ 'is-on': plan.orientationLock === opt.value }"
               type="button"
               role="tab"
-              :aria-selected="conn.orientationLock === opt.value"
-              @click="conn.orientationLock = opt.value"
+              :aria-selected="plan.orientationLock === opt.value"
+              @click="plan.orientationLock = opt.value"
             >
               {{ opt.label }}
             </button>
@@ -1316,15 +1452,16 @@ async function removeVibe(vibe: NaiVibe) {
             <div class="bbi-field-head">
               <span class="bbi-field-label">采样器</span>
             </div>
-            <select class="bbi-input bbi-select" v-model="conn.sampler">
+            <select v-if="!planFixed" class="bbi-input bbi-select" v-model="plan.sampler">
               <option v-for="s in samplerOptions" :key="s.value" :value="s.value">{{ s.label }}</option>
             </select>
+            <div v-else class="bbi-input bbi-select is-fixed">{{ samplerLabel(planFixed.sampler) }}(官方固定)</div>
           </div>
           <div class="bbi-field">
             <div class="bbi-field-head">
               <span class="bbi-field-label">噪声表</span>
             </div>
-            <select class="bbi-input bbi-select" v-model="conn.noiseSchedule">
+            <select class="bbi-input bbi-select" v-model="plan.noiseSchedule">
               <option v-for="s in NAI_NOISE_SCHEDULES" :key="s.value" :value="s.value">
                 {{ s.label }}
               </option>
@@ -1337,7 +1474,8 @@ async function removeVibe(vibe: NaiVibe) {
             <div class="bbi-field-head">
               <span class="bbi-field-label">步数</span>
             </div>
-            <input class="bbi-input" type="number" v-model.number="conn.steps" min="1" max="50" />
+            <input v-if="!planFixed" class="bbi-input" type="number" v-model.number="plan.steps" min="1" max="50" />
+            <input v-else class="bbi-input" type="number" :value="planFixed.steps" disabled />
           </div>
           <div class="bbi-field">
             <div class="bbi-field-head">
@@ -1346,7 +1484,7 @@ async function removeVibe(vibe: NaiVibe) {
             <input
               class="bbi-input"
               type="number"
-              v-model.number="conn.scale"
+              v-model.number="plan.scale"
               min="0"
               max="35"
               step="0.1"
@@ -1357,41 +1495,44 @@ async function removeVibe(vibe: NaiVibe) {
               <span class="bbi-field-label">Rescale</span>
             </div>
             <input
+              v-if="!planFixed"
               class="bbi-input"
               type="number"
-              v-model.number="conn.cfgRescale"
+              v-model.number="plan.cfgRescale"
               min="0"
               max="1"
               step="0.05"
             />
+            <input v-else class="bbi-input" type="number" :value="0" disabled />
           </div>
           <div class="bbi-field">
             <div class="bbi-field-head">
               <span class="bbi-field-label">种子</span>
             </div>
-            <input class="bbi-input" type="number" v-model.number="conn.seed" min="0" />
+            <input class="bbi-input" type="number" v-model.number="plan.seed" min="0" />
           </div>
         </div>
         <p class="bbi-field-hint">Scale = 提示词相关性;Rescale = 相关性调整;种子 0 = 随机。</p>
 
         <label class="bbi-switch-row">
           <span class="bbi-field-label">Variety Boost(画面多样性,按尺寸自动计算)</span>
-          <input v-model="conn.varietyBoost" type="checkbox" class="bbi-checkbox" />
+          <input v-model="plan.varietyBoost" type="checkbox" class="bbi-checkbox" />
         </label>
 
         <div class="bbi-num-row">
-          <span class="bbi-field-label">同时出图数</span>
+          <span class="bbi-field-label">同时出图数(按当前站点)</span>
           <input
             class="bbi-input bbi-num"
             type="number"
-            v-model.number="conn.concurrency"
+            v-model.number="endpointConcurrency"
             min="1"
-            max="4"
+            :max="NAI_CONCURRENCY_MAX"
           />
         </div>
         <p class="bbi-field-hint">
           NAI 服务端不排队,并发高容易被限流(429),建议保持 1;超出的请求自动排队等待。
-          被限流时会自动退避重试(最多 3 次),并让所有排队任务一起冷却,不会连着撞上去。
+          这个数字跟着**当前站点**走:官方站与公益站各设各的,某个站被限流也不会拖住别的站。
+          被限流时会自动退避重试(最多 3 次),并让该站点的排队任务一起冷却。
         </p>
       </Collapsible>
 
@@ -1400,7 +1541,7 @@ async function removeVibe(vibe: NaiVibe) {
           上传参考图,生成时叠加其风格/氛围;编码按当前选中的模型进行,会消耗一次接口调用。
         </p>
         <p v-else class="bbi-field-hint vibe-hint">
-          Current model does not support Vibe Transfer.
+          当前模型(NAI 5)暂不支持 Vibe Transfer;已勾选的 vibe 会原样保留,出图时整组跳过,切回 4.5 即恢复。
         </p>
 
         <div class="vibe-actions">
@@ -1414,7 +1555,7 @@ async function removeVibe(vibe: NaiVibe) {
           </button>
           <label class="bbi-switch-row vibe-normalize">
             <span class="bbi-field-label">强度归一化</span>
-            <input v-model="conn.normalizeRefStrength" type="checkbox" class="bbi-checkbox" :disabled="!vibesSupported" />
+            <input v-model="plan.normalizeRefStrength" type="checkbox" class="bbi-checkbox" :disabled="!vibesSupported" />
           </label>
           <input ref="vibeFileInput" type="file" accept="image/*" hidden @change="onVibeFileChange" />
           <input ref="vibeImportInput" type="file" accept=".naiv4vibe" hidden @change="onVibeImportChange" />
@@ -1556,7 +1697,7 @@ async function removeVibe(vibe: NaiVibe) {
                   <div class="vibe-head">
                     <input class="bbi-input vibe-name" type="text" v-model="vibe.name" spellcheck="false" />
                     <label class="vibe-enable" title="生成时叠加此 vibe">
-                      <input v-model="vibe.enabled" type="checkbox" class="bbi-checkbox" />
+                      <input v-model="vibe.enabled" type="checkbox" class="bbi-checkbox" @change="syncPlanVibes" />
                       启用
                     </label>
                   </div>
@@ -1757,8 +1898,7 @@ async function removeVibe(vibe: NaiVibe) {
       </div>
     </ModalMask>
 
-    <!-- ===== 画师串库管理器:搜索/预览图/勾选批量删除 ===== -->
-    <NaiArtistManager v-model:open="artistManagerOpen" :target="target" />
+    <!-- 画师串库已就地展开在「提示词」折叠区里(见 NaiArtistLibrary) -->
 
     <ConfirmDialog
       v-model:open="endpointDeleteOpen"
@@ -1801,6 +1941,9 @@ async function removeVibe(vibe: NaiVibe) {
         </header>
 
         <p class="bbi-modal-label">{{ editingNaiPrompt.hint }}</p>
+        <p v-if="planFixed && editingNaiPrompt.key === 'negative'" class="bbi-field-hint">
+          当前模型(NAI 5 Full Medium)的负面词由官方固定,这里保存的值不会发出去;换回其它模型时照常生效。
+        </p>
 
         <BbiTextarea
           v-model="naiPromptDraft"
@@ -1831,6 +1974,67 @@ async function removeVibe(vibe: NaiVibe) {
 </template>
 
 <style scoped>
+/* 出图方案列表:一行一套,点行整套切换;名字就地可改 */
+.plan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+
+.plan-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--bbi-line);
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-surface);
+  cursor: pointer;
+}
+
+.plan-row:hover {
+  border-color: var(--bbi-accent);
+}
+
+.plan-row.is-on {
+  border-color: var(--bbi-accent);
+  box-shadow: 0 0 0 1px var(--bbi-accent);
+}
+
+.plan-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--bbi-line);
+  flex: 0 0 auto;
+}
+
+.plan-row.is-on .plan-dot {
+  background: var(--bbi-accent);
+}
+
+.plan-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 6px;
+  font-size: 13px;
+}
+
+.plan-meta {
+  font-size: 11px;
+  color: var(--bbi-ink-soft);
+  white-space: nowrap;
+}
+
+/* 官方固定参数的只读行:与下拉同高同宽,灰字表示不可改 */
+.is-fixed {
+  display: flex;
+  align-items: center;
+  color: var(--bbi-text-dim, #888);
+  cursor: default;
+}
+
 /* 默认参数的语义配对紧凑行:双字段行两列、数字参数行四列;
    窄屏双字段行落单列、数字行落 2×2。
    垂直节奏由行容器统一管(行内字段的 margin-bottom 归零),

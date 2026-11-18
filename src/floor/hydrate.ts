@@ -388,12 +388,13 @@ export function bindFloorHydration(): boolean {
       }
     },
   );
-  // NAI 系并发上限 → 闸门(ComfyUI 不限并发,靠服务端队列)。
-  // 跟随**当前渠道**而非死盯 settings.nai:nai 与 latent 各有一份 concurrency,
-  // 只 watch 前者会让 latent 用户改了数字却不生效(闸门仍按 NAI 那份限流)。
+  // 各接入点的并发上限 → 各自的闸门(ComfyUI 不限并发,靠服务端队列)。
+  // 删掉的站点不必回收闸门:没人再往那个 id 上取槽,留着的只是一个空对象。
   watch(
-    () => (settings.defaultBackend === 'latent' ? settings.latent : settings.nai).concurrency,
-    value => setNaiConcurrency(value),
+    () => settings.nai.endpoints.map(ep => [ep.id, ep.concurrency] as const),
+    pairs => {
+      for (const [id, concurrency] of pairs) setNaiConcurrency(concurrency, id);
+    },
     { immediate: true },
   );
   return true;

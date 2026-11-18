@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import type { ImageCharacterPrompt } from '@/autoTag/protocol';
 import { cancelFloorTags } from '@/autoTag/runner';
@@ -39,7 +39,7 @@ import {
 import { isTagPlanning } from '@/floor/tagPlanState';
 import { formatGenerationMeta } from '@/generationMeta';
 import {
-  activeNaiArtist,
+  activeNaiPlan,
   activeOrientationLock,
   imageDisplayMaxHeight,
   settings,
@@ -135,6 +135,45 @@ const menuOpen = ref(false);
 /** 楼层面板里的画师串快捷切换浮层。 */
 const artistPickerOpen = ref(false);
 
+/**
+ * 沉浸显示(设置项 ui.immersiveImages):有图时 ⋯ 与翻页器都藏起来,点一下图才浮现。
+ * 只在有图时生效——无图时占位区本就是操作区(生成按钮等),藏了反而没处点。
+ * 浮现态是本组件的临时 ref,不进 store:被重水合重建就回到藏起,正合「沉浸」的默认。
+ */
+const immersive = computed(() => settings.ui.immersiveImages && !!imageSrc.value);
+const uiRevealed = ref(false);
+/** 控件此刻是否藏着(给 CSS 的 data-hide-ui)。⋯ 菜单展开时必然算浮现。 */
+const uiHidden = computed(() => immersive.value && !uiRevealed.value && !menuOpen.value);
+
+/** 点图:沉浸且控件藏着 → 先把控件叫出来;否则照旧进灯箱。 */
+function onImageClick(): void {
+  if (uiHidden.value) {
+    uiRevealed.value = true;
+    return;
+  }
+  openImage();
+}
+
+const rootEl = ref<HTMLElement | null>(null);
+
+/**
+ * 点卡片外任意处收起控件。卡片挂在锚点的 open shadow root 里,composedPath 能穿进去,
+ * 直接比 path 而不用 contains(contains 不跨 shadow 边界)。
+ * 捕获阶段监听:ST 有些按钮会 stopPropagation,冒泡阶段收不到。
+ */
+function onOutsidePointerDown(event: PointerEvent): void {
+  if (rootEl.value && event.composedPath().includes(rootEl.value)) return;
+  uiRevealed.value = false;
+  menuOpen.value = false;
+}
+
+// 只在浮现期间挂监听:一屏几十张卡片,不该每张都常驻一个全局 pointerdown
+watch(uiRevealed, revealed => {
+  if (revealed) document.addEventListener('pointerdown', onOutsidePointerDown, true);
+  else document.removeEventListener('pointerdown', onOutsidePointerDown, true);
+});
+onBeforeUnmount(() => document.removeEventListener('pointerdown', onOutsidePointerDown, true));
+
 /** 运行态记录(可能为 undefined = 无在途任务)。 */
 const record = computed(() => getGenRecord(key.value));
 
@@ -161,19 +200,14 @@ const planning = computed(() => isTagPlanning(key.value));
 
 const comfyActive = computed(() => settings.defaultBackend === 'comfyui');
 const naiActive = computed(() => settings.defaultBackend === 'nai');
-const latentActive = computed(() => settings.defaultBackend === 'latent');
 const imgRouterActive = computed(() => settings.defaultBackend === 'imgrouter');
 const latentApiActive = computed(() => settings.defaultBackend === 'latentapi');
 
 /**
- * 楼层快捷切换只服务 NAI / latent 渠道:画师串库是这两个渠道自己的属性,
+ * 楼层快捷切换只服务 NAI 渠道:画师串库是它自己的属性,
  * 其它渠道没有「当前画师串」这个概念。
  */
-const artistConn = computed(() => {
-  if (settings.defaultBackend === 'nai') return settings.nai;
-  if (settings.defaultBackend === 'latent') return settings.latent;
-  return null;
-});
+const artistConn = computed(() => (settings.defaultBackend === 'nai' ? settings.nai : null));
 
 const artistChoices = computed(() => {
   const conn = artistConn.value;
@@ -187,14 +221,16 @@ const artistChoices = computed(() => {
 /** 悬空 id 与「不使用」同显,与设置面板下拉口径一致。 */
 const currentArtistId = computed(() => {
   const conn = artistConn.value;
-  return conn ? (activeNaiArtist(conn)?.id ?? '') : '';
+  return conn ? activeNaiPlan(conn).artistId : '';
 });
 
 /** 楼层面板快捷切换:与设置面板同口径,切换即套用该画师串的 Vibe 绑定。 */
 function pickArtist(preset: NaiArtistPreset | null): void {
   const conn = artistConn.value;
   if (!conn) return;
-  conn.activeArtistId = preset?.id ?? '';
+  const plan = activeNaiPlan(conn);
+  plan.artistId = preset?.id ?? '';
+  conn.activeArtistId = plan.artistId;
   if (preset) applyArtistVibeState(conn.vibes, preset);
   artistPickerOpen.value = false;
   toastr.success(
@@ -311,10 +347,9 @@ const barText = computed(() => {
 
 /** 无图且后端未就绪时,占位区中央的配置引导。 */
 const pendingHint = computed(() => {
-  if (!comfyActive.value && !naiActive.value && !latentActive.value && !imgRouterActive.value && !latentApiActive.value)
+  if (!comfyActive.value && !naiActive.value && !imgRouterActive.value && !latentApiActive.value)
     return '出图后端未选择,请到柏宝绘「渠道」页选择出图渠道';
   if (naiActive.value) return '未配置 NAI,请到柏宝绘「渠道」页填写 API Key';
-  if (latentActive.value) return '未配置 Latent,请到柏宝绘「渠道」页填写接口地址与 API Key';
   if (imgRouterActive.value) return '未配置 ImgRouter,请到柏宝绘「渠道」页填写地址与访问令牌';
   if (latentApiActive.value) return '未配置 Latent 原生 API,请到柏宝绘「渠道」页填写 API Key';
   return '未配置 ComfyUI,请到柏宝绘「渠道」页填写工作流';
@@ -554,6 +589,7 @@ watch(hash, () => maybeAutoGenerate());
   <!-- 沉浸式设计:图即卡片。无边框/无背景面板/无品牌栏,控件悬浮在图上,
        桌面 hover 浮现、触屏常驻淡显;提示词收进悬浮按钮唤起的面板,平时零占位。 -->
   <div
+    ref="rootEl"
     class="bbi-figure"
     :data-phase="phase"
     :data-capped="displayMaxHeight ? '1' : ''"
@@ -583,13 +619,18 @@ watch(hash, () => maybeAutoGenerate());
          高度归零 + 淡出,<img> 不卸载——展开瞬间图就在,不会重新发起请求。 -->
     <div class="bbi-figure__collapse" :data-collapsed="collapsed ? '1' : ''">
       <div class="bbi-figure__collapse-inner">
-    <div class="bbi-figure__stage" :data-size="effectiveSize" :data-placeholder="imageSrc ? '' : '1'">
+    <div
+      class="bbi-figure__stage"
+      :data-size="effectiveSize"
+      :data-placeholder="imageSrc ? '' : '1'"
+      :data-hide-ui="uiHidden ? '1' : ''"
+    >
       <img
         v-if="imageSrc"
         class="bbi-figure__img"
         :src="imageSrc"
         alt="生图结果"
-        @click="openImage"
+        @click="onImageClick"
         @error="onImageError"
       />
 

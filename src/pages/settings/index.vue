@@ -306,14 +306,14 @@ const TAG_PROMPT_METAS: TagPromptMeta[] = [
   {
     key: 'latentApiSpec',
     label: 'Latent 原生 API 规范',
-    hint: '默认后端为 Latent 原生 API 时拼进自动 tag 请求，按 Anima 写法（Scene / Char / Description）约束书写；内置默认照 anima寻迹 与 绘境成章 提炼。{{#nl}}…{{/nl}} / {{^nl}}…{{/nl}} 按该渠道「生成自然语言」开关取舍。留空用内置默认。',
+    hint: '默认后端为 Latent 原生 API 时拼进自动 tag 请求，按 Anima 写法（Scene / Char / Description）约束书写；内置默认照 anima寻迹 与 绘境成章 提炼。{{#nl}}…{{/nl}} / {{^nl}}…{{/nl}} 按该渠道「生成自然语言」开关取舍。这里是全局默认；渠道页的每套配置里可以单独覆盖（留空则回落到这一份）。',
     builtin: DEFAULT_LATENT_API_SPEC,
     macros: NL_SECTION_MACROS,
   },
   {
     key: 'latentApiThinking',
     label: 'Latent 原生 API 思维链',
-    hint: '默认后端为 Latent 原生 API 时使用的输出前思考清单（Scene 块 + 每个可见角色一块）。与「Latent 原生 API 规范」配套，同样支持条件段。留空用内置默认。',
+    hint: '默认后端为 Latent 原生 API 时使用的输出前思考清单（Scene 块 + 每个可见角色一块）。与「Latent 原生 API 规范」配套，同样支持条件段。这里是全局默认；渠道页的每套配置里可以单独覆盖（留空则回落到这一份）。',
     builtin: DEFAULT_LATENT_API_THINKING,
     macros: NL_SECTION_MACROS,
   },
@@ -784,6 +784,14 @@ async function confirmUpdate() {
         <p class="bbi-field-hint">
           只管图片在聊天里显示多大,主要针对电脑宽屏;不改出图分辨率与横竖,也不改图片文件本身。
           手机等窄屏本来就由宽度限住,基本不受影响。「铺满楼层宽度」即旧版效果。
+        </p>
+
+        <label class="bbi-switch-row">
+          <span class="bbi-field-label">楼层图片沉浸显示</span>
+          <input v-model="settings.ui.immersiveImages" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p class="bbi-field-hint">
+          开启后图片上不显示菜单和翻页,点一下图片才出现,点别处收起;出现时再点图片看大图。
         </p>
 
         <label class="bbi-switch-row">

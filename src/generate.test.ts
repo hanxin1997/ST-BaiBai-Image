@@ -49,6 +49,9 @@ function naiReady(model: NaiModel = 'nai-diffusion-4-5-full'): void {
   settings.nai.model = model;
   settings.nai.seed = 0;
   settings.nai.orientationLock = 'auto';
+  // 方案化后 model/seed 的真源在方案上;镜像只是给旧调用方读的。
+  settings.nai.plans[0].model = model;
+  settings.nai.plans[0].seed = 0;
 }
 
 /** 把设置调成「ComfyUI 自定义工作流已配齐」。 */
@@ -60,15 +63,6 @@ function comfyReady(): void {
   preset.mode = 'custom';
   preset.workflow = '{"1":{}}';
   preset.orientationLock = 'auto';
-}
-
-/** 把设置调成「Latent 已配齐」。 */
-function latentReady(model: NaiModel = 'nai-diffusion-4-5-full'): void {
-  settings.defaultBackend = 'latent';
-  settings.latent.url = 'https://latent.example';
-  settings.latent.key = 'k';
-  settings.latent.model = model;
-  settings.latent.seed = 0;
 }
 
 /** 把设置调成「ImgRouter 已配齐」。 */
@@ -112,22 +106,6 @@ describe('backendStatus', () => {
     });
   });
 
-  it('treats Latent like NAI for configured + supportsCharacters', () => {
-    latentReady();
-    expect(backendStatus()).toMatchObject({
-      backend: 'latent',
-      configured: true,
-      supportsCharacters: true,
-      model: 'nai-diffusion-4-5-full',
-    });
-    settings.latent.key = '';
-    expect(backendStatus()).toMatchObject({
-      configured: false,
-      reason: '未填写 Latent API Key',
-      supportsCharacters: true,
-    });
-  });
-
   it('keeps ImgRouter at supportsCharacters=false and uses the model or a fallback label', () => {
     imgrouterReady();
     expect(backendStatus()).toMatchObject({
@@ -149,22 +127,22 @@ describe('backendStatus', () => {
 describe('decideSeed', () => {
   it('prefers an explicit seed over everything else', () => {
     naiReady();
-    settings.nai.seed = 999;
+    settings.nai.plans[0].seed = 999;
     expect(decideSeed('nai', 12345)).toBe(12345);
     expect(decideSeed('nai', 12345.7)).toBe(12345);
   });
 
-  it('uses the NAI panel seed only when it is a positive number', () => {
+  it('uses the NAI plan seed only when it is a positive number', () => {
     naiReady();
-    settings.nai.seed = 777;
+    settings.nai.plans[0].seed = 777;
     expect(decideSeed('nai')).toBe(777);
-    settings.nai.seed = 0;
+    settings.nai.plans[0].seed = 0;
     expect(decideSeed('nai')).not.toBe(0);
   });
 
   it.each([0, -1, NaN, undefined])('ignores %s as an override and still returns a usable seed', value => {
     naiReady();
-    settings.nai.seed = 0;
+    settings.nai.plans[0].seed = 0;
     const seed = decideSeed('nai', value as number | undefined);
     expect(Number.isInteger(seed)).toBe(true);
     expect(seed).toBeGreaterThan(0);
@@ -174,12 +152,6 @@ describe('decideSeed', () => {
     imgrouterReady();
     expect(decideSeed('imgrouter')).toBe(0);
     expect(decideSeed('imgrouter', 12345)).toBe(12345);
-  });
-
-  it('reads the Latent panel seed the same way as NAI', () => {
-    latentReady();
-    settings.latent.seed = 888;
-    expect(decideSeed('latent')).toBe(888);
   });
 });
 
@@ -210,7 +182,7 @@ describe('generateImage', () => {
     const characters = [{ name: '阿黛尔', tag: '1girl', nl: '' }];
     await generateImage({ prompt: 'x', characters, seed: 5, size: 'landscape' });
     expect(vi.mocked(generateNaiImage).mock.calls[0][1]).toEqual({
-      prompt: 'x', nl: '', characters, seed: 5, size: 'landscape', flatten: false,
+      prompt: 'x', nl: '', characters, seed: 5, size: 'landscape',
     });
   });
 
@@ -260,21 +232,6 @@ describe('generateImage', () => {
       seed: 9,
       size: 'portrait',
     });
-  });
-
-  it('holds the NAI gate for Latent and flattens Character Prompts into the prompt', async () => {
-    latentReady();
-    const characters = [{ name: '阿黛尔', tag: '1girl', nl: '' }];
-    await generateImage({ prompt: 'x', characters, seed: 5, size: 'portrait' });
-    expect(vi.mocked(acquireNaiSlot)).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(generateNaiImage).mock.calls[0][0]).toBe(settings.latent);
-    expect(vi.mocked(generateNaiImage).mock.calls[0][1]).toMatchObject({
-      prompt: 'x',
-      characters,
-      seed: 5,
-      flatten: true,
-    });
-    expect((await generateImage({ prompt: 'x', characters, seed: 1 })).charactersApplied).toBe(true);
   });
 
   it('leaves ImgRouter out of the gate and does not apply characters', async () => {

@@ -522,6 +522,20 @@
   color: oklch(1 0 0 / 0.9);
 }
 
+/* ——— 沉浸显示:有图时操作组与翻页器藏起,点图才浮现(见 Card.vue 的 uiHidden) ———
+   只藏这两组;状态行、提示词面板、画师串浮层不在此列。
+   pointer-events 一并关掉:opacity:0 的元素仍会命中点击,会在图上留隐形热区。 */
+.bbi-figure__stage[data-hide-ui='1'] .bbi-figure__actions,
+.bbi-figure__stage[data-hide-ui='1'] .bbi-figure__pager {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.bbi-figure__actions,
+.bbi-figure__pager {
+  transition: opacity var(--bbi-dur) var(--bbi-ease);
+}
+
 /* ——— 折叠动画:grid-template-rows 1fr→0fr 过渡(高度 auto 也能平滑) ———
    折叠时舞台不卸载,只是高度归零 + 淡出,展开时 <img> 不需要重新请求。
    不支持 grid 行过渡的老浏览器退化为即时切换,功能不受影响。

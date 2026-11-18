@@ -43,23 +43,15 @@ watch(viewing, v => {
   }
 });
 
-// latent 与 nai 共用 NaiPanel:协议相同,靠 :target 区分读写哪条渠道的配置
-// (见 NaiPanel 文件头)。照抄一份 2000 行面板才是真的维护不起。
+// NAI 面板只服务 nai 一条渠道(旧 latent 渠道已移除,Latent 只剩原生 API 面板)。
 const PANELS: Record<BackendId, Component> = {
   webui: WebUIPanel,
   comfyui: ComfyUIPanel,
   nai: NaiPanel,
-  latent: NaiPanel,
   imgrouter: ImgRouterPanel,
   latentapi: LatentApiPanel,
 };
 const activePanel = computed(() => PANELS[viewing.value]);
-
-/**
- * 只有 NaiPanel 读这个 prop;其余面板收到多余 attr 无副作用(Vue 会当 fallthrough)。
- * 收窄成 'nai' | 'latent' 是因为 NaiPanel 的 target 只认这两个值,直接透传 BackendId 过不了类型。
- */
-const panelTarget = computed<'nai' | 'latent'>(() => (viewing.value === 'latent' ? 'latent' : 'nai'));
 </script>
 
 <template>
@@ -85,7 +77,7 @@ const panelTarget = computed<'nai' | 'latent'>(() => (viewing.value === 'latent'
 
     <!-- KeepAlive:切换渠道时保留各面板的折叠/输入状态 -->
     <KeepAlive>
-      <component :is="activePanel" :key="viewing" :target="panelTarget" />
+      <component :is="activePanel" :key="viewing" />
     </KeepAlive>
   </section>
 </template>

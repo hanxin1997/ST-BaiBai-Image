@@ -8,14 +8,13 @@ import {
   runNaiWithRetry,
   type NaiRetryInfo,
 } from '@/backends/naiRateLimit';
-import { buildPromptSections, joinSections } from '@/backends/promptSections';
 import { parseSize, pickSize, type Orientation } from '@/backends/size';
 import { clampVibeStrength, loadVibeData } from '@/backends/vibeStore';
 import { decodeMessagePack, type MessagePackValue } from '@/msgpack';
 import type { GenerationArtist, GenerationMeta, GenerationParams, GenerationVibe } from '@/generationMeta';
 import type {
   NaiArtistPreset,
-  NaiSettings,
+  NaiRunConfig,
   NaiVibe,
   NaiVibeData,
   NaiVibeEncodings,
@@ -79,6 +78,7 @@ export const NAI_NOISE_SCHEDULES: { value: string; label: string }[] = [
 /** 各模型官方质量词，拼到正向提示词末尾;用户在面板改过则用其覆盖值。 */
 const QUALITY_TAGS: Record<string, string> = {
   'nai-diffusion-5-full': 'very aesthetic, masterpiece, no text',
+  'nai-diffusion-5-full-medium': 'very aesthetic, masterpiece, no text',
   'nai-diffusion-5-curated': 'very aesthetic, masterpiece, no text',
   'nai-diffusion-4-5-full': 'location, very aesthetic, masterpiece, no text',
   'nai-diffusion-4-5-curated': 'location, masterpiece, no text, -0.8::feet::, rating:general',
@@ -91,11 +91,14 @@ const QUALITY_TAGS: Record<string, string> = {
  * 各模型官方 Heavy 负面词，作为无需用户选择的通用默认;用户改过则用其覆盖值。
  * 5-full 在官方基线后额外串一条插件精选的通用负面层:只排画质/解剖/水印等**缺陷**,
  * 不含题材、风格、身材、画师偏好——那些会跟用户的正向词和画师串长期打架。
+ * 5-full-medium 的负面词由官方固定为 Heavy 预设(见 naiFixedSettings),不串插件层。
  * 其余模型维持官方基线不动。
  */
 const DEFAULT_UNDESIRED_CONTENT: Record<string, string> = {
   'nai-diffusion-5-full':
     'lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, text, watermark, signature, username, artist name, bad anatomy, bad hands, bad feet, extra digits, fewer digits, extra fingers, fused fingers, extra limbs, missing limbs, long neck, blurry, poorly drawn, unfinished, plastic skin, waxy skin, oversaturated, washed out',
+  'nai-diffusion-5-full-medium':
+    'lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page',
   'nai-diffusion-5-curated':
     'lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page',
   'nai-diffusion-3':
@@ -131,8 +134,29 @@ export function isNai5(model: string): boolean {
   return model.includes('nai-diffusion-5');
 }
 
+/**
+ * 官方锁死的采样参数(官方前端模型能力表里的 fixedSettings)。目前只有 V5 Full 的
+ * Medium 档(官方叫「Medium Effort」):更快、更省 Anlas,代价是步数、采样器、负面词
+ * 都由官方定死、不支持 CFG Rescale。官方前端对它直接隐藏这几项、发请求时强行改写,
+ * 用户自填的负面词与角色负面词一律清空——这里照抄同一口径,不赌服务端收不收自定义值。
+ * 其余模型 → null。
+ */
+export interface NaiFixedSettings {
+  steps: number;
+  sampler: string;
+}
+
+export function naiFixedSettings(model: string): NaiFixedSettings | null {
+  return model.includes('nai-diffusion-5-full-medium') ? { steps: 14, sampler: 'k_euler_ancestral' } : null;
+}
+
+/**
+ * V5 不支持 Vibe Transfer(官方未开放)。早先按「V5 也有 v5full 编码键」当成支持,
+ * 结果 V5 用户照样被引导去上传编码、出图时把编码发过去。vibeModelKey 的 v5 键留着只为
+ * 读写官方 .naiv4vibe 文件时不丢数据,不代表能用。
+ */
 export function naiSupportsVibes(model: string): boolean {
-  return isNai3(model) || isNai4Family(model) || isNai5(model);
+  return isNai3(model) || isNai4Family(model);
 }
 
 const NAI_V5_SAMPLERS = new Set([
@@ -267,20 +291,11 @@ export interface NaiGenerateValues {
   seed?: number;
   /** 画幅方向;缺省竖屏(与改动前的固定默认一致)。 */
   size?: Orientation;
-  /**
-   * latent 渠道:把正向 tag / 自然语言 / 各角色摊成分段串塞进正向提示词
-   * (格式见 backends/promptSections.ts),并清空结构化 Character Prompts。
-   *
-   * 刻意**不**做成 settings 里的用户开关:它是 latent 这条渠道的定义而非可调项,
-   * 给个开关只会让人关掉之后困惑「为什么角色没生效」。由 Card.vue 按当前后端传入。
-   */
-  flatten?: boolean;
 }
 
 /** fullPositivePrompt 的可选入参。用对象而非继续加位参:现有调用点与测试不受影响。 */
 export interface FullPositiveOpts {
   characters?: readonly ImageCharacterPrompt[];
-  flatten?: boolean;
 }
 
 /**
@@ -327,19 +342,14 @@ type JsonObject = Record<string, unknown>;
  * settings.ts 已 import 本模块的 naiDefaultUndesired,反向加值依赖会成运行时环(TDZ 隐患)。
  * 这一行 find 的重复是有意为之。
  */
-function naiActivePreset(nai: NaiSettings): NaiArtistPreset | null {
-  if (!nai.activeArtistId) return null;
-  return (
-    nai.artistPresets.find(a => a.id === nai.activeArtistId) ??
-    BUILTIN_NAI_ARTISTS.find(a => a.id === nai.activeArtistId) ??
-    null
-  );
+function naiActivePreset(nai: NaiRunConfig): NaiArtistPreset | null {
+  return nai.artist;
 }
 
 /** 当前生效的画师串快照（id / 名字 / 正文）。未选或正文全空白 → null。
  *  拼装（naiArtistPrompt）与随图记录（generateNaiImage 的 usage）都走这里，保证
  *  「真发出去的画师串」与「记下来的画师串」永远同源。 */
-export function naiArtistUsage(nai: NaiSettings): GenerationArtist | null {
+export function naiArtistUsage(nai: NaiRunConfig): GenerationArtist | null {
   const preset = naiActivePreset(nai);
   const prompt = preset?.prompt.trim() ?? '';
   // 全空白的 preset 必须归 null:'   ' 是 truthy,下游 filter(Boolean) 兜不住它
@@ -348,7 +358,7 @@ export function naiArtistUsage(nai: NaiSettings): GenerationArtist | null {
 }
 
 /** 当前生效的画师串:选中条目的正文;未选 / 指向已删条目 / 内容全空白 → 空串。 */
-export function naiArtistPrompt(nai: NaiSettings): string {
+export function naiArtistPrompt(nai: NaiRunConfig): string {
   return naiArtistUsage(nai)?.prompt ?? '';
 }
 
@@ -357,13 +367,16 @@ export function naiArtistPrompt(nai: NaiSettings): string {
  * 任一级空串(或纯空白)= 跟随下一级。内置默认当前 = 模型官方词;
  * 以后插件要换成自己的精选默认,只改 naiDefaultQualityTags,链结构不变。
  */
-export function naiQualityTags(nai: NaiSettings): string {
+export function naiQualityTags(nai: NaiRunConfig): string {
   const bound = naiActivePreset(nai)?.quality.trim();
   return bound || nai.qualityTags.trim() || naiDefaultQualityTags(nai.model);
 }
 
 /** 负面提示词解析链:配方绑定值 → 渠道覆盖值(undesiredContent)→ 内置默认(模型官方负面词)。 */
-export function naiUndesiredContent(nai: NaiSettings): string {
+export function naiUndesiredContent(nai: NaiRunConfig): string {
+  // Medium 档的负面词由官方固定:无视画师串与渠道覆盖,发出去的就是官方 Heavy 原文。
+  // 画师串里自填过的负面词仍保留着,换回其它模型照常生效。
+  if (naiFixedSettings(nai.model)) return naiDefaultUndesired(nai.model);
   const bound = naiActivePreset(nai)?.negative.trim();
   return bound || nai.undesiredContent.trim() || naiDefaultUndesired(nai.model);
 }
@@ -380,7 +393,7 @@ export function naiUndesiredContent(nai: NaiSettings): string {
  * NAI3(读 input)与 NAI4/4.5(读 v4_prompt)拿到不同的提示词,且只在 NAI3 上暴露。
  */
 export function fullPositivePrompt(
-  nai: NaiSettings,
+  nai: NaiRunConfig,
   prompt: string,
   nl = '',
   opts: FullPositiveOpts = {},
@@ -388,22 +401,6 @@ export function fullPositivePrompt(
   const artist = naiArtistPrompt(nai);
   const quality = naiQualityTags(nai);
   const tags = [artist, prompt.trim(), quality].filter(Boolean).join(', ');
-  // latent:摊成分段串。画师串与质量词仍并进「正向提示词」段,次序不变——
-  // 换行分段只改「怎么装」,不改「装什么」,故两种模式的 tag 内容逐字相同。
-  if (opts.flatten) {
-    return joinSections(
-      buildPromptSections({
-        prompt: tags,
-        nl: nl.trim(),
-        // 角色段照 Character Prompts 的口径normalize:见 singleSubjectTag
-        characters: (opts.characters ?? []).map(character => ({
-          name: character.name,
-          tag: singleSubjectTag(character.tag),
-          nl: character.nl.trim(),
-        })),
-      }),
-    );
-  }
   return naiSupportsCharacterPrompts(nai.model) && nl.trim() ? `${tags}. ${nl.trim()}` : tags;
 }
 
@@ -472,7 +469,7 @@ function characterCaptions(characters: readonly ImageCharacterPrompt[]) {
  * 负面完整 prompt = 配方绑定值 → 渠道覆盖值(undesiredContent)→ 模型官方负面词
  * (见 naiUndesiredContent)。想额外排除什么,往任一级的值里接即可。
  */
-export function fullNegativePrompt(nai: NaiSettings): string {
+export function fullNegativePrompt(nai: NaiRunConfig): string {
   return naiUndesiredContent(nai);
 }
 
@@ -480,25 +477,20 @@ export function fullNegativePrompt(nai: NaiSettings): string {
  * 构造 parameters。v4 系模型带 v4_prompt/v4_negative_prompt 结构;NAI3 不带。
  * vibe 不在此叠加(见 applyVibes),保持「一次生成 = build + applyVibes」两步。
  */
-/** V5 原生链路 = 模型是 V5 且不是 latent 的摊平模式(latent 仍走旧协议)。 */
-function usesNativeV5(nai: NaiSettings, flatten: boolean | undefined): boolean {
-  return isNai5(nai.model) && !flatten;
-}
-
-export function buildNaiParameters(nai: NaiSettings, values: NaiGenerateValues): JsonObject {
+export function buildNaiParameters(nai: NaiRunConfig, values: NaiGenerateValues): JsonObject {
   // 画幅按方向取用户配的那一格;没填回落竖屏默认
   const orientation = values.size ?? 'portrait';
   const { width, height } = parseResolution(pickSize(nai, orientation) || '832×1216');
   // 显式传入 > 面板固定种子 > 随机
   const seed = values.seed ?? (nai.seed > 0 ? nai.seed : naiRandomSeed());
-  const prompt = fullPositivePrompt(nai, values.prompt, values.nl, {
-    characters: values.characters,
-    flatten: values.flatten,
-  });
+  const prompt = fullPositivePrompt(nai, values.prompt, values.nl);
   const negative = fullNegativePrompt(nai);
   const skipCfg = skipCfgAboveSigma(width, height, nai.model, nai.varietyBoost);
-  const sampler = isNai5(nai.model) && !NAI_V5_SAMPLERS.has(nai.sampler) ? 'k_euler_ancestral' : nai.sampler;
-  const nativeV5 = usesNativeV5(nai, values.flatten);
+  const fixed = naiFixedSettings(nai.model);
+  const sampler =
+    fixed?.sampler ??
+    (isNai5(nai.model) && !NAI_V5_SAMPLERS.has(nai.sampler) ? 'k_euler_ancestral' : nai.sampler);
+  const nativeV5 = isNai5(nai.model);
 
   const params: JsonObject = {
     params_version: isNai5(nai.model) ? 4 : 3,
@@ -506,14 +498,14 @@ export function buildNaiParameters(nai: NaiSettings, values: NaiGenerateValues):
     height,
     scale: nai.scale,
     sampler,
-    steps: nai.steps,
+    steps: fixed?.steps ?? nai.steps,
     n_samples: 1,
     dynamic_thresholding: false,
     controlnet_strength: 1,
     legacy: false,
     legacy_uc: false,
     add_original_image: true,
-    cfg_rescale: nai.cfgRescale,
+    cfg_rescale: fixed ? 0 : nai.cfgRescale,
     noise_schedule: nai.noiseSchedule,
     legacy_v3_extend: false,
     stream: 'msgpack',
@@ -550,10 +542,7 @@ export function buildNaiParameters(nai: NaiSettings, values: NaiGenerateValues):
   } else {
     // NAI4/4.5/V5: v4 caption structure; Vibe uses a model-specific cached encoding.
     params.reference_image_multiple_cached = [];
-    // flatten(latent)时清空:角色已在正向串的角色段里,再发一遍结构化 Character Prompts
-    // 等于把同一个角色喂两遍,模型会当成画面里有两个同样的人。
-    const characters =
-      naiSupportsCharacterPrompts(nai.model) && !values.flatten ? (values.characters ?? []) : [];
+    const characters = naiSupportsCharacterPrompts(nai.model) ? (values.characters ?? []) : [];
     const captions = characterCaptions(characters);
     // LWB/官方 V5 都发结构化角色数组;只靠 v4_prompt.char_captions 时部分第三方
     // 转发会丢掉角色特征,这是「鬼画符」的主要来源之一。
@@ -614,7 +603,7 @@ export interface VibeApplication {
  */
 export function applyVibes(
   params: JsonObject,
-  nai: NaiSettings,
+  nai: NaiRunConfig,
   dataById: ReadonlyMap<string, NaiVibeData>,
 ): VibeApplication {
   const active = nai.vibes.filter(v => v.enabled);
@@ -708,7 +697,7 @@ async function naiHttpError(resp: Response, label: string): Promise<NaiError> {
 
 /** 测试连接:优先 /user/subscription 验 key;第三方站无此接口(404)时只验证地址可达。 */
 export async function testNaiConnection(
-  nai: Pick<NaiSettings, 'url' | 'key'>,
+  nai: Pick<NaiRunConfig, 'url' | 'key'>,
   signal?: AbortSignal,
 ): Promise<{ message: string }> {
   if (!nai.key.trim()) throw new NaiError('请先填写 API Key');
@@ -754,7 +743,7 @@ export interface NaiImageOutput {
 }
 
 /** 读启用的 vibe 数据(读失败只告警、按缺编码处理),再叠加进 parameters。 */
-async function loadAndApplyVibes(params: JsonObject, nai: NaiSettings): Promise<GenerationVibe[]> {
+async function loadAndApplyVibes(params: JsonObject, nai: NaiRunConfig): Promise<GenerationVibe[]> {
   const activeVibes = naiSupportsVibes(nai.model) ? nai.vibes.filter(vibe => vibe.enabled) : [];
   const loaded = new Map<string, NaiVibeData>();
   for (const vibe of activeVibes) {
@@ -782,7 +771,7 @@ async function loadAndApplyVibes(params: JsonObject, nai: NaiSettings): Promise<
  * 报给卡片显示 —— 否则用户看着「生成中…」一动不动几十秒,只会以为卡死了再点一次。
  */
 export async function generateNaiImage(
-  nai: NaiSettings,
+  nai: NaiRunConfig,
   values: NaiGenerateValues,
   signal?: AbortSignal,
   opts: { onRetry?: (info: NaiRetryInfo) => void } = {},
@@ -794,11 +783,8 @@ export async function generateNaiImage(
   const artist = naiArtistUsage(nai);
   const params = buildNaiParameters(nai, values);
   const vibes = await loadAndApplyVibes(params, nai);
-  // 顶层 input 与随图记录的 positive 用同一次拼装(latent 下即分段串),记下的就是发出去的
-  const positive = fullPositivePrompt(nai, values.prompt, values.nl, {
-    characters: values.characters,
-    flatten: values.flatten,
-  });
+  // 顶层 input 与随图记录的 positive 用同一次拼装,记下的就是发出去的
+  const positive = fullPositivePrompt(nai, values.prompt, values.nl);
   const body = {
     input: positive,
     model: nai.model,
@@ -806,13 +792,7 @@ export async function generateNaiImage(
     parameters: params,
     use_new_shared_trial: true,
   };
-  const result = await requestNaiImage(
-    nai,
-    body,
-    signal,
-    opts.onRetry,
-    usesNativeV5(nai, values.flatten),
-  );
+  const result = await requestNaiImage(nai, body, signal, opts.onRetry, isNai5(nai.model));
   const usage = {
     positive,
     negative: fullNegativePrompt(nai),
@@ -826,7 +806,7 @@ export async function generateNaiImage(
 }
 
 /** 采样参数快照：只收标量，不含提示词与 vibe 二进制。 */
-function naiParamsSnapshot(params: JsonObject, nai: NaiSettings): GenerationParams {
+function naiParamsSnapshot(params: JsonObject, nai: NaiRunConfig): GenerationParams {
   return {
     sampler: params.sampler as string,
     steps: params.steps as number,
@@ -947,7 +927,7 @@ function decodeNaiStreamImage(bytes: Uint8Array): Uint8Array {
  * 其余错误照常抛,避免把 401/402 误判成「不支持流式」再白打一次旧端点。
  */
 async function requestNaiStreamImage(
-  nai: NaiSettings,
+  nai: NaiRunConfig,
   body: JsonObject,
   signal: AbortSignal | undefined,
 ): Promise<ComfyImageResult | null> {
@@ -975,7 +955,7 @@ async function requestNaiStreamImage(
 }
 
 async function requestNaiLegacyImage(
-  nai: NaiSettings,
+  nai: NaiRunConfig,
   body: JsonObject,
   signal: AbortSignal | undefined,
 ): Promise<ComfyImageResult> {
@@ -998,7 +978,7 @@ async function requestNaiLegacyImage(
  * 重跑它们既白费功夫,也会把 vibe 缺编码的 toastr 警告重复弹出来。
  */
 function requestNaiImage(
-  nai: NaiSettings,
+  nai: NaiRunConfig,
   body: JsonObject,
   signal: AbortSignal | undefined,
   onRetry: ((info: NaiRetryInfo) => void) | undefined,
@@ -1012,7 +992,7 @@ function requestNaiImage(
       }
       return requestNaiLegacyImage(nai, body, signal);
     },
-    { signal, onRetry },
+    { signal, onRetry, gate: nai.endpointId },
   );
 }
 
@@ -1029,12 +1009,12 @@ export const VIBE_ENCODING_KEY = 'b36a8472fe418d9f80d6bb1c54e3a6e62c62936aa7bf31
  * (并发槽由调用方取,见 pages/backend/panels/NaiPanel.vue —— 与卡片同一条纪律。)
  */
 export async function encodeVibeImage(
-  nai: Pick<NaiSettings, 'url' | 'key'>,
+  nai: Pick<NaiRunConfig, 'url' | 'key'>,
   imageBase64: string,
   model: string,
   infoExtracted = 1,
   signal?: AbortSignal,
-  opts: { onRetry?: (info: NaiRetryInfo) => void } = {},
+  opts: { onRetry?: (info: NaiRetryInfo) => void; gate?: string } = {},
 ): Promise<string> {
   if (!nai.key.trim()) throw new NaiError('请先填写 NAI API Key');
   return runNaiWithRetry(
@@ -1055,7 +1035,7 @@ export async function encodeVibeImage(
       }
       return uint8ToBase64(bytes);
     },
-    { signal, onRetry: opts.onRetry },
+    { signal, onRetry: opts.onRetry, gate: opts.gate },
   );
 }
 

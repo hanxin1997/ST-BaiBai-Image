@@ -23,7 +23,7 @@ vi.mock('@/generate', () => ({
   decideSeed: vi.fn(() => 4242),
   generateImage: vi.fn(),
   hasClientGate: (backend: string) =>
-    backend === 'nai' || backend === 'latent' || backend === 'latentapi',
+    backend === 'nai' || backend === 'latentapi',
 }));
 
 vi.mock('@/floor/storage', () => ({ saveExternalImage: vi.fn(async () => '/user/images/x.png') }));

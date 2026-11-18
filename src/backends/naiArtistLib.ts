@@ -7,7 +7,7 @@ import type {
 
 /**
  * 画师串库的管理态纯逻辑(搜索匹配 / 删除接位规划 / Vibe 绑定)。
- * 与交互解耦,便于单测;NaiArtistManager.vue 只做交互与落盘。
+ * 与交互解耦,便于单测;NaiArtistLibrary.vue 只做交互与落盘。
  */
 
 /** 切换画师串时套用其 Vibe 绑定:undefined = 未绑定,不动;[] = 明确不使用,全部关闭。 */

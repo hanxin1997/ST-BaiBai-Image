@@ -28,10 +28,16 @@ import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import {
   activeComfyPreset,
+  activeComfyPromptSet,
+  activeComfyServer,
+  BUILTIN_COMFY_ILLUST_ID,
   effectiveComfyConn,
+  newComfyPromptSet,
+  newComfyServer,
   newComfyWorkflow,
   ORIENTATION_LOCKS,
   settings,
+  type ComfyPromptSet,
 } from '@/state/settings';
 import { computed, nextTick, ref, watch } from 'vue';
 
@@ -46,6 +52,109 @@ const confirmDeleteOpen = ref(false);
 
 /** 本渠道是否为当前出图渠道;「使用此渠道」按钮与设置页选择器、页签徽标同属一个开关。 */
 const inUse = computed(() => settings.defaultBackend === 'comfyui');
+
+/* ============ 服务器库 ============ */
+
+const server = computed(() => activeComfyServer());
+const serverOptions = computed(() =>
+  settings.comfyui.servers.map(s => ({ value: s.id, label: s.name || '未命名服务器' })),
+);
+
+/** 当前方案引用的服务器;切换时把渠道级 url 镜像一起刷新。 */
+const serverId = computed<string>({
+  get: () => server.value.id,
+  set: id => {
+    const target = settings.comfyui.servers.find(s => s.id === id);
+    if (!target) return;
+    active.value.serverId = id;
+    settings.comfyui.url = target.url;
+  },
+});
+
+/** 地址输入框写「当前服务器」,同时刷新渠道级镜像(兼容仍读 url 的旧路径)。 */
+const serverUrl = computed<string>({
+  get: () => server.value.url,
+  set: value => {
+    server.value.url = value;
+    settings.comfyui.url = value;
+  },
+});
+
+function addServer() {
+  const created = newComfyServer(`服务器 ${settings.comfyui.servers.length + 1}`);
+  settings.comfyui.servers.push(created);
+  active.value.serverId = created.id;
+  settings.comfyui.url = created.url;
+}
+
+function deleteServer() {
+  if (settings.comfyui.servers.length <= 1) return;
+  const currentId = server.value.id;
+  const index = settings.comfyui.servers.findIndex(s => s.id === currentId);
+  settings.comfyui.servers.splice(index, 1);
+  const next = settings.comfyui.servers[Math.min(index, settings.comfyui.servers.length - 1)];
+  for (const wf of settings.comfyui.workflows) if (wf.serverId === currentId) wf.serverId = next.id;
+  settings.comfyui.url = next.url;
+}
+
+/* ============ 提示词库 ============ */
+
+const promptSets = computed(() => settings.comfyui.promptSets);
+const promptSetOptions = computed(() => [
+  { value: BUILTIN_COMFY_ILLUST_ID, label: '插画(内置)' },
+  ...promptSets.value.map(s => ({ value: s.id, label: s.name || '未命名提示词' })),
+]);
+
+/** 当前方案引用的提示词集;空串 = 内置。 */
+const promptSetId = computed<string>({
+  get: () => active.value.promptSetId || BUILTIN_COMFY_ILLUST_ID,
+  set: id => {
+    active.value.promptSetId = id;
+  },
+});
+
+const promptSetEditing = ref<ComfyPromptSet | null>(null);
+const promptSetDraft = ref<ComfyPromptSet | null>(null);
+
+function addPromptSet() {
+  const created = newComfyPromptSet(`提示词 ${promptSets.value.length + 1}`);
+  settings.comfyui.promptSets.push(created);
+  active.value.promptSetId = created.id;
+  editPromptSet(created);
+}
+
+function editPromptSet(set: ComfyPromptSet) {
+  promptSetEditing.value = set;
+  promptSetDraft.value = { ...set };
+}
+
+function cancelPromptSet() {
+  promptSetEditing.value = null;
+  promptSetDraft.value = null;
+}
+
+function savePromptSet() {
+  if (!promptSetEditing.value || !promptSetDraft.value) return;
+  Object.assign(promptSetEditing.value, promptSetDraft.value);
+  promptSetEditing.value = null;
+  promptSetDraft.value = null;
+  toastr.success('提示词已保存', 'ComfyUI');
+}
+
+function deletePromptSet(set: ComfyPromptSet) {
+  const index = settings.comfyui.promptSets.findIndex(s => s.id === set.id);
+  if (index < 0) return;
+  settings.comfyui.promptSets.splice(index, 1);
+  for (const wf of settings.comfyui.workflows) {
+    if (wf.promptSetId === set.id) wf.promptSetId = BUILTIN_COMFY_ILLUST_ID;
+  }
+}
+
+function deleteEditingPromptSet() {
+  if (!promptSetEditing.value) return;
+  deletePromptSet(promptSetEditing.value);
+  cancelPromptSet();
+}
 
 /* ============ 工作流库 ============ */
 
@@ -360,11 +469,29 @@ function applyAssist() {
     <div class="bbi-sections">
       <Collapsible title="配置" :open="false">
         <div class="api-row">
+          <span class="bbi-field-label">服务器</span>
+          <BbiSelect class="wf-select" v-model="serverId" :options="serverOptions" aria-label="当前服务器" />
+          <span class="wf-ops">
+            <button class="bbi-icon-btn wf-op" type="button" title="新建服务器" @click="addServer">
+              <Icon name="plus" :size="14" />
+            </button>
+            <button
+              class="bbi-icon-btn wf-op wf-remove"
+              type="button"
+              :disabled="settings.comfyui.servers.length <= 1"
+              title="删除当前服务器"
+              @click="deleteServer"
+            >
+              <Icon name="trash" :size="14" />
+            </button>
+          </span>
+        </div>
+        <div class="api-row">
           <span class="bbi-field-label">URL</span>
           <input
             class="bbi-input"
             type="text"
-            v-model="settings.comfyui.url"
+            v-model="serverUrl"
             placeholder="http://127.0.0.1:8188"
             spellcheck="false"
           />
@@ -387,7 +514,40 @@ function applyAssist() {
         </div>
       </Collapsible>
 
+      <Collapsible title="提示词库" :open="false">
+        <div class="wf-row">
+          <span class="bbi-field-label">当前提示词</span>
+          <BbiSelect class="wf-select" v-model="promptSetId" :options="promptSetOptions" aria-label="当前提示词集" />
+          <span class="wf-ops">
+            <button class="bbi-icon-btn wf-op" type="button" title="新建一套提示词" @click="addPromptSet">
+              <Icon name="plus" :size="14" />
+            </button>
+          </span>
+        </div>
+        <ul class="bbi-prompt-list">
+          <li v-for="s in promptSets" :key="s.id" class="bbi-prompt-item">
+            <button class="bbi-prompt-open" type="button" @click="editPromptSet(s)">
+              <span class="bbi-prompt-name">{{ s.name || '未命名提示词' }}</span>
+              <span class="bbi-prompt-state" :class="{ 'is-custom': s.spec.trim() }">
+                {{ s.spec.trim() ? '已自定义' : '留空回落内置' }}
+              </span>
+              <Icon name="edit" class="bbi-prompt-edit" />
+            </button>
+          </li>
+        </ul>
+        <p class="bbi-field-hint">内置「插画」随插件版本更新;要改就新建一套自己的,方案里选用它。</p>
+      </Collapsible>
+
       <Collapsible title="工作流" :open="false">
+        <div class="wf-row">
+          <span class="bbi-field-label">服务器</span>
+          <BbiSelect class="wf-select" v-model="serverId" :options="serverOptions" aria-label="当前方案服务器" />
+        </div>
+        <div class="wf-row">
+          <span class="bbi-field-label">提示词集</span>
+          <BbiSelect class="wf-select" v-model="promptSetId" :options="promptSetOptions" aria-label="当前方案提示词集" />
+        </div>
+        <hr class="wf-divider" />
         <div class="wf-row">
           <span class="bbi-field-label">当前工作流</span>
           <input
@@ -801,6 +961,42 @@ function applyAssist() {
             <Icon name="check" />
             应用工作流
           </button>
+        </footer>
+      </div>
+    </ModalMask>
+
+    <!-- ===== 提示词编辑弹窗:书写规范 + 思维链(留空回落内置) ===== -->
+    <ModalMask :open="!!promptSetDraft" @close="cancelPromptSet">
+      <div v-if="promptSetDraft" class="bbi-modal bbi-modal-wide" role="dialog" aria-modal="true" aria-label="编辑提示词">
+        <header class="bbi-modal-head">
+          <span class="bbi-modal-title">编辑提示词</span>
+          <button class="bbi-icon-mini" type="button" title="关闭" aria-label="关闭" @click="cancelPromptSet">
+            <Icon name="close" />
+          </button>
+        </header>
+
+        <div class="bbi-modal-field">
+          <span class="bbi-modal-label">名称</span>
+          <input class="bbi-input" v-model="promptSetDraft.name" type="text" spellcheck="false" />
+        </div>
+
+        <div class="bbi-modal-field">
+          <span class="bbi-modal-label">书写规范(留空 = 回落内置)</span>
+          <BbiTextarea v-model="promptSetDraft.spec" :rows="8" :max-rows="20" mono />
+        </div>
+
+        <div class="bbi-modal-field">
+          <span class="bbi-modal-label">思维链(留空 = 回落内置)</span>
+          <BbiTextarea v-model="promptSetDraft.thinking" :rows="8" :max-rows="20" mono />
+        </div>
+
+        <footer class="bbi-modal-foot">
+          <button class="bbi-btn bbi-btn-danger" type="button" @click="deleteEditingPromptSet">
+            <Icon name="trash" /> 删除
+          </button>
+          <span class="bbi-modal-foot-spacer"></span>
+          <button class="bbi-btn" type="button" @click="cancelPromptSet">取消</button>
+          <button class="bbi-btn bbi-btn-primary" type="button" @click="savePromptSet">保存</button>
         </footer>
       </div>
     </ModalMask>

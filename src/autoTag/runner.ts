@@ -347,7 +347,7 @@ function unmarkPlan(chatId: string, floor: number, swipeId: number, slot: RunOpt
 /** 世界书生图按当前出图渠道定形:有分角色提示的保留角色,ComfyUI / ImgRouter 拼成一串。 */
 function worldbookTarget(): 'characters' | 'folded' {
   const backend = settings.defaultBackend;
-  return backend === 'nai' || backend === 'latent' || backend === 'latentapi' ? 'characters' : 'folded';
+  return backend === 'nai' || backend === 'latentapi' ? 'characters' : 'folded';
 }
 
 /**

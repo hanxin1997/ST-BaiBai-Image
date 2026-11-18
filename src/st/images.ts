@@ -24,6 +24,12 @@ export class ImageStoreError extends Error {
  */
 export const ARTIST_PREVIEW_FOLDER = '柏宝绘_画师串';
 
+/**
+ * Latent 原生 API 配置预览图的固定子目录(user/images 下)。
+ * 与画师串预览同口径:只当配置封面,不进图库/历史,删配置时连带删文件。
+ */
+export const LATENT_PROFILE_PREVIEW_FOLDER = '柏宝绘_Latent配置';
+
 async function postImage(
   endpoint: string,
   body: Record<string, unknown>,

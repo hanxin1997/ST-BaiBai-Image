@@ -31,11 +31,10 @@ import { reactive, watch } from 'vue';
  */
 
 /** 生图后端 */
-export type BackendId = 'webui' | 'comfyui' | 'nai' | 'imgrouter' | 'latent' | 'latentapi';
+export type BackendId = 'webui' | 'comfyui' | 'nai' | 'imgrouter' | 'latentapi';
 // 顺序即展示顺序(渠道页页签 / 设置页出图后端下拉):NAI 用户最多,排最前;webui 隐藏但保留。
 export const BACKENDS: { value: BackendId; label: string }[] = [
   { value: 'nai', label: 'NAI' },
-  { value: 'latent', label: 'Latent' },
   { value: 'comfyui', label: 'ComfyUI' },
   { value: 'imgrouter', label: 'ImgRouter' },
   { value: 'latentapi', label: 'Latent 原生 API' },
@@ -82,10 +81,44 @@ export interface BackendConn {
  * 留在渠道级的话,每次切工作流都得再手改两处,「切换」这件事就只做了一半。
  * url 反过来仍是渠道级(一台 ComfyUI 服务器跑所有工作流)。
  */
+/** 一台 ComfyUI 服务器。多个方案可共用一台;被方案引用时不可删。 */
+export interface ComfyServer {
+  id: string;
+  name: string;
+  url: string;
+}
+
+/** 内置插画提示词集的 id(只读,随插件版本更新;不进 settings)。 */
+export const BUILTIN_COMFY_ILLUST_ID = 'builtin_illust';
+
+/**
+ * 一套 AI 写提示词用的文本:书写规范 + 思维链,成对存放(两者必须配套)。
+ * 多个方案可共用一套,改一处全部生效——这正是它从方案里拆出来的理由。
+ * 内置的那套按 id 解析、只读;想改就复制成自己的。
+ */
+export interface ComfyPromptSet {
+  id: string;
+  name: string;
+  /** 书写规范;留空回落内置。 */
+  spec: string;
+  /** 输出前思考清单;留空回落内置。 */
+  thinking: string;
+}
+
+/**
+ * 一套出图方案(存储键沿用 workflows / ComfyWorkflowPreset,免迁移)。
+ * 除 JSON 外还带着「这套底模要什么」——切过去即全套生效。
+ *
+ * 服务器与提示词是**引用**:多个方案共用一台服务器、一套提示词,改一处不必挨个改。
+ */
 export interface ComfyWorkflowPreset extends SizePair {
   id: string;
   /** 显示名(下拉列表与切换用;允许重名,以 id 为键)。 */
   name: string;
+  /** 引用的服务器 id;悬空时 normalize 回落第一台。 */
+  serverId: string;
+  /** 引用的提示词集 id(用户库或内置);悬空/空串回落内置插画。 */
+  promptSetId: string;
   /**
    * 配置方式,两模式互斥:
    * - custom:粘贴 Save (API Format) 的 JSON,动态值用 %prompt% 等占位符;
@@ -115,8 +148,12 @@ export interface ComfyRunConn extends SizePair {
   simple: ComfySimpleConfig;
 }
 
-/** ComfyUI 连接与工作流库。 */
+/** ComfyUI 连接与三个库。 */
 export interface ComfyUISettings extends BackendConn {
+  /** 服务器库。**不变式:恒非空**(方案恒非空且必引用一台,被引用的删不掉)。 */
+  servers: ComfyServer[];
+  /** 用户提示词库(不含内置);可为空。 */
+  promptSets: ComfyPromptSet[];
   /** 工作流库。**不变式:恒非空**(至少一条,见 normalizeComfyUI 收尾兜底)。 */
   workflows: ComfyWorkflowPreset[];
   /** 当前使用的工作流 id;指向已删条目时由 normalize 回落到第一条。 */
@@ -133,6 +170,7 @@ export interface ComfyUISettings extends BackendConn {
  */
 export type NaiModel =
   | 'nai-diffusion-5-full'
+  | 'nai-diffusion-5-full-medium'
   | 'nai-diffusion-5-curated'
   | 'nai-diffusion-4-5-full'
   | 'nai-diffusion-4-5-curated'
@@ -151,6 +189,7 @@ export type NaiModel =
  */
 export const NAI_MODELS: { value: NaiModel; label: string }[] = [
   { value: 'nai-diffusion-5-full', label: 'NAI 5 Full(最新,无过滤)' },
+  { value: 'nai-diffusion-5-full-medium', label: 'NAI 5 Full Medium(省点数,参数由官方固定)' },
   { value: 'nai-diffusion-5-curated', label: 'NAI 5 Curated(有内容过滤)' },
   { value: 'nai-diffusion-4-5-full', label: 'NAI 4.5 Full(无过滤)' },
   { value: 'nai-diffusion-4-5-curated', label: 'NAI 4.5 Curated(有内容过滤)' },
@@ -280,10 +319,95 @@ export interface NaiEndpoint {
   url: string;
   /** 该站点的 API Key。镜像站的 Key 与官方不通用,故随站点存而不是渠道级一份。 */
   key: string;
+  /**
+   * 该站点的同时出图数(1–4,默认 1)。
+   * 限流是站/账号级的事:官方站一般只敢 1,有的公益站允许 3;按接入点存,
+   * 换站不必重设,也不会让 A 站的 429 冷却把 B 站一起冻住(见 floor/genQueue.ts)。
+   */
+  concurrency: number;
+}
+
+/**
+ * 一套 NAI 出图方案:「从哪个站发、用什么模型、什么画风、怎么采样」打包在一起,切过去全套生效。
+ *
+ * 接入点、画师串、vibe 是**引用**:三个库全局共享,多个方案共用一个站、一条画师串、
+ * 一张 vibe,改一处全部生效。vibe 强度挂在 vibe 上(全方案共用),方案只记「叠加哪几张」。
+ * 同时出图数不进方案:限流是接入点/账号级的事(见 NaiEndpoint.concurrency)。
+ */
+export interface NaiPlan extends SizePair {
+  id: string;
+  /** 显示名(列表与切换用;允许重名,以 id 为键)。 */
+  name: string;
+  /** 引用的接入点 id;悬空时回落第一条(地址是必需品,不能落空)。 */
+  endpointId: string;
+  model: NaiModel;
+  /**
+   * 引用的画师串 id。**空串 = 不使用画师串**,是有意义的存储值。
+   * 合法值域:{''} ∪ 用户库 id ∪ 内置库 id(bi_*);其余一律由 normalizeNai 清成空串。
+   */
+  artistId: string;
+  sampler: string;
+  steps: number;
+  /** 提示词相关性(CFG scale)。 */
+  scale: number;
+  /** 关联性调整(cfg_rescale,0–1)。 */
+  cfgRescale: number;
+  /** 噪声表(karras/native/exponential/polyexponential)。 */
+  noiseSchedule: string;
+  /** 固定种子;0 = 每次随机。 */
+  seed: number;
+  /** Variety Boost(skip_cfg_above_sigma,按尺寸与模型自动算 magic 值)。 */
+  varietyBoost: boolean;
+  /** 参考强度归一化:多个 vibe 强度总和超过 1 时按比例压回 1。 */
+  normalizeRefStrength: boolean;
+  /**
+   * 本方案叠加的 vibe(库内 id)。模型不支持 vibe(当前 = NAI 5)时**原样保留**、出图整批跳过:
+   * 切回 4.5,或日后官方给 V5 开放 vibe,勾过的还在。
+   */
+  vibeIds: string[];
+  /** 生成自然语言(仅 4.5/V5 有意义,默认开)。 */
+  naturalLanguage: boolean;
+  /** 画幅锁;语义见 size.ts 的 OrientationLock。 */
+  orientationLock: OrientationLock;
+}
+
+/**
+ * 一次 NAI 请求实际要用的全部参数(effectiveNai 产出)。
+ *
+ * backends/nai.ts 只认这个收窄后的形状,不认 NaiSettings / NaiPlan——后端关心的是
+ * 「这一次往哪儿发、画什么风格」,不是「用户存了几套方案」。引用都已在这里解开:
+ * 接入点给出 url/key,画师串给出快照,vibes 只含本方案叠加的那几张(库内顺序)。
+ */
+export interface NaiRunConfig extends SizePair {
+  /** 所用接入点的 id:闸门与 429 冷却按它分账(floor/genQueue.ts)。 */
+  endpointId: string;
+  url: string;
+  key: string;
+  model: NaiModel;
+  /** 本方案的画师串;未选 / 悬空 = null。 */
+  artist: NaiArtistPreset | null;
+  /** 渠道级正面质量词覆盖值;画师串绑定值优先。 */
+  qualityTags: string;
+  /** 渠道级负面提示词覆盖值;画师串绑定值优先。 */
+  undesiredContent: string;
+  sampler: string;
+  steps: number;
+  scale: number;
+  cfgRescale: number;
+  noiseSchedule: string;
+  seed: number;
+  varietyBoost: boolean;
+  normalizeRefStrength: boolean;
+  /** 本方案叠加的 vibe;模型不支持 vibe 时由后端整批跳过(不在这里滤,好让它提示用户)。 */
+  vibes: NaiVibe[];
 }
 
 /**
  * NAI 连接与出图参数。url 可改:填第三方兼容站即走第三方(协议与官方一致)。
+ *
+ * 方案化后,**平铺的 model/sampler/steps/…/activeArtistId 是「当前方案」的镜像**:
+ * 出图侧读 effectiveNai(),面板与迁移读镜像;切方案时由 setActiveNaiPlan 一次性刷新。
+ * 唯一真源是 plans[] + activePlanId。
  *
  * ⚠ **不变式:url / key 恒等于当前站点(activeNaiEndpoint)的 url / key。**
  * 这两个字段是活值镜像,backends/nai.ts 的三处 fetch 与 floor/autoTag 各调用方都只读它们,
@@ -338,11 +462,13 @@ export interface NaiSettings extends BackendConn {
    * 每个用户的设备上,以后想调都得做指纹迁移。
    */
   artistPresets: NaiArtistPreset[];
+  /** 出图方案库。**不变式:恒非空**(至少一条,见 normalizeNai 收尾兜底)。 */
+  plans: NaiPlan[];
+  /** 当前方案 id;悬空时由 normalize 回落到第一条。 */
+  activePlanId: string;
   /**
-   * 当前使用的画师串 id。**空串 = 不使用画师串**,是有意义的存储值。
-   * 合法值域:{''} ∪ 用户库 id ∪ 内置库 id(bi_*);其余一律由 normalizeNai 清成空串——
-   * 刻意**不**像 activeWorkflowId 那样回落第一条:那会给用户静默套上一套
-   * 他没选过的画风,每张图都变样却查不出原因。
+   * 当前使用的画师串 id(当前方案 artistId 的镜像)。**空串 = 不使用画师串**。
+   * 合法值域:{''} ∪ 用户库 id ∪ 内置库 id(bi_*);其余一律由 normalizeNai 清成空串。
    */
   activeArtistId: string;
   /**
@@ -352,7 +478,6 @@ export interface NaiSettings extends BackendConn {
    * 关它不影响原生多角色提示(characters[]),那是模型能力,不是写法。
    * 存在理由:4.5 的提示词预算(约 512 token,Base 与全部角色共用)比 V5 紧得多,
    * nl 是最大头,超了会被截断、画面跟着走样。
-   * latent 与 nai 各存一份(同结构,见 latentDefaults)。
    */
   naturalLanguage: boolean;
   /** 画幅锁(渠道级,面板上与横竖尺寸并排);语义见 size.ts 的 OrientationLock。 */
@@ -396,6 +521,11 @@ export interface UiPrefs {
    * 与出图分辨率、横竖方向无关,生成的文件一字节不变。
    */
   imageDisplaySize: ImageDisplaySize;
+  /**
+   * 楼层图片沉浸显示:有图时把菜单与翻页器藏起来,点一下图才浮现,点卡片外收起。
+   * 只改聊天里的呈现,不动图片文件;无图时不生效(占位区本就是操作区)。
+   */
+  immersiveImages: boolean;
 }
 
 /** 楼层图片显示大小。 */
@@ -444,19 +574,57 @@ export type LatentApiScheduler = (typeof LATENT_API_SCHEDULERS)[number];
 export const LATENT_API_STEPS = { min: 8, max: 12 } as const;
 
 /**
+ * 一套 Latent 原生 API 配置(画风配方):出图参数 + 提示词规范 + 预览图。
+ *
+ * 与 NAI 方案库同层:切换配置 = 整套参数与写法一起换。连接(url/key)不在这里,
+ * 留在渠道级 —— 一个站点一份 Key,换画风不该顺手换站。
+ */
+export interface LatentApiProfile {
+  id: string;
+  name: string;
+  /** 拼在 Scene 最前的正向前缀(质量词等)。 */
+  positivePrefix: string;
+  /** 负面提示词。站点不加默认负面,留空就真的什么都不排除。 */
+  negativePrompt: string;
+  steps: number;
+  sampler: LatentApiSampler;
+  scheduler: LatentApiScheduler;
+  /** 种子;0 = 每张随机。 */
+  seed: number;
+  naturalLanguage: boolean;
+  /** 画幅锁,比其它渠道多一档 square。 */
+  orientationLock: OrientationLock;
+  /** 书写规范;空串 = 回落设置页的全局 latentApiSpec(再空则内置默认)。 */
+  spec: string;
+  /** 思维链;空串 = 回落设置页的全局 latentApiThinking(再空则内置默认)。 */
+  thinking: string;
+  /** 预览图生成用的示例提示词(Scene 串,不含前缀)。 */
+  previewPrompt: string;
+  /** 预览图路径(user/images/柏宝绘_Latent配置/<id>.jpg);只当配置封面,不进图库。 */
+  previewPath?: string;
+}
+
+/**
  * 「Latent 原生 API」渠道(latent.moe 自己的 /api/generate,Anima-2.9B-int8-turbo)。
  *
- * 与旧 latent 渠道(NAI 协议 + 分段串,存在 settings.latent)**完全无关**,各存各的:
- * 旧渠道仍能用,新渠道失败不该连累它。不 extends BackendConn:这家没有自由尺寸,
+ * 这是唯一的 Latent 渠道:旧 latent(NAI 协议 + 分段串)已移除,存量配置由
+ * normalize 迁移到 defaultBackend='latentapi'。不 extends BackendConn:这家没有自由尺寸,
  * 只有 portrait / landscape / square 三档 resolution,竖横两格尺寸串在这里没有意义。
+ *
+ * 方案化后,平铺的 positivePrefix/negativePrompt/steps/…/orientationLock 是
+ * 「当前配置」的镜像:出图侧仍读它们,切配置时由 setActiveLatentApiProfile 一次性刷新。
  */
 export interface LatentApiSettings {
   /** 站点地址;请求一律经酒馆 CORS 转发(站点不回 Access-Control-Allow-Origin)。 */
   url: string;
   key: string;
-  /** 拼在 Scene 最前的正向前缀(质量词等)。分级标签不放这里,由 Scene 自己写。 */
+  /** 配置库。**不变式:恒非空**(至少一条,见 normalizeLatentApi 收尾兜底)。 */
+  profiles: LatentApiProfile[];
+  /** 当前配置 id;悬空时由 normalize 回落到第一条。 */
+  activeProfileId: string;
+  /** 拼在 Scene 最前的正向前缀(当前配置的镜像)。 */
   positivePrefix: string;
-  /** 负面提示词。站点不加默认负面,留空就真的什么都不排除。 */
+  /** 负面提示词(当前配置的镜像)。 */
   negativePrompt: string;
   steps: number;
   sampler: LatentApiSampler;
@@ -1590,10 +1758,8 @@ export interface ImageSettings {
   webui: BackendConn;
   comfyui: ComfyUISettings;
   nai: NaiSettings;
-  /** latent:协议同 NAI,提示词按分段串打包(见 latentDefaults)。 */
-  latent: NaiSettings;
   imgrouter: ImgRouterSettings;
-  /** Latent 原生 API(与上面的 latent 无关,见 LatentApiSettings)。 */
+  /** Latent 原生 API(唯一的 Latent 渠道;旧 NAI 协议 latent 已移除)。 */
   latentApi: LatentApiSettings;
   /** 副 API 渠道列表(镜像共享存储;真身在 extensionSettings['baibai_api_channels']) */
   channels: ApiChannel[];
@@ -1642,24 +1808,53 @@ function backendDefaults(url: string): BackendConn {
   };
 }
 
-/**
- * Latent 原生 API 默认值。正向前缀与负面词取自 anima寻迹 世界书的「官方参数备忘」;
- * 前缀里**去掉了 safe**:分级标签(safe/sensitive/nsfw/explicit)由 Scene 自己写,
- * 前缀固定写 safe 会和 Scene 里的 nsfw/explicit 打架。步数/采样器/调度器取接口文档默认值。
- */
-function latentApiDefaults(): LatentApiSettings {
+/** 默认正向前缀 / 负面词:取自 anima寻迹 世界书的「官方参数备忘」,前缀里去掉 safe。 */
+const LATENT_API_DEFAULT_PREFIX = 'masterpiece, best quality, score_7';
+const LATENT_API_DEFAULT_NEGATIVE =
+  'worst quality, low quality, score_1, score_2, score_3, artist name, blurry, jpeg artifacts, chromatic aberration';
+
+let latentProfileSeq = 0;
+
+/** 新建一套 Latent 配置(id 生成口径同其它库;lap_ 前缀不与 ep_/plan_/art_ 撞)。 */
+export function newLatentApiProfile(name = '配置 1'): LatentApiProfile {
+  latentProfileSeq += 1;
   return {
-    url: 'https://latent.moe',
-    key: '',
-    positivePrefix: 'masterpiece, best quality, score_7',
-    negativePrompt:
-      'worst quality, low quality, score_1, score_2, score_3, artist name, blurry, jpeg artifacts, chromatic aberration',
+    id: `lap_${Date.now()}_${latentProfileSeq}`,
+    name,
+    positivePrefix: LATENT_API_DEFAULT_PREFIX,
+    negativePrompt: LATENT_API_DEFAULT_NEGATIVE,
     steps: 8,
     sampler: 'euler',
     scheduler: 'sgm_uniform',
     seed: 0,
     naturalLanguage: true,
     orientationLock: 'auto',
+    spec: '',
+    thinking: '',
+    previewPrompt: '1girl, portrait, soft light, detailed face, upper body',
+  };
+}
+
+/**
+ * Latent 原生 API 默认值。正向前缀与负面词取自 anima寻迹 世界书的「官方参数备忘」;
+ * 前缀里**去掉了 safe**:分级标签(safe/sensitive/nsfw/explicit)由 Scene 自己写,
+ * 前缀固定写 safe 会和 Scene 里的 nsfw/explicit 打架。步数/采样器/调度器取接口文档默认值。
+ */
+function latentApiDefaults(): LatentApiSettings {
+  const profile = newLatentApiProfile('默认配置');
+  return {
+    url: 'https://latent.moe',
+    key: '',
+    profiles: [profile],
+    activeProfileId: profile.id,
+    positivePrefix: profile.positivePrefix,
+    negativePrompt: profile.negativePrompt,
+    steps: profile.steps,
+    sampler: profile.sampler,
+    scheduler: profile.scheduler,
+    seed: profile.seed,
+    naturalLanguage: profile.naturalLanguage,
+    orientationLock: profile.orientationLock,
   };
 }
 
@@ -1684,12 +1879,30 @@ const DEFAULT_LANDSCAPE_SIZE = '1216×832';
 
 let workflowSeq = 0;
 
+let comfyServerSeq = 0;
+
+/** 新建一台 ComfyUI 服务器(id 生成口径同其它库;cs_ 前缀不与 wf_/cps_ 撞)。 */
+export function newComfyServer(name = '本机', url = 'http://127.0.0.1:8188'): ComfyServer {
+  comfyServerSeq += 1;
+  return { id: `cs_${Date.now()}_${comfyServerSeq}`, name, url };
+}
+
+let comfyPromptSetSeq = 0;
+
+/** 新建一套空提示词(名字占位;spec/thinking 留空回落内置)。 */
+export function newComfyPromptSet(name = '我的提示词'): ComfyPromptSet {
+  comfyPromptSetSeq += 1;
+  return { id: `cps_${Date.now()}_${comfyPromptSetSeq}`, name, spec: '', thinking: '' };
+}
+
 /** 新建一条空工作流预设(id 生成口径同 newChannel)。 */
 export function newComfyWorkflow(name = DEFAULT_WORKFLOW_NAME): ComfyWorkflowPreset {
   workflowSeq += 1;
   return {
     id: `wf_${Date.now()}_${workflowSeq}`,
     name,
+    serverId: '',
+    promptSetId: BUILTIN_COMFY_ILLUST_ID,
     mode: 'custom',
     workflow: '',
     simple: simpleDefaults(),
@@ -1701,14 +1914,19 @@ export function newComfyWorkflow(name = DEFAULT_WORKFLOW_NAME): ComfyWorkflowPre
 }
 
 /**
- * 新装即带一条空预设,而不是空库。
+ * 新装即带一台服务器 + 一条空预设,而不是空库。
  * 只用一套工作流的人不该被迫先「新建」才有地方粘 JSON——手感与改造前的单文本框完全一致,
  * 「库」这个概念对他们保持隐形。也顺带让 workflows 恒非空的不变式从出生起就成立。
  */
 function comfyDefaults(): ComfyUISettings {
+  const server = newComfyServer();
   const preset = newComfyWorkflow();
+  preset.serverId = server.id;
+  preset.promptSetId = BUILTIN_COMFY_ILLUST_ID;
   return {
-    ...backendDefaults('http://127.0.0.1:8188'),
+    ...backendDefaults(server.url),
+    servers: [server],
+    promptSets: [],
     workflows: [preset],
     activeWorkflowId: preset.id,
   };
@@ -1728,12 +1946,21 @@ export function newNaiArtist(name = DEFAULT_ARTIST_NAME): NaiArtistPreset {
 /** NAI 官方地址。naiDefaults 的默认值与站点命名(endpointName)共用这一份,不写两遍。 */
 export const NAI_OFFICIAL_URL = 'https://image.novelai.net';
 
+/** 接入点同时出图数的上限。NAI 的 generate-image 是阻塞式请求,压太高容易吃 429。 */
+export const NAI_CONCURRENCY_MAX = 4;
+
 let endpointSeq = 0;
 
 /** 新建一条空站点(id 生成口径同 newNaiArtist;ep_ 前缀不与 wf_/art_/ch_ 撞)。 */
-export function newNaiEndpoint(name: string, url = '', key = ''): NaiEndpoint {
+export function newNaiEndpoint(name: string, url = '', key = '', concurrency = 1): NaiEndpoint {
   endpointSeq += 1;
-  return { id: `ep_${Date.now()}_${endpointSeq}`, name, url, key };
+  return {
+    id: `ep_${Date.now()}_${endpointSeq}`,
+    name,
+    url,
+    key,
+    concurrency: Math.min(NAI_CONCURRENCY_MAX, Math.max(1, Math.floor(concurrency) || 1)),
+  };
 }
 
 /**
@@ -1747,10 +1974,41 @@ function endpointName(url: string): string {
   return trimmed === NAI_OFFICIAL_URL ? '官方' : '当前站点';
 }
 
+let planSeq = 0;
+
+/** 新建一套方案(id 生成口径同 newNaiEndpoint;plan_ 前缀不与其它库撞)。 */
+export function newNaiPlan(name = '方案 1'): NaiPlan {
+  planSeq += 1;
+  return {
+    id: `plan_${Date.now()}_${planSeq}`,
+    name,
+    endpointId: '',
+    model: 'nai-diffusion-5-full',
+    artistId: '',
+    sampler: 'k_euler',
+    steps: 28,
+    scale: 5.5,
+    cfgRescale: 0,
+    noiseSchedule: 'karras',
+    seed: 0,
+    varietyBoost: true,
+    normalizeRefStrength: true,
+    vibeIds: [],
+    naturalLanguage: true,
+    orientationLock: 'auto',
+    portraitSize: '832×1216',
+    landscapeSize: '1216×832',
+  };
+}
+
 function naiDefaults(url = NAI_OFFICIAL_URL): NaiSettings {
   // 出生即带一条站点(照 comfyDefaults 的口径):只用一个站点的人不该被迫先「新增」
   // 才有地方填地址,手感与改造前的两个输入框完全一致,「库」这个概念对他们保持隐形。
   const endpoint = newNaiEndpoint(endpointName(url), url);
+  // 出生即带一套方案:只用一套参数的人不该被迫先「新建」才有地方改模型。
+  const plan = newNaiPlan('默认方案');
+  plan.endpointId = endpoint.id;
+  plan.artistId = BUILTIN_NAI_ARTISTS[0]?.id ?? '';
   return {
     ...backendDefaults(url),
     resolution: '832×1216',
@@ -1772,31 +2030,16 @@ function naiDefaults(url = NAI_OFFICIAL_URL): NaiSettings {
     // 用户库为空:库里只有用户自己建的配方,官方推荐的那条是内置只读条目
     // (BUILTIN_NAI_ARTISTS),不进 settings。
     artistPresets: [],
+    plans: [plan],
+    activePlanId: plan.id,
     // 新装用户默认启用内置「默认画师串」——默认值只在这条路径生效:
     // hydrate 时旧用户的 stored.nai.activeArtistId 已存在(哪怕空串),会被
     // normalizeNai 原样保留,不受影响。
-    activeArtistId: BUILTIN_NAI_ARTISTS[0]?.id ?? '',
+    activeArtistId: plan.artistId,
     // 开着自然语言、不锁方向 = 改动前的行为
     naturalLanguage: true,
     orientationLock: 'auto',
   };
-}
-
-/**
- * latent 渠道默认值。
- *
- * 复用 NaiSettings 与 naiDefaults:协议完全相同(端点、鉴权、parameters、vibe、配方、
- * zip 解包一律照 NAI),唯一差异是提示词打包方式,而那个差异落在
- * backends/nai.ts 的 flatten 分支里,与设置结构无关。
- *
- * **存储独立**而非共用 settings.nai:latent 是另一个服务,URL 与 Key 都不同——
- * 共用一份的话每次切渠道都得把地址和密钥改回去,等于没有「两条渠道」。
- * 同理 vibe 库与画师配方库也各自一份(改一边不会动另一边)。
- *
- * url 留空:latent 上游地址因人而异,没有可猜的默认值;猜一个只会让人以为已配好。
- */
-function latentDefaults(): NaiSettings {
-  return naiDefaults('');
 }
 
 function defaults(): ImageSettings {
@@ -1815,13 +2058,13 @@ function defaults(): ImageSettings {
       cardTheme: 'st',
       autoCollapseImages: false,
       imageDisplaySize: 'medium',
+      immersiveImages: false,
     },
     // 出图后端默认 ComfyUI(当前唯一实现的出图后端);webui 渠道已隐藏,不再作为可选值
     defaultBackend: 'comfyui',
     webui: backendDefaults('http://127.0.0.1:7860'),
     comfyui: comfyDefaults(),
     nai: naiDefaults(),
-    latent: latentDefaults(),
     imgrouter: imgRouterDefaults(),
     latentApi: latentApiDefaults(),
     channels: [],
@@ -1974,6 +2217,28 @@ export function activeComfyPreset(): ComfyWorkflowPreset {
   return list.find(w => w.id === settings.comfyui.activeWorkflowId) ?? list[0] ?? newComfyWorkflow();
 }
 
+/** 当前方案引用的服务器;悬空回落第一台(服务器恒非空)。 */
+export function activeComfyServer(): ComfyServer {
+  const list = settings.comfyui.servers;
+  return list.find(s => s.id === activeComfyPreset().serverId) ?? list[0] ?? newComfyServer();
+}
+
+/** 内置插画提示词集(只读,随版本更新)。 */
+export function builtinComfyPromptSet(): ComfyPromptSet {
+  return {
+    id: BUILTIN_COMFY_ILLUST_ID,
+    name: '插画(内置)',
+    spec: DEFAULT_COMFY_SPEC,
+    thinking: DEFAULT_COMFY_THINKING,
+  };
+}
+
+/** 当前方案引用的提示词集;悬空/空串回落内置。 */
+export function activeComfyPromptSet(): ComfyPromptSet {
+  const preset = activeComfyPreset();
+  return settings.comfyui.promptSets.find(s => s.id === preset.promptSetId) ?? builtinComfyPromptSet();
+}
+
 /** 画幅锁选项(顺序即分段按钮顺序);NAI/Latent 渠道与 ComfyUI 每套工作流的面板共用这一份。 */
 export const ORIENTATION_LOCKS: { value: OrientationLock; label: string }[] = [
   { value: 'auto', label: '自动' },
@@ -1998,7 +2263,6 @@ export const LATENT_API_ORIENTATION_LOCKS: { value: OrientationLock; label: stri
 export function activeOrientationLock(): OrientationLock {
   const backend = settings.defaultBackend;
   if (backend === 'nai') return settings.nai.orientationLock;
-  if (backend === 'latent') return settings.latent.orientationLock;
   if (backend === 'latentapi') return settings.latentApi.orientationLock;
   if (backend === 'comfyui') return activeComfyPreset().orientationLock;
   return 'auto';
@@ -2011,7 +2275,7 @@ export function activeOrientationLock(): OrientationLock {
 export function effectiveComfyConn(): ComfyRunConn {
   const preset = activeComfyPreset();
   return {
-    url: settings.comfyui.url,
+    url: activeComfyServer().url,
     workflow: preset.workflow,
     mode: preset.mode,
     simple: preset.simple,
@@ -2031,15 +2295,95 @@ export function effectiveComfyConn(): ComfyRunConn {
  * 注意拼装侧不走这里,走 backends/nai.ts 的 naiArtistPrompt(纯函数、吃 NaiSettings)——
  * settings.ts 已 import 本模块的 naiDefaultUndesired,反向加值依赖会成运行时环。
  */
-export function activeNaiArtist(conn: NaiSettings = settings.nai): NaiArtistPreset | null {
-  const id = conn.activeArtistId;
+/** 当前方案。**不返回 null**:plans 恒非空(naiDefaults 出生即带一条、normalizeNai 收尾兜底)。 */
+export function activeNaiPlan(conn: NaiSettings = settings.nai): NaiPlan {
+  const list = conn.plans;
+  return list.find(p => p.id === conn.activePlanId) ?? list[0] ?? newNaiPlan();
+}
+
+/**
+ * 把当前方案的参数写回平铺镜像(切方案、normalize 收尾共用)。
+ * 镜像存在的意义:面板与老调用方仍读 conn.model / conn.sampler / conn.activeArtistId,
+ * 不必为了「方案」这个概念把每一处读取都改成 activeNaiPlan()。
+ */
+export function syncNaiMirror(conn: NaiSettings = settings.nai): void {
+  const plan = activeNaiPlan(conn);
+  conn.model = plan.model;
+  conn.sampler = plan.sampler;
+  conn.steps = plan.steps;
+  conn.scale = plan.scale;
+  conn.cfgRescale = plan.cfgRescale;
+  conn.noiseSchedule = plan.noiseSchedule;
+  conn.seed = plan.seed;
+  conn.varietyBoost = plan.varietyBoost;
+  conn.normalizeRefStrength = plan.normalizeRefStrength;
+  conn.activeArtistId = plan.artistId;
+  conn.naturalLanguage = plan.naturalLanguage;
+  conn.orientationLock = plan.orientationLock;
+  conn.portraitSize = plan.portraitSize;
+  conn.landscapeSize = plan.landscapeSize;
+  const endpoint = conn.endpoints.find(e => e.id === plan.endpointId) ?? conn.endpoints[0];
+  if (endpoint) {
+    conn.activeEndpointId = endpoint.id;
+    conn.url = endpoint.url;
+    conn.key = endpoint.key;
+    conn.concurrency = endpoint.concurrency;
+  }
+}
+
+/** 切换当前方案:写 activePlanId 并一次性刷新镜像(下一张起生效,在途请求不重排)。 */
+export function setActiveNaiPlan(planId: string, conn: NaiSettings = settings.nai): void {
+  if (!conn.plans.some(p => p.id === planId)) return;
+  conn.activePlanId = planId;
+  syncNaiMirror(conn);
+}
+
+/**
+ * 一次请求要用的全部参数:方案 + 解开的接入点/画师串/vibe 引用。
+ * backends/nai.ts 只吃这个形状,不认识「方案」这个概念。
+ */
+export function effectiveNai(conn: NaiSettings = settings.nai): NaiRunConfig {
+  const plan = activeNaiPlan(conn);
+  const endpoint =
+    conn.endpoints.find(e => e.id === plan.endpointId) ??
+    conn.endpoints[0] ??
+    newNaiEndpoint(endpointName(''));
+  const ids = new Set(plan.vibeIds);
+  return {
+    endpointId: endpoint.id,
+    url: endpoint.url,
+    key: endpoint.key,
+    model: plan.model,
+    artist: findNaiArtist(conn, plan.artistId),
+    qualityTags: conn.qualityTags,
+    undesiredContent: conn.undesiredContent,
+    sampler: plan.sampler,
+    steps: plan.steps,
+    scale: plan.scale,
+    cfgRescale: plan.cfgRescale,
+    noiseSchedule: plan.noiseSchedule,
+    seed: plan.seed,
+    varietyBoost: plan.varietyBoost,
+    normalizeRefStrength: plan.normalizeRefStrength,
+    vibes: conn.vibes.filter(vibe => ids.has(vibe.id)),
+    portraitSize: plan.portraitSize,
+    landscapeSize: plan.landscapeSize,
+  };
+}
+
+/** 按 id 在「用户库 ∪ 内置库」里找画师串(与 nai.ts 的 naiActivePreset 同口径)。 */
+function findNaiArtist(conn: NaiSettings, id: string): NaiArtistPreset | null {
   if (!id) return null;
-  // 查找域 = 用户库 ∪ 内置库(与 nai.ts 的 naiActivePreset 同口径)
   return (
     conn.artistPresets.find(a => a.id === id) ??
     BUILTIN_NAI_ARTISTS.find(a => a.id === id) ??
     null
   );
+}
+
+export function activeNaiArtist(conn: NaiSettings = settings.nai): NaiArtistPreset | null {
+  // 读镜像(面板与旧调用方的口径);真源是当前方案的 artistId,由 syncNaiMirror 同步。
+  return findNaiArtist(conn, conn.activeArtistId);
 }
 
 /**
@@ -2056,6 +2400,13 @@ export function activeNaiEndpoint(conn: NaiSettings = settings.nai): NaiEndpoint
   return (
     list.find(e => e.id === conn.activeEndpointId) ?? list[0] ?? newNaiEndpoint(endpointName(''))
   );
+}
+
+/**
+ * 当前出图渠道的闸门键(接入点 id)。
+ */
+export function activeNaiGateId(): string {
+  return activeNaiEndpoint(settings.nai).id;
 }
 
 /**
@@ -2091,22 +2442,137 @@ function pickEnum<T extends string>(value: unknown, allowed: readonly T[], fallb
   return allowed.includes(value as T) ? (value as T) : fallback;
 }
 
+/** 单条 Latent 配置清洗:步数夹进接口范围,枚举认不出回落默认。 */
+function normalizeLatentApiProfile(
+  raw: unknown,
+  index: number,
+  fallback: LatentApiProfile,
+): LatentApiProfile {
+  const o = (raw ?? {}) as Partial<LatentApiProfile>;
+  const text = (value: unknown, def: string) => (typeof value === 'string' ? value : def);
+  return {
+    id: typeof o.id === 'string' && o.id ? o.id : `lap_${Date.now()}_${index}`,
+    name: text(o.name, `配置 ${index + 1}`),
+    positivePrefix: text(o.positivePrefix, fallback.positivePrefix),
+    negativePrompt: text(o.negativePrompt, fallback.negativePrompt),
+    steps: Math.round(clampNumber(o.steps, fallback.steps, LATENT_API_STEPS.min, LATENT_API_STEPS.max)),
+    sampler: pickEnum(o.sampler, LATENT_API_SAMPLERS, fallback.sampler),
+    scheduler: pickEnum(o.scheduler, LATENT_API_SCHEDULERS, fallback.scheduler),
+    seed: Math.max(0, Math.floor(clampNumber(o.seed, fallback.seed, 0, Number.MAX_SAFE_INTEGER))),
+    naturalLanguage: typeof o.naturalLanguage === 'boolean' ? o.naturalLanguage : fallback.naturalLanguage,
+    orientationLock: normalizeOrientationLock(o.orientationLock),
+    spec: text(o.spec, ''),
+    thinking: text(o.thinking, ''),
+    previewPrompt: text(o.previewPrompt, fallback.previewPrompt),
+    previewPath: typeof o.previewPath === 'string' && o.previewPath ? o.previewPath : undefined,
+  };
+}
+
+/** 存量迁移:老配置只有平铺字段 → 折成唯一一套「默认配置」(spec/thinking 留空回落全局)。 */
+function foldLegacyLatentApiProfile(
+  o: Partial<LatentApiSettings>,
+  fallback: LatentApiProfile,
+): LatentApiProfile {
+  const profile = newLatentApiProfile('默认配置');
+  profile.positivePrefix = typeof o.positivePrefix === 'string' ? o.positivePrefix : profile.positivePrefix;
+  profile.negativePrompt = typeof o.negativePrompt === 'string' ? o.negativePrompt : profile.negativePrompt;
+  profile.steps = Math.round(
+    clampNumber(o.steps, profile.steps, LATENT_API_STEPS.min, LATENT_API_STEPS.max),
+  );
+  profile.sampler = pickEnum(o.sampler, LATENT_API_SAMPLERS, profile.sampler);
+  profile.scheduler = pickEnum(o.scheduler, LATENT_API_SCHEDULERS, profile.scheduler);
+  profile.seed = Math.max(0, Math.floor(clampNumber(o.seed, profile.seed, 0, Number.MAX_SAFE_INTEGER)));
+  profile.naturalLanguage =
+    typeof o.naturalLanguage === 'boolean' ? o.naturalLanguage : profile.naturalLanguage;
+  profile.orientationLock = normalizeOrientationLock(o.orientationLock);
+  return profile;
+}
+
+/** 当前配置。**不返回 null**:profiles 恒非空(normalize 收尾兜底)。 */
+export function activeLatentApiProfile(
+  conn: LatentApiSettings = settings.latentApi,
+): LatentApiProfile {
+  return (
+    conn.profiles.find(p => p.id === conn.activeProfileId) ??
+    conn.profiles[0] ??
+    newLatentApiProfile()
+  );
+}
+
+/** 把当前配置写回平铺镜像(切配置、normalize 收尾共用)。 */
+export function syncLatentApiMirror(conn: LatentApiSettings = settings.latentApi): void {
+  const profile = activeLatentApiProfile(conn);
+  conn.positivePrefix = profile.positivePrefix;
+  conn.negativePrompt = profile.negativePrompt;
+  conn.steps = profile.steps;
+  conn.sampler = profile.sampler;
+  conn.scheduler = profile.scheduler;
+  conn.seed = profile.seed;
+  conn.naturalLanguage = profile.naturalLanguage;
+  conn.orientationLock = profile.orientationLock;
+}
+
+/** 切换当前配置:写 activeProfileId 并刷新镜像(下一张起生效)。 */
+export function setActiveLatentApiProfile(
+  id: string,
+  conn: LatentApiSettings = settings.latentApi,
+): void {
+  if (!conn.profiles.some(p => p.id === id)) return;
+  conn.activeProfileId = id;
+  syncLatentApiMirror(conn);
+}
+
+/** 配置 → 出图形状(补上渠道级 url/key;其余字段取自配置)。 */
+export function latentApiProfileToConn(
+  profile: LatentApiProfile,
+  conn: LatentApiSettings = settings.latentApi,
+): LatentApiSettings {
+  return {
+    url: conn.url,
+    key: conn.key,
+    profiles: conn.profiles,
+    activeProfileId: conn.activeProfileId,
+    positivePrefix: profile.positivePrefix,
+    negativePrompt: profile.negativePrompt,
+    steps: profile.steps,
+    sampler: profile.sampler,
+    scheduler: profile.scheduler,
+    seed: profile.seed,
+    naturalLanguage: profile.naturalLanguage,
+    orientationLock: profile.orientationLock,
+  };
+}
+
 /** Latent 原生 API 清洗:逐字段兜底;步数夹进接口允许范围,枚举认不出就回落默认。 */
 function normalizeLatentApi(raw: unknown, def: LatentApiSettings): LatentApiSettings {
   const o = (raw ?? {}) as Partial<LatentApiSettings>;
   const text = (value: unknown, fallback: string) => (typeof value === 'string' ? value : fallback);
-  return {
+  const profiles = Array.isArray(o.profiles)
+    ? o.profiles.map((rawProfile, index) =>
+        normalizeLatentApiProfile(rawProfile, index, def.profiles[0] ?? newLatentApiProfile()),
+      )
+    : [foldLegacyLatentApiProfile(o, def.profiles[0] ?? newLatentApiProfile())];
+  if (!profiles.length) profiles.push(foldLegacyLatentApiProfile(o, def.profiles[0] ?? newLatentApiProfile()));
+  const activeProfileId =
+    typeof o.activeProfileId === 'string' && profiles.some(p => p.id === o.activeProfileId)
+      ? o.activeProfileId
+      : profiles[0].id;
+  const merged: LatentApiSettings = {
     url: text(o.url, def.url),
     key: text(o.key, def.key),
-    positivePrefix: text(o.positivePrefix, def.positivePrefix),
-    negativePrompt: text(o.negativePrompt, def.negativePrompt),
-    steps: Math.round(clampNumber(o.steps, def.steps, LATENT_API_STEPS.min, LATENT_API_STEPS.max)),
-    sampler: pickEnum(o.sampler, LATENT_API_SAMPLERS, def.sampler),
-    scheduler: pickEnum(o.scheduler, LATENT_API_SCHEDULERS, def.scheduler),
-    seed: Math.max(0, Math.floor(clampNumber(o.seed, def.seed, 0, Number.MAX_SAFE_INTEGER))),
-    naturalLanguage: typeof o.naturalLanguage === 'boolean' ? o.naturalLanguage : def.naturalLanguage,
-    orientationLock: normalizeOrientationLock(o.orientationLock),
+    profiles,
+    activeProfileId,
+    positivePrefix: def.positivePrefix,
+    negativePrompt: def.negativePrompt,
+    steps: def.steps,
+    sampler: def.sampler,
+    scheduler: def.scheduler,
+    seed: def.seed,
+    naturalLanguage: def.naturalLanguage,
+    orientationLock: def.orientationLock,
   };
+  syncLatentApiMirror(merged);
+  return merged;
 }
 
 /** ImgRouter 清洗:连接骨架复用 normalizeBackend,再逐项补自己的三格。 */
@@ -2121,6 +2587,27 @@ function normalizeImgRouter(raw: unknown, def: ImgRouterSettings): ImgRouterSett
   };
 }
 
+/** 单条服务器清洗:缺字段/类型不符逐项回退。url 允许空串(未填完的服务器不是垃圾数据)。 */
+function normalizeComfyServer(raw: unknown, index: number): ComfyServer {
+  const o = (raw ?? {}) as Partial<ComfyServer>;
+  return {
+    id: typeof o.id === 'string' && o.id ? o.id : `cs_${Date.now()}_${index}`,
+    name: typeof o.name === 'string' && o.name ? o.name : `服务器 ${index + 1}`,
+    url: typeof o.url === 'string' ? o.url : '',
+  };
+}
+
+/** 单条提示词集清洗:spec/thinking 允许空串(= 回落内置)。 */
+function normalizeComfyPromptSet(raw: unknown, index: number): ComfyPromptSet {
+  const o = (raw ?? {}) as Partial<ComfyPromptSet>;
+  return {
+    id: typeof o.id === 'string' && o.id ? o.id : `cps_${Date.now()}_${index}`,
+    name: typeof o.name === 'string' && o.name ? o.name : `提示词 ${index + 1}`,
+    spec: typeof o.spec === 'string' ? o.spec : '',
+    thinking: typeof o.thinking === 'string' ? o.thinking : '',
+  };
+}
+
 /** 单条预设清洗:缺字段/类型不符逐项回退,尺寸空串按默认补(工作流用了 %width% 时要有值可用)。 */
 function normalizeWorkflowPreset(raw: unknown, seq: number): ComfyWorkflowPreset {
   const o = (raw ?? {}) as Partial<ComfyWorkflowPreset>;
@@ -2129,6 +2616,9 @@ function normalizeWorkflowPreset(raw: unknown, seq: number): ComfyWorkflowPreset
   return {
     id: typeof o.id === 'string' && o.id ? o.id : `wf_${Date.now()}_${seq}`,
     name: typeof o.name === 'string' && o.name ? o.name : DEFAULT_WORKFLOW_NAME,
+    serverId: typeof o.serverId === 'string' ? o.serverId : '',
+    promptSetId:
+      typeof o.promptSetId === 'string' && o.promptSetId ? o.promptSetId : BUILTIN_COMFY_ILLUST_ID,
     // 存量预设没有 mode 字段 → custom(它们都是粘 JSON 的);simple 逐字段清洗出全量默认值
     mode: o.mode === 'simple' ? 'simple' : 'custom',
     workflow: typeof o.workflow === 'string' ? o.workflow : '',
@@ -2148,11 +2638,17 @@ function normalizeWorkflowPreset(raw: unknown, seq: number): ComfyWorkflowPreset
  * workflow 为空串也照样建这一条:那正是用户当前面对的空槽位,不是垃圾数据——
  * 何况 workflows 恒非空的不变式要求库里至少有一条。
  */
-function foldLegacyWorkflow(o: Partial<ComfyUISettings>, conn: BackendConn): ComfyWorkflowPreset {
+function foldLegacyWorkflow(
+  o: Partial<ComfyUISettings>,
+  conn: BackendConn,
+  serverId: string,
+): ComfyWorkflowPreset {
   const legacy = o as Partial<{ workflow: unknown; naturalLanguage: unknown }>;
   const preset = newComfyWorkflow();
   return {
     ...preset,
+    serverId,
+    promptSetId: BUILTIN_COMFY_ILLUST_ID,
     workflow: typeof legacy.workflow === 'string' ? legacy.workflow : '',
     naturalLanguage: typeof legacy.naturalLanguage === 'boolean' ? legacy.naturalLanguage : false,
     // 渠道级横竖尺寸下沉进预设;normalizeBackend 已做过 resolution→横竖两格的老迁移
@@ -2161,15 +2657,58 @@ function foldLegacyWorkflow(o: Partial<ComfyUISettings>, conn: BackendConn): Com
   };
 }
 
-function normalizeComfyUI(raw: unknown, def: ComfyUISettings): ComfyUISettings {
+function normalizeComfyUI(
+  raw: unknown,
+  def: ComfyUISettings,
+  legacyPrompts?: { comfySpec?: string; comfyThinking?: string },
+): ComfyUISettings {
   const conn = normalizeBackend(raw, def);
   const o = (raw ?? {}) as Partial<ComfyUISettings>;
 
+  // 服务器库:老配置没有 servers 键 → 用渠道级 url 折成第一台(见 foldLegacyEndpoint 同口径)
+  const servers = Array.isArray(o.servers)
+    ? o.servers.map(normalizeComfyServer)
+    : [newComfyServer('本机', conn.url.trim() || def.servers[0]?.url || 'http://127.0.0.1:8188')];
+  if (!servers.length) servers.push(newComfyServer());
+
+  // 提示词库:老配置没有 promptSets 键 → 把设置页改过的 comfySpec/comfyThinking 折成一套
+  // 用户提示词;没改过(空串)则留空数组,方案回落内置。
+  const promptSets = Array.isArray(o.promptSets) ? o.promptSets.map(normalizeComfyPromptSet) : [];
+  let legacyPromptSet: ComfyPromptSet | null = null;
+  if (!Array.isArray(o.promptSets)) {
+    const spec = legacyPrompts?.comfySpec?.trim() ?? '';
+    const thinking = legacyPrompts?.comfyThinking?.trim() ?? '';
+    if (spec || thinking) {
+      const set = newComfyPromptSet('我的提示词');
+      set.spec = spec;
+      set.thinking = thinking;
+      promptSets.push(set);
+      legacyPromptSet = set;
+    }
+  }
+
   const workflows = Array.isArray(o.workflows)
     ? o.workflows.map(normalizeWorkflowPreset)
-    : [foldLegacyWorkflow(o, conn)];
+    : [foldLegacyWorkflow(o, conn, servers[0].id)];
   // 不变式兜底:脏数据把库清空了也要留一条,否则面板与出图门槛全得处理 undefined
   if (!workflows.length) workflows.push(newComfyWorkflow());
+
+  // 引用修复:悬空的服务器回落第一台;悬空/不存在的提示词集回落内置。
+  // 从老配置迁移出来的那套用户提示词,要让「原本没写 promptSetId」的方案引用它——
+  // 否则用户精调过的规范会留在库里没人用,升级等于悄悄换回内置。
+  const serverIds = new Set(servers.map(s => s.id));
+  const promptSetIds = new Set(promptSets.map(s => s.id));
+  const rawWorkflows = Array.isArray(o.workflows) ? o.workflows : [];
+  for (const preset of workflows) {
+    if (!serverIds.has(preset.serverId)) preset.serverId = servers[0].id;
+    const rawPreset = rawWorkflows.find(item => item?.id === preset.id);
+    const hadPromptSetId = typeof rawPreset?.promptSetId === 'string' && !!rawPreset.promptSetId;
+    if (legacyPromptSet && !hadPromptSetId) {
+      preset.promptSetId = legacyPromptSet.id;
+    } else if (preset.promptSetId !== BUILTIN_COMFY_ILLUST_ID && !promptSetIds.has(preset.promptSetId)) {
+      preset.promptSetId = BUILTIN_COMFY_ILLUST_ID;
+    }
+  }
 
   // 指向已删条目(或压根没存)时回落第一条:悬空 id 会让面板显示空白、出图取不到工作流
   const activeWorkflowId =
@@ -2177,7 +2716,7 @@ function normalizeComfyUI(raw: unknown, def: ComfyUISettings): ComfyUISettings {
       ? o.activeWorkflowId
       : workflows[0].id;
 
-  return { ...conn, workflows, activeWorkflowId };
+  return { ...conn, url: servers[0].url, servers, promptSets, workflows, activeWorkflowId };
 }
 
 const NAI_MODEL_VALUES = new Set<string>(NAI_MODELS.map(m => m.value));
@@ -2376,13 +2915,17 @@ function prunePresetVibeRefs(preset: NaiArtistPreset, vibes: readonly NaiVibe[])
 }
 
 /** 单条站点清洗:缺字段/类型不符逐项回退。url/key 允许空串(未填完的站点不是垃圾数据)。 */
-function normalizeNaiEndpoint(raw: unknown, seq: number): NaiEndpoint {
+function normalizeNaiEndpoint(raw: unknown, seq: number, fallbackConcurrency = 1): NaiEndpoint {
   const o = (raw ?? {}) as Partial<NaiEndpoint>;
   return {
     id: typeof o.id === 'string' && o.id ? o.id : `ep_${Date.now()}_${seq}`,
     name: typeof o.name === 'string' && o.name ? o.name : `站点 ${seq + 1}`,
     url: typeof o.url === 'string' ? o.url : '',
     key: typeof o.key === 'string' ? o.key : '',
+    concurrency: Math.min(
+      NAI_CONCURRENCY_MAX,
+      Math.max(1, Math.floor(clampNumber(o.concurrency, fallbackConcurrency, 1, NAI_CONCURRENCY_MAX))),
+    ),
   };
 }
 
@@ -2393,8 +2936,101 @@ function normalizeNaiEndpoint(raw: unknown, seq: number): NaiEndpoint {
  * url 为空串也照样建这一条(latent 的默认就是空地址):那正是用户当前面对的空槽位,
  * 何况 endpoints 恒非空的不变式要求库里至少有一条。
  */
-function foldLegacyEndpoint(conn: BackendConn, key: string): NaiEndpoint {
-  return newNaiEndpoint(endpointName(conn.url), conn.url, key);
+function foldLegacyEndpoint(conn: BackendConn, key: string, concurrency = 1): NaiEndpoint {
+  return newNaiEndpoint(endpointName(conn.url), conn.url, key, concurrency);
+}
+
+/** 单条方案清洗:引用修复 + 字段兜底。引用悬空的口径见各字段注释。 */
+function normalizeNaiPlan(
+  raw: unknown,
+  index: number,
+  endpoints: readonly NaiEndpoint[],
+  artistPresets: readonly NaiArtistPreset[],
+  vibes: readonly NaiVibe[],
+  fallback: NaiPlan,
+): NaiPlan {
+  const o = (raw ?? {}) as Partial<NaiPlan>;
+  const text = (value: unknown, def: string) => (typeof value === 'string' && value ? value : def);
+  const size = (value: unknown, def: string) => (typeof value === 'string' && value.trim() ? value : def);
+  // 接入点悬空 → 回落第一条:地址是必需品,不能落空(与画师串相反)
+  const endpointId =
+    typeof o.endpointId === 'string' && endpoints.some(e => e.id === o.endpointId)
+      ? o.endpointId
+      : endpoints[0]?.id ?? '';
+  // 画师串悬空 → 清成空串:不给画师串只是不加画风,静默回落会换掉每张图的样子
+  const artistId =
+    typeof o.artistId === 'string' &&
+    (artistPresets.some(a => a.id === o.artistId) || isBuiltinNaiArtist(o.artistId))
+      ? o.artistId
+      : '';
+  const vibeIds = new Set(vibes.map(vibe => vibe.id));
+  const stored = typeof o.model === 'string' ? o.model : '';
+  const model = NAI_MODEL_VALUES.has(stored) ? (stored as NaiModel) : fallback.model;
+  if (stored && stored !== model) {
+    console.warn(`[柏宝绘] NAI 方案「${text(o.name, `方案 ${index + 1}`)}」的模型「${stored}」已下线,本次回落为 ${model}`);
+  }
+  return {
+    id: typeof o.id === 'string' && o.id ? o.id : `plan_${Date.now()}_${index}`,
+    name: text(o.name, `方案 ${index + 1}`),
+    endpointId,
+    model,
+    artistId,
+    sampler: text(o.sampler, fallback.sampler),
+    steps: Math.round(clampNumber(o.steps, fallback.steps, 1, 50)),
+    scale: clampNumber(o.scale, fallback.scale, 0, 35),
+    cfgRescale: clampNumber(o.cfgRescale, fallback.cfgRescale, 0, 1),
+    noiseSchedule: text(o.noiseSchedule, fallback.noiseSchedule),
+    seed: Math.round(clampNumber(o.seed, fallback.seed, 0, 4294967295)),
+    varietyBoost: typeof o.varietyBoost === 'boolean' ? o.varietyBoost : fallback.varietyBoost,
+    normalizeRefStrength:
+      typeof o.normalizeRefStrength === 'boolean' ? o.normalizeRefStrength : fallback.normalizeRefStrength,
+    vibeIds: Array.isArray(o.vibeIds)
+      ? [...new Set(o.vibeIds.filter((id): id is string => typeof id === 'string' && vibeIds.has(id)))]
+      : [],
+    naturalLanguage: typeof o.naturalLanguage === 'boolean' ? o.naturalLanguage : fallback.naturalLanguage,
+    orientationLock: normalizeOrientationLock(o.orientationLock),
+    portraitSize: size(o.portraitSize, fallback.portraitSize),
+    landscapeSize: size(o.landscapeSize, fallback.landscapeSize),
+  };
+}
+
+/**
+ * 存量迁移:老配置没有 plans 键 → 把平铺参数原样折成唯一一套「默认方案」。
+ * 口径同 foldLegacyWorkflow:用户特意设过的值绝不被默认值悄悄顶掉。
+ * 老数据里 enabled===true 的 vibe 成为方案的 vibeIds。
+ */
+function foldLegacyNaiPlan(
+  o: Partial<NaiSettings>,
+  endpoints: readonly NaiEndpoint[],
+  artistPresets: readonly NaiArtistPreset[],
+  vibes: readonly NaiVibe[],
+): NaiPlan {
+  const plan = newNaiPlan('默认方案');
+  plan.endpointId = endpoints[0]?.id ?? '';
+  plan.model = NAI_MODEL_VALUES.has(o.model as string) ? (o.model as NaiModel) : plan.model;
+  plan.artistId =
+    typeof o.activeArtistId === 'string' &&
+    (artistPresets.some(a => a.id === o.activeArtistId) || isBuiltinNaiArtist(o.activeArtistId))
+      ? o.activeArtistId
+      : '';
+  plan.sampler = typeof o.sampler === 'string' && o.sampler ? o.sampler : plan.sampler;
+  plan.steps = Math.round(clampNumber(o.steps, plan.steps, 1, 50));
+  plan.scale = clampNumber(o.scale, plan.scale, 0, 35);
+  plan.cfgRescale = clampNumber(o.cfgRescale, plan.cfgRescale, 0, 1);
+  plan.noiseSchedule =
+    typeof o.noiseSchedule === 'string' && o.noiseSchedule ? o.noiseSchedule : plan.noiseSchedule;
+  plan.seed = Math.round(clampNumber(o.seed, plan.seed, 0, 4294967295));
+  plan.varietyBoost = typeof o.varietyBoost === 'boolean' ? o.varietyBoost : plan.varietyBoost;
+  plan.normalizeRefStrength =
+    typeof o.normalizeRefStrength === 'boolean' ? o.normalizeRefStrength : plan.normalizeRefStrength;
+  plan.vibeIds = vibes.filter(vibe => vibe.enabled).map(vibe => vibe.id);
+  plan.naturalLanguage = typeof o.naturalLanguage === 'boolean' ? o.naturalLanguage : plan.naturalLanguage;
+  plan.orientationLock = normalizeOrientationLock(o.orientationLock);
+  plan.portraitSize =
+    typeof o.portraitSize === 'string' && o.portraitSize ? o.portraitSize : plan.portraitSize;
+  plan.landscapeSize =
+    typeof o.landscapeSize === 'string' && o.landscapeSize ? o.landscapeSize : plan.landscapeSize;
+  return plan;
 }
 
 function normalizeNai(raw: unknown, def: NaiSettings): NaiSettings {
@@ -2428,13 +3064,16 @@ function normalizeNai(raw: unknown, def: NaiSettings): NaiSettings {
       ? o.activeArtistId
       : '';
 
-  // 站点库:老配置没有 endpoints 键 → 用渠道级的 url/key 折成第一条(见 foldLegacyEndpoint)
+  // 站点库:老配置没有 endpoints 键 → 用渠道级的 url/key 折成第一条(见 foldLegacyEndpoint)。
+  // 并发同理:老配置只有顶层 concurrency,升级时把它分给当时已有的每条(条目自带值优先),
+  // 迁移后顶层字段只作为「新建条目的默认值」保留,实际闸门按 activeNaiEndpoint().concurrency。
   const legacyKey = typeof o.key === 'string' ? o.key : def.key;
+  const legacyConcurrency = Math.round(clampNumber(o.concurrency, def.concurrency, 1, NAI_CONCURRENCY_MAX));
   const endpoints = Array.isArray(o.endpoints)
-    ? o.endpoints.map(normalizeNaiEndpoint)
-    : [foldLegacyEndpoint(conn, legacyKey)];
+    ? o.endpoints.map((raw, index) => normalizeNaiEndpoint(raw, index, legacyConcurrency))
+    : [foldLegacyEndpoint(conn, legacyKey, legacyConcurrency)];
   // 不变式兜底:脏数据把库清空了也要留一条,否则面板与出图门槛全得处理 undefined
-  if (!endpoints.length) endpoints.push(foldLegacyEndpoint(conn, legacyKey));
+  if (!endpoints.length) endpoints.push(foldLegacyEndpoint(conn, legacyKey, legacyConcurrency));
 
   // 指向已删条目(或压根没存)时回落第一条:悬空 id 会让面板显示空白、出图取不到地址。
   // 与 activeArtistId 的「清成空串」刻意相反 —— 站点不是可选调味,没有它出不了图。
@@ -2445,7 +3084,20 @@ function normalizeNai(raw: unknown, def: NaiSettings): NaiSettings {
   // `?? endpoints[0]` 在类型上兜底(activeEndpointId 上面已保证命中),口径同 activeComfyPreset
   const active = endpoints.find(e => e.id === activeEndpointId) ?? endpoints[0];
 
-  return {
+  // 方案库:老配置没有 plans 键 → 平铺参数折成唯一一套「默认方案」(见 foldLegacyNaiPlan)。
+  // 空数组按脏数据处理,补一条默认方案;plans 恒非空是消费方不判空的前提。
+  const plans = Array.isArray(o.plans)
+    ? o.plans.map((rawPlan, index) =>
+        normalizeNaiPlan(rawPlan, index, endpoints, artistPresets, vibes, def.plans[0] ?? newNaiPlan()),
+      )
+    : [foldLegacyNaiPlan(o, endpoints, artistPresets, vibes)];
+  if (!plans.length) plans.push(foldLegacyNaiPlan(o, endpoints, artistPresets, vibes));
+  const activePlanId =
+    typeof o.activePlanId === 'string' && plans.some(p => p.id === o.activePlanId)
+      ? o.activePlanId
+      : plans[0].id;
+
+  const merged: NaiSettings = {
     ...conn,
     // 不变式落地:活值镜像一律从当前站点派生,而非原样保留存量的渠道级 url/key。
     // 于是「手改过 settings / 装过旧版本 / 存量脏数据」造成的镜像脱钩每次载入都自愈。
@@ -2468,14 +3120,19 @@ function normalizeNai(raw: unknown, def: NaiSettings): NaiSettings {
     varietyBoost: typeof o.varietyBoost === 'boolean' ? o.varietyBoost : def.varietyBoost,
     normalizeRefStrength:
       typeof o.normalizeRefStrength === 'boolean' ? o.normalizeRefStrength : def.normalizeRefStrength,
-    concurrency: Math.round(clampNumber(o.concurrency, def.concurrency, 1, 4)),
+    concurrency: active.concurrency,
     vibes,
     artistPresets,
+    plans,
+    activePlanId,
     activeArtistId,
     // 老配置缺这两个字段:回落默认 = 开着自然语言、不锁方向,即改动前的行为
     naturalLanguage: typeof o.naturalLanguage === 'boolean' ? o.naturalLanguage : def.naturalLanguage,
     orientationLock: normalizeOrientationLock(o.orientationLock),
   };
+  // 方案化收尾:平铺字段一律从当前方案派生(切方案与载入同一口径,镜像不会脱钩)
+  syncNaiMirror(merged);
+  return merged;
 }
 
 /**
@@ -2665,17 +3322,21 @@ function normalize(raw: unknown): ImageSettings {
     imageDisplaySize: IMAGE_DISPLAY_SIZES.some(option => option.value === ru.imageDisplaySize)
       ? (ru.imageDisplaySize as ImageDisplaySize)
       : d.ui.imageDisplaySize,
+    immersiveImages:
+      typeof ru.immersiveImages === 'boolean' ? ru.immersiveImages : d.ui.immersiveImages,
   };
   // webui 已隐藏:存量数据里的 'webui'(或任何认不出的值)一律迁移到默认后端
   // (否则规范/出图口径会落空)。判据走 SELECTABLE_BACKENDS,加后端时这里不用再改。
-  merged.defaultBackend = isSelectableBackend(merged.defaultBackend)
-    ? merged.defaultBackend
-    : d.defaultBackend;
+  // 旧 latent 渠道已移除:存量 'latent' 迁到 Latent 原生 API,而不是悄悄回落成 ComfyUI。
+  merged.defaultBackend =
+    (merged.defaultBackend as string) === 'latent'
+      ? 'latentapi'
+      : isSelectableBackend(merged.defaultBackend)
+        ? merged.defaultBackend
+        : d.defaultBackend;
   merged.webui = normalizeBackend(r.webui, d.webui);
-  merged.comfyui = normalizeComfyUI(r.comfyui, d.comfyui);
+  merged.comfyui = normalizeComfyUI(r.comfyui, d.comfyui, r.autoTag?.prompts);
   merged.nai = normalizeNai(r.nai, d.nai);
-  // latent 与 nai 同结构,归一化直接复用同一份(见 latentDefaults)
-  merged.latent = normalizeNai(r.latent, d.latent);
   merged.imgrouter = normalizeImgRouter(r.imgrouter, d.imgrouter);
   merged.latentApi = normalizeLatentApi(r.latentApi, d.latentApi);
   // 副 API 渠道:逐个补全字段并校验类型
@@ -2780,7 +3441,6 @@ function applyInto(target: ImageSettings, src: ImageSettings): void {
   target.webui = src.webui;
   target.comfyui = src.comfyui;
   target.nai = src.nai;
-  target.latent = src.latent;
   target.imgrouter = src.imgrouter;
   target.latentApi = src.latentApi;
   target.channels = src.channels;
