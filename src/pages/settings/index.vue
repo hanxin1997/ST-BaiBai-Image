@@ -3,6 +3,7 @@ import BbiSelect from '@/components/BbiSelect.vue';
 import BbiTextarea from '@/components/BbiTextarea.vue';
 import Collapsible from '@/components/Collapsible.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
+import { deleteCharLibraryWorldbook } from '@/autoTag/charLibraryWorldbook';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import { fetchModels, testChannel } from '@/api/client';
@@ -103,6 +104,17 @@ const worldbookFormatSel = computed<string>({
   get: () => settings.autoTag.worldbookFormat,
   set: v => (settings.autoTag.worldbookFormat = v as WorldbookFormat),
 });
+
+async function onDeleteCharLibraryWorldbook(): Promise<void> {
+  const name = settings.autoTag.charLibraryWorldbookName;
+  if (!window.confirm(`删除世界书「${name}」？此操作不可恢复。`)) return;
+  try {
+    await deleteCharLibraryWorldbook();
+    toastr.success('专用世界书已删除', '柏宝绘');
+  } catch (error) {
+    toastr.error(error instanceof Error ? error.message : String(error), '删除失败');
+  }
+}
 
 /* —— 世界书链:书库只存组装请求需要的字段;导入后按书名替换,支持更新同一本 —— */
 const worldbookChainBookSel = computed<string>({
@@ -881,6 +893,83 @@ async function confirmUpdate() {
         <p v-if="settings.autoTag.worldbookImages" class="bbi-field-hint">
           只决定按哪种格式读生图词,出图仍走当前出图渠道。NAI:Scene Composition / Character N Prompt;
           Anima:size / Scene / CharN / Description。格式选错时生图词原样保留并提示。
+          角色段写成 <code>名字 | tag</code> 时,世界书生图会自动建档;没有名字的段按「角色 N」处理,不建档。
+        </p>
+
+        <!-- 角色外貌注入:临时注入默认开;常驻世界书可选 -->
+        <label class="bbi-switch-row">
+          <span class="bbi-field-label">主 LLM 临时注入角色外貌库</span>
+          <input v-model="settings.autoTag.injectCharLibrary" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p class="bbi-field-hint">
+          每次请求把当前聊天的角色固定外貌 push 成一条 system,请求结束自然消失;不写世界书、不覆盖、不残留。
+          写正文与 <code>image###</code> 时照抄库中字段,省掉一次生图 tag 请求。
+        </p>
+        <label v-if="settings.autoTag.injectCharLibrary" class="bbi-switch-row">
+          <span class="bbi-field-label">替换 @角色名 占位符</span>
+          <input v-model="settings.autoTag.replaceCharPlaceholders" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p v-if="settings.autoTag.injectCharLibrary" class="bbi-field-hint">
+          正文/世界书里的 <code>@小雪</code> 会被替换成库中最新外貌;未命中的 @ 原样保留。
+        </p>
+        <label v-if="settings.autoTag.injectCharLibrary" class="bbi-num-row">
+          <span class="bbi-field-label">注入字符上限(0 = 不限)</span>
+          <input
+            v-model.number="settings.autoTag.charLibraryMaxChars"
+            class="bbi-input bbi-num"
+            type="number"
+            min="0"
+            step="100"
+          />
+        </label>
+
+        <label class="bbi-switch-row">
+          <span class="bbi-field-label">常驻世界书条目</span>
+          <input v-model="settings.autoTag.charLibraryWorldbook" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p class="bbi-field-hint">
+          把当前聊天角色库写进全局世界书,世界书列表里能看到;多聊天会互相覆盖,切聊天时插件会重写。
+        </p>
+        <div v-if="settings.autoTag.charLibraryWorldbook" class="bbi-field">
+          <div class="bbi-field-head"><span class="bbi-field-label">书名</span></div>
+          <input
+            v-model="settings.autoTag.charLibraryWorldbookName"
+            class="bbi-input"
+            type="text"
+            spellcheck="false"
+          />
+        </div>
+        <div v-if="settings.autoTag.charLibraryWorldbook" class="bbi-field">
+          <div class="bbi-field-head"><span class="bbi-field-label">条目名</span></div>
+          <input
+            v-model="settings.autoTag.charLibraryEntryName"
+            class="bbi-input"
+            type="text"
+            spellcheck="false"
+          />
+        </div>
+        <button
+          v-if="settings.autoTag.charLibraryWorldbook"
+          class="bbi-btn bbi-btn-sm bbi-btn-danger"
+          type="button"
+          @click="onDeleteCharLibraryWorldbook"
+        >
+          删除专用世界书
+        </button>
+
+        <label class="bbi-switch-row">
+          <span class="bbi-field-label">世界书生图自动建档</span>
+          <input v-model="settings.autoTag.worldbookAutoRegister" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p class="bbi-field-hint">
+          角色段写成 <code>名字 | tag</code> 时,把名字与外貌写进角色库(只新建,不覆盖已有)。
+        </p>
+        <label v-if="settings.autoTag.worldbookAutoRegister" class="bbi-switch-row">
+          <span class="bbi-field-label">更新已有角色</span>
+          <input v-model="settings.autoTag.worldbookUpdateExisting" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p v-if="settings.autoTag.worldbookAutoRegister" class="bbi-field-hint">
+          开启后,世界书生图里同一角色的外貌变化会覆盖库中 raw;动作/服装等临时状态也可能被写进去,默认关。
         </p>
 
         <label class="bbi-switch-row">

@@ -766,6 +766,25 @@ export interface AutoTagSettings {
    * 由用户选而不从内容猜:两种格式的键名有重叠(Scene / Scene Composition),猜错会静默读歪。
    */
   worldbookFormat: WorldbookFormat;
+  /**
+   * 主 LLM 临时注入当前聊天角色库(默认开):每次请求前 push 一条 system,
+   * 请求结束自然消失——不写世界书、不覆盖、不残留(见 autoTag/charLibraryPrompt.ts)。
+   */
+  injectCharLibrary: boolean;
+  /** 把正文/世界书里的 `@角色名` 替换成库中最新外貌(默认开)。 */
+  replaceCharPlaceholders: boolean;
+  /** 注入文本的字符上限;0 = 不限制。 */
+  charLibraryMaxChars: number;
+  /** 常驻世界书条目(默认关):把库写进「直接角色外貌」的 constant 条目。 */
+  charLibraryWorldbook: boolean;
+  /** 常驻世界书名(默认「直接角色外貌」)。 */
+  charLibraryWorldbookName: string;
+  /** 常驻条目名(默认「角色固定外貌库」)。 */
+  charLibraryEntryName: string;
+  /** 世界书生图自动建档(默认开,只新建;不覆盖已有)。 */
+  worldbookAutoRegister: boolean;
+  /** 世界书生图更新已有角色(默认关,避免临时状态写进长期外貌)。 */
+  worldbookUpdateExisting: boolean;
   /** 可编辑提示词集(破限/后端规范/思维链);空串 = 回落内置默认。 */
   prompts: AutoTagPrompts;
   /**
@@ -1610,7 +1629,7 @@ Description（JSON 的 nl 键）：
 - 依次覆盖：谁在画面里、在什么位置、在做什么 → 空间关系 → 光源与阴影 → 动态瞬间 → 情绪基调 → 材质质感。通常 6–12 句，画面简单就少写。
 - 角色名照抄档案原名（中文名写中文）；【一次性】角色用正文里的指称。
 {{/nl}}
-长度：Scene、全部 Char{{#nl}} 与 Description{{/nl}} 合计控制在约 1800 字符以内（接口上限 2000，前缀要占一部分）。超了按这个顺序删：冗余背景 → 质量词/同义词 → 次要修饰 → 次要 tag；身份、有效状态、衣物、因果接触、可见结构不删。
+长度：Scene、全部 Char{{#nl}} 与 Description{{/nl}} 合计控制在约 1800 token 以内（接口上限 2000，前缀要占一部分）。超了按这个顺序删：冗余背景 → 质量词/同义词 → 次要修饰 → 次要 tag；身份、有效状态、衣物、因果接触、可见结构不删。
 
 落笔前清理：去掉完全重复的词、画面里看不见的词、语义重复的词（留更具体的：white shirt 留，shirt 删）、互相矛盾的词（bra 与 topless、standing 与 lying、pantyhose 与 barefoot 等）。
 
@@ -1701,7 +1720,7 @@ E. 选段
    - 单帧没有拼时刻、没有多镜头或分镜。
    - 没有正文未写的夸大身材或暴露服装；看不见的部位、重复词、矛盾词都已去掉。
    - 每个在场角色都能三选一：库中同名条目、changes 里的 field:"new"、或【一次性】；【一次性】没有被写进 changes。
-   - size 与景别一致；Scene + 全部 Char{{#nl}} + Description{{/nl}} 合计约 1800 字符以内。
+   - size 与景别一致；Scene + 全部 Char{{#nl}} + Description{{/nl}} 合计约 1800 token 以内。
    - 张数在设定范围内；仅当下限为 0 且确实无可画时 images 才为空。`;
 
 /**
@@ -2079,6 +2098,14 @@ function defaults(): ImageSettings {
       notifyProgress: true,
       worldbookImages: false,
       worldbookFormat: 'nai',
+      injectCharLibrary: true,
+      replaceCharPlaceholders: true,
+      charLibraryMaxChars: 0,
+      charLibraryWorldbook: false,
+      charLibraryWorldbookName: '直接角色外貌',
+      charLibraryEntryName: '角色固定外貌库',
+      worldbookAutoRegister: true,
+      worldbookUpdateExisting: false,
       prompts: {
         jailbreak: '',
         naiSpec: '',
@@ -3381,6 +3408,36 @@ function normalize(raw: unknown): ImageSettings {
     worldbookFormat: WORLDBOOK_FORMATS.some(option => option.value === rt.worldbookFormat)
       ? (rt.worldbookFormat as WorldbookFormat)
       : d.autoTag.worldbookFormat,
+    injectCharLibrary:
+      typeof rt.injectCharLibrary === 'boolean' ? rt.injectCharLibrary : d.autoTag.injectCharLibrary,
+    replaceCharPlaceholders:
+      typeof rt.replaceCharPlaceholders === 'boolean'
+        ? rt.replaceCharPlaceholders
+        : d.autoTag.replaceCharPlaceholders,
+    charLibraryMaxChars:
+      typeof rt.charLibraryMaxChars === 'number' && Number.isFinite(rt.charLibraryMaxChars)
+        ? Math.max(0, Math.floor(rt.charLibraryMaxChars))
+        : d.autoTag.charLibraryMaxChars,
+    charLibraryWorldbook:
+      typeof rt.charLibraryWorldbook === 'boolean'
+        ? rt.charLibraryWorldbook
+        : d.autoTag.charLibraryWorldbook,
+    charLibraryWorldbookName:
+      typeof rt.charLibraryWorldbookName === 'string' && rt.charLibraryWorldbookName.trim()
+        ? rt.charLibraryWorldbookName.trim()
+        : d.autoTag.charLibraryWorldbookName,
+    charLibraryEntryName:
+      typeof rt.charLibraryEntryName === 'string' && rt.charLibraryEntryName.trim()
+        ? rt.charLibraryEntryName.trim()
+        : d.autoTag.charLibraryEntryName,
+    worldbookAutoRegister:
+      typeof rt.worldbookAutoRegister === 'boolean'
+        ? rt.worldbookAutoRegister
+        : d.autoTag.worldbookAutoRegister,
+    worldbookUpdateExisting:
+      typeof rt.worldbookUpdateExisting === 'boolean'
+        ? rt.worldbookUpdateExisting
+        : d.autoTag.worldbookUpdateExisting,
     // 可编辑提示词集:逐字段兜底;旧版 jailbreakPrompt 字段迁移进 prompts.jailbreak
     prompts: (() => {
       const rp = (rt.prompts ?? {}) as Partial<AutoTagPrompts>;

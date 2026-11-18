@@ -23,10 +23,12 @@ import {
   createCharTagNewOp,
   createCharTagSetOp,
   emptyCharFields,
+  findCharTag,
   lockedCharTagNames,
   makeCharTagFloorDelta,
   readCharTagFloorDelta,
   recomputeCharTags,
+  upsertCharTag,
   type CharTagAutoOp,
   type CharTagField,
 } from '@/state/charTags';
@@ -41,6 +43,7 @@ import { applyMessageText, type ApplyMessageResult } from '@/st/messageEdit';
 import { getContext, isAiStoryMessage, type STMessage } from '@/st/context';
 import {
   hasImageTagTrace,
+  parseImageTagContent,
   parseImageTags,
   replaceImageTagAt,
   serializeImageTag,
@@ -351,6 +354,42 @@ function worldbookTarget(): 'characters' | 'folded' {
 }
 
 /**
+ * 世界书生图自动建档:角色段写成 `名字 | tag` 时,把名字与外貌写进角色库。
+ *
+ * 只新建、不覆盖已有(除非用户显式开「更新已有」):`image###` 里混着动作/服装/表情,
+ * 直接覆盖会把临时状态写进长期外貌。只存 raw,结构化字段留给自动 tag 的 changes 补全。
+ */
+function registerWorldbookCharacters(text: string): void {
+  for (const rawTag of parseImageTags(text)) {
+    const content = parseImageTagContent(rawTag);
+    for (const character of content.characters) {
+      const name = character.name.trim();
+      if (!name || /^角色 \d+$/.test(name)) continue;
+      const tag = character.tag.trim();
+      if (!tag) continue;
+      const existing = findCharTag(name);
+      if (existing) {
+        if (!settings.autoTag.worldbookUpdateExisting) continue;
+        if (existing.raw.trim() === tag) continue;
+        upsertCharTag({ ...existing, raw: tag, history: existing.history }, undefined, {
+          recordChanges: true,
+        });
+        continue;
+      }
+      upsertCharTag({
+        name,
+        fields: emptyCharFields(),
+        raw: tag,
+        nl: '',
+        source: 'book',
+        desc: '世界书生图',
+        history: [],
+      });
+    }
+  }
+}
+
+/**
  * 世界书生图:正文里已有 `image###…###` 时原位换成 <bbi_image> 并出图,不请求副 API。
  * 返回 true = 本楼已由这条路处理完(转成了、或格式不符已提示),调用方不再走副 API。
  *
@@ -366,6 +405,8 @@ async function runWorldbookImages(floor: number, message: STMessage, chatId: str
     toastr.warning(`第 ${floor} 楼的生图词格式与「世界书格式」设置（${format === 'nai' ? 'NAI' : 'Anima'}）不符，没有转换`, '柏宝绘');
     return true;
   }
+  // 自动建档:角色段带名字时把外貌写进库;库更新后世界书注入/临时注入下一次就是新的
+  if (settings.autoTag.worldbookAutoRegister) registerWorldbookCharacters(preview.text);
   const swipeId = activeSwipeId(message);
   const markSwipeId = message.swipe_id ?? 0;
   for (let seq = 0; seq < preview.converted; seq++) markForAutoGenerate(chatId, floor, markSwipeId, seq, 'force');
@@ -558,6 +599,7 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
             },
             preparedTarget,
             anchors.text,
+            charTagsBeforeFloor(floor),
           )
         : await buildAutoTagMessages(
             context,

@@ -35,15 +35,18 @@ export class LatentPromptTooLongError extends LatentApiError {
   readonly length: number;
   readonly limit: number;
   constructor(length: number, limit: number) {
-    super(`提示词 ${length} 字,超过 Latent 上限 ${limit},请在编辑弹窗里删减`);
+    super(`提示词 ${length} 字符,超过接口上限(约 2000 token / ${limit} 字符),请在编辑弹窗里删减`);
     this.name = 'LatentPromptTooLongError';
     this.length = length;
     this.limit = limit;
   }
 }
 
-/** 接口的提示词长度上限(字符)。 */
-export const LATENT_API_PROMPT_LIMIT = 2000;
+/**
+ * 接口的提示词上限。站点按 token 限(2000 token/次请求),这里用字符做保守兜底:
+ * 8000 字符约等于 2000 token 英文,超了才跳过——比按 2000 字符判更贴近站点真实额度。
+ */
+export const LATENT_API_PROMPT_LIMIT = 8000;
 /** 显示与随图记录用的模型名(接口不让选模型,固定是这一个)。 */
 export const LATENT_API_MODEL = 'Anima-2.9B-int8-turbo';
 const POLL_INTERVAL_MS = 2000;

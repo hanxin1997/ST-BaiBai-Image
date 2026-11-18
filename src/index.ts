@@ -1,18 +1,22 @@
 import App from '@/App.vue';
+import { injectCharLibrary } from '@/autoTag/charLibraryPrompt';
+import { clearCharLibraryWorldbook, syncCharLibraryWorldbook } from '@/autoTag/charLibraryWorldbook';
 import { bindAutoTagging } from '@/autoTag/runner';
 import { bindTagActionButtons } from '@/floor/actionButton';
 import { bindFloorHydration } from '@/floor/hydrate';
 import { injectMenuButton } from '@/menu';
 import { registerPublicInterface } from '@/public/register';
-import { bindCharTagSync } from '@/state/charTags';
+import { bindCharTagSync, charTagLib } from '@/state/charTags';
 import { initGlobalCharTags } from '@/state/globalCharTags';
-import { hydrateSettings } from '@/state/settings';
+import { hydrateSettings, settings } from '@/state/settings';
 import { ui } from '@/state/ui';
+import { getContext } from '@/st/context';
 import { guardEditableArrowKeys } from '@/st/keyboard';
 import { ensureImageTagRegexRegistered } from '@/st/imageTagRegex';
 import { syncTopBarButton } from '@/topbar';
 import { checkForUpdate } from '@/update';
 import { versionedAssetUrl } from '@/version';
+import type { ChatMsg } from '@/api/client';
 // 这两行让 Vite 把全局样式打进 dist/index.css(随后注入 shadow root)
 import '@/styles/base.css';
 import '@/styles/theme.css';
@@ -109,6 +113,8 @@ async function hydrateWhenReady(attempt = 0) {
     ['设置载入', hydrateSettings],
     ['全局角色库初始化', initGlobalCharTags],
     ['角色库同步', bindCharTagSync],
+    ['角色库注入', bindCharLibraryInjection],
+    ['角色库常驻世界书', bindCharLibraryWorldbook],
     ['图片标签正则', ensureImageTagRegexRegistered],
     ['自动 tag 事件', bindAutoTagging],
     ['楼层水合', bindFloorHydration],
@@ -128,6 +134,58 @@ async function hydrateWhenReady(attempt = 0) {
 }
 
 type InitStep = readonly [name: string, run: () => void | Promise<void>];
+
+let charLibraryBound = false;
+let charLibraryWorldbookBound = false;
+
+/**
+ * 常驻世界书模式:启动、切聊天、开关变化时把当前聊天角色库写进「直接角色外貌」。
+ * 默认关;关着时只清空条目内容,不碰用户其它世界书。
+ */
+function bindCharLibraryWorldbook(): void {
+  if (charLibraryWorldbookBound) return;
+  const context = getContext();
+  if (!context?.eventSource) return;
+  const sync = () => {
+    void syncCharLibraryWorldbook().catch(error => {
+      console.warn('[柏宝绘] 同步角色外貌世界书失败', error);
+    });
+  };
+  if (settings.autoTag.charLibraryWorldbook) sync();
+  context.eventSource.on(context.eventTypes.CHAT_CHANGED, sync);
+  watch(
+    () => settings.autoTag.charLibraryWorldbook,
+    on => {
+      if (on) sync();
+      else {
+        void clearCharLibraryWorldbook().catch(error => {
+          console.warn('[柏宝绘] 清空角色外貌世界书失败', error);
+        });
+      }
+    },
+  );
+  charLibraryWorldbookBound = true;
+}
+
+/**
+ * 主 LLM 的临时注入:每次请求前把当前聊天角色库 push 成一条 system,并替换 @角色名。
+ * 只活在本次请求的 messages 里,请求结束自然消失——不写世界书、不覆盖、不残留。
+ * 开关关闭时直接 return,不注册任何东西。
+ */
+function bindCharLibraryInjection(): void {
+  if (charLibraryBound) return;
+  const events = getContext()?.eventSource;
+  if (!events) return;
+  events.on('generate_interceptor', (chat: unknown) => {
+    if (!settings.autoTag.injectCharLibrary) return;
+    if (!Array.isArray(chat)) return;
+    injectCharLibrary(chat as ChatMsg[], charTagLib.entries, {
+      replacePlaceholders: settings.autoTag.replaceCharPlaceholders,
+      maxChars: settings.autoTag.charLibraryMaxChars,
+    });
+  });
+  charLibraryBound = true;
+}
 
 /** 单步初始化隔离:失败只记录自己,不阻断后续绑定。 */
 async function runStep([name, run]: InitStep): Promise<boolean> {

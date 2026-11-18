@@ -57,6 +57,8 @@ interface RawField {
 }
 
 interface DraftCharacter {
+  /** 角色名(角色段写成 `名字 | tag` 时解析出来;没有则空,出图时用「角色 N」)。 */
+  name: string;
   tag: string;
   uc: string;
   center: string;
@@ -100,16 +102,26 @@ function splitFields(body: string, format: WorldbookImageFormat): RawField[] {
 function characterDraft(draft: DraftImage, index: number): DraftCharacter {
   const existing = draft.characters.get(index);
   if (existing) return existing;
-  const created: DraftCharacter = { tag: '', uc: '', center: '' };
+  const created: DraftCharacter = { name: '', tag: '', uc: '', center: '' };
   draft.characters.set(index, created);
   return created;
 }
 
-/** 角色 Prompt:拆出 NAI 版的 `|centers:C3` 位置后缀,其余是 tag。 */
+/**
+ * 角色 Prompt:拆出 NAI 版的 `|centers:C3` 位置后缀,再拆 `名字 | tag`。
+ * 没有竖线时整段都是 tag、名字为空(兼容旧世界书);有名字才会被世界书生图自动建档。
+ */
 function applyCharacterPrompt(character: DraftCharacter, value: string): void {
   const centers = CENTERS_SUFFIX.exec(value);
+  const body = centers ? value.slice(0, centers.index) : value;
   character.center = centers ? centers[1].toUpperCase() : '';
-  character.tag = trimSeparators(centers ? value.slice(0, centers.index) : value);
+  const pipe = body.indexOf('|');
+  if (pipe >= 0) {
+    character.name = body.slice(0, pipe).trim();
+    character.tag = trimSeparators(body.slice(pipe + 1));
+  } else {
+    character.tag = trimSeparators(body);
+  }
 }
 
 function applyField(draft: DraftImage, field: RawField): void {
@@ -150,7 +162,7 @@ function toContent(draft: DraftImage, target: WorldbookImageTarget): ImageTagCon
     };
   }
   const prompts: ImageCharacterPrompt[] = characters.map((character, position) => ({
-    name: `${UNNAMED_CHARACTER} ${position + 1}`,
+    name: character.name || `${UNNAMED_CHARACTER} ${position + 1}`,
     tag: character.tag,
     nl: '',
     ...(character.center ? { center: character.center } : {}),

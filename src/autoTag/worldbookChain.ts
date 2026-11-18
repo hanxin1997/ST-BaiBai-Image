@@ -1,6 +1,7 @@
 import type { ChatMsg } from '@/api/client';
 import { orientationOfSize, type Orientation } from '@/backends/size';
 import { cleanHistoryText, type PreparedTargetText, type TargetSegment } from '@/autoTag/clean';
+import { replaceCharPlaceholders } from '@/autoTag/charLibraryPrompt';
 import {
   buildCharCardSystem,
   buildPersonaSystem,
@@ -17,6 +18,7 @@ import {
   type WorldbookChainMessageRole,
   type WorldbookChainTriggerMode,
 } from '@/state/settings';
+import type { CharTagEntry } from '@/state/charTags';
 
 /**
  * 世界书链:把导入的世界书按原 role/触发方式组装成请求,替代内置思维链与破限词。
@@ -288,10 +290,13 @@ function processEntryContent(
   entry: WorldbookChainEntry,
   variables: Map<string, string>,
   placeholders: Record<string, string>,
+  charEntries?: readonly CharTagEntry[],
 ): string {
   const stripped = stripPresetComments(entry.content);
   if (!stripped.trim()) return '';
-  return applyRolls(applyVariables(applyPlaceholders(stripped, placeholders), variables)).trim();
+  const expanded = applyRolls(applyVariables(applyPlaceholders(stripped, placeholders), variables)).trim();
+  // `@角色名` → 库中最新外貌;世界书里不用手写外貌,库更新后自动跟着变。
+  return charEntries?.length ? replaceCharPlaceholders(expanded, [...charEntries]) : expanded;
 }
 
 function tagLimitInstruction(limit: number): string {
@@ -335,6 +340,7 @@ export function buildWorldbookChainMessages(
   options: WorldbookChainBuildOptions,
   preparedTarget: PreparedTargetText,
   libraryText?: string | null,
+  charEntries?: readonly CharTagEntry[],
 ): ChatMsg[] {
   const stripTags = settings.excludes.customStripTags;
   const targetText = preparedTarget.segments.map(segment => segment.text).join('\n\n');
@@ -360,7 +366,7 @@ export function buildWorldbookChainMessages(
   if (persona) messages.push({ role: 'system', content: buildPersonaSystem(persona) });
   for (const entry of book.entries) {
     if (!entryActive(entry, triggerText)) continue;
-    const content = processEntryContent(entry, variables, placeholders);
+    const content = processEntryContent(entry, variables, placeholders, charEntries);
     if (content) messages.push({ role: entry.role, content });
   }
   return messages;
