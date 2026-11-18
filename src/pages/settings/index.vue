@@ -896,6 +896,19 @@ async function confirmUpdate() {
           角色段写成 <code>名字 | tag</code> 时,世界书生图会自动建档;没有名字的段按「角色 N」处理,不建档。
         </p>
 
+        <label v-if="settings.autoTag.worldbookImages" class="bbi-switch-row">
+          <span class="bbi-field-label">没出格式时自动转 tag</span>
+          <input
+            v-model="settings.autoTag.worldbookFallbackAutoTag"
+            type="checkbox"
+            class="bbi-checkbox"
+          />
+        </label>
+        <p v-if="settings.autoTag.worldbookImages" class="bbi-field-hint">
+          世界书生图没写 <code>image###</code>,或写了但格式读不出时,自动改走副 API 生成 tag;
+          关着时自动路径直接跳过,手动按钮照旧可用。
+        </p>
+
         <!-- 角色外貌注入:临时注入默认开;常驻世界书可选 -->
         <label class="bbi-switch-row">
           <span class="bbi-field-label">主 LLM 临时注入角色外貌库</span>

@@ -403,7 +403,8 @@ async function runWorldbookImages(floor: number, message: STMessage, chatId: str
   if (!preview.converted) {
     // 有块但一个都读不出 = 格式选错了。不回落副 API:那是另一套提示词,结果不会是用户想要的
     toastr.warning(`第 ${floor} 楼的生图词格式与「世界书格式」设置（${format === 'nai' ? 'NAI' : 'Anima'}）不符，没有转换`, '柏宝绘');
-    return true;
+    // 开了「自动切换」时交回调用方继续走自动 tag;否则按老行为就此结束
+    return !settings.autoTag.worldbookFallbackAutoTag;
   }
   // 自动建档:角色段带名字时把外貌写进库;库更新后世界书注入/临时注入下一次就是新的
   if (settings.autoTag.worldbookAutoRegister) registerWorldbookCharacters(preview.text);
@@ -511,7 +512,9 @@ async function runForFloor(floor: number, opts: RunOptions = {}): Promise<void> 
   if (!chainOn && worldbookOn && !opts.replace && !slot) {
     const currentChatId = context.getCurrentChatId?.() ?? '';
     if (currentChatId && (await runWorldbookImages(floor, message, currentChatId, Boolean(opts.manual)))) return;
-    if (!opts.manual) {
+    // 没出格式(没写 image### 或格式读不出)且没开自动切换 → 自动路径到此为止;
+    // 开了自动切换则继续往下走副 API,手动按钮本来就会继续。
+    if (!opts.manual && !settings.autoTag.worldbookFallbackAutoTag) {
       diagnostic('runForFloor:skip', { floor, reason: 'worldbook-no-image-block' });
       return;
     }

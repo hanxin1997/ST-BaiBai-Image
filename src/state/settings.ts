@@ -785,6 +785,11 @@ export interface AutoTagSettings {
   worldbookAutoRegister: boolean;
   /** 世界书生图更新已有角色(默认关,避免临时状态写进长期外貌)。 */
   worldbookUpdateExisting: boolean;
+  /**
+   * 世界书生图没出格式时自动转自动 tag(默认关)。
+   * 覆盖两种情况:主 LLM 没写 image###、写了但格式读不出——都改走副 API 生成 tag。
+   */
+  worldbookFallbackAutoTag: boolean;
   /** 可编辑提示词集(破限/后端规范/思维链);空串 = 回落内置默认。 */
   prompts: AutoTagPrompts;
   /**
@@ -2106,6 +2111,7 @@ function defaults(): ImageSettings {
       charLibraryEntryName: '角色固定外貌库',
       worldbookAutoRegister: true,
       worldbookUpdateExisting: false,
+      worldbookFallbackAutoTag: false,
       prompts: {
         jailbreak: '',
         naiSpec: '',
@@ -3438,6 +3444,10 @@ function normalize(raw: unknown): ImageSettings {
       typeof rt.worldbookUpdateExisting === 'boolean'
         ? rt.worldbookUpdateExisting
         : d.autoTag.worldbookUpdateExisting,
+    worldbookFallbackAutoTag:
+      typeof rt.worldbookFallbackAutoTag === 'boolean'
+        ? rt.worldbookFallbackAutoTag
+        : d.autoTag.worldbookFallbackAutoTag,
     // 可编辑提示词集:逐字段兜底;旧版 jailbreakPrompt 字段迁移进 prompts.jailbreak
     prompts: (() => {
       const rp = (rt.prompts ?? {}) as Partial<AutoTagPrompts>;
