@@ -373,6 +373,10 @@ export interface NaiPlan extends SizePair {
   previewPrompt: string;
   /** 预览图路径(user/images/柏宝绘_NAI方案/<id>.jpg);只当方案封面,不进图库。 */
   previewPath?: string;
+  /** 方案级正面质量词;空 = 回落画师串/渠道/官方。 */
+  qualityTags: string;
+  /** 方案级负面提示词;空 = 回落画师串/渠道/官方。 */
+  undesiredContent: string;
 }
 
 /**
@@ -2025,6 +2029,8 @@ export function newNaiPlan(name = '方案 1'): NaiPlan {
     naturalLanguage: true,
     orientationLock: 'auto',
     previewPrompt: '1girl, portrait, soft light, detailed face, upper body',
+    qualityTags: '',
+    undesiredContent: '',
     portraitSize: '832×1216',
     landscapeSize: '1216×832',
   };
@@ -2395,8 +2401,8 @@ export function effectiveNai(
     key: endpoint.key,
     model: plan.model,
     artist: findNaiArtist(conn, plan.artistId),
-    qualityTags: conn.qualityTags,
-    undesiredContent: conn.undesiredContent,
+    qualityTags: plan.qualityTags || conn.qualityTags,
+    undesiredContent: plan.undesiredContent || conn.undesiredContent,
     sampler: plan.sampler,
     steps: plan.steps,
     scale: plan.scale,
@@ -3031,6 +3037,8 @@ function normalizeNaiPlan(
     orientationLock: normalizeOrientationLock(o.orientationLock),
     previewPrompt: text(o.previewPrompt, fallback.previewPrompt),
     previewPath: typeof o.previewPath === 'string' && o.previewPath ? o.previewPath : undefined,
+    qualityTags: text(o.qualityTags, fallback.qualityTags),
+    undesiredContent: text(o.undesiredContent, fallback.undesiredContent),
     portraitSize: size(o.portraitSize, fallback.portraitSize),
     landscapeSize: size(o.landscapeSize, fallback.landscapeSize),
   };
@@ -3068,6 +3076,10 @@ function foldLegacyNaiPlan(
   plan.vibeIds = vibes.filter(vibe => vibe.enabled).map(vibe => vibe.id);
   plan.naturalLanguage = typeof o.naturalLanguage === 'boolean' ? o.naturalLanguage : plan.naturalLanguage;
   plan.orientationLock = normalizeOrientationLock(o.orientationLock);
+  // 老渠道级的质量词/负面词直接折进方案:面板不再有「提示词」区,统一在方案里改。
+  plan.qualityTags = typeof o.qualityTags === 'string' ? o.qualityTags : plan.qualityTags;
+  plan.undesiredContent =
+    typeof o.undesiredContent === 'string' ? o.undesiredContent : plan.undesiredContent;
   plan.portraitSize =
     typeof o.portraitSize === 'string' && o.portraitSize ? o.portraitSize : plan.portraitSize;
   plan.landscapeSize =
