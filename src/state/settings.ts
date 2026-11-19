@@ -369,6 +369,10 @@ export interface NaiPlan extends SizePair {
   naturalLanguage: boolean;
   /** 画幅锁;语义见 size.ts 的 OrientationLock。 */
   orientationLock: OrientationLock;
+  /** 预览图生成用的示例提示词(Scene 串,不含画师串/质量词)。 */
+  previewPrompt: string;
+  /** 预览图路径(user/images/柏宝绘_NAI方案/<id>.jpg);只当方案封面,不进图库。 */
+  previewPath?: string;
 }
 
 /**
@@ -2020,6 +2024,7 @@ export function newNaiPlan(name = '方案 1'): NaiPlan {
     vibeIds: [],
     naturalLanguage: true,
     orientationLock: 'auto',
+    previewPrompt: '1girl, portrait, soft light, detailed face, upper body',
     portraitSize: '832×1216',
     landscapeSize: '1216×832',
   };
@@ -2375,8 +2380,10 @@ export function setActiveNaiPlan(planId: string, conn: NaiSettings = settings.na
  * 一次请求要用的全部参数:方案 + 解开的接入点/画师串/vibe 引用。
  * backends/nai.ts 只吃这个形状,不认识「方案」这个概念。
  */
-export function effectiveNai(conn: NaiSettings = settings.nai): NaiRunConfig {
-  const plan = activeNaiPlan(conn);
+export function effectiveNai(
+  conn: NaiSettings = settings.nai,
+  plan: NaiPlan = activeNaiPlan(conn),
+): NaiRunConfig {
   const endpoint =
     conn.endpoints.find(e => e.id === plan.endpointId) ??
     conn.endpoints[0] ??
@@ -3022,6 +3029,8 @@ function normalizeNaiPlan(
       : [],
     naturalLanguage: typeof o.naturalLanguage === 'boolean' ? o.naturalLanguage : fallback.naturalLanguage,
     orientationLock: normalizeOrientationLock(o.orientationLock),
+    previewPrompt: text(o.previewPrompt, fallback.previewPrompt),
+    previewPath: typeof o.previewPath === 'string' && o.previewPath ? o.previewPath : undefined,
     portraitSize: size(o.portraitSize, fallback.portraitSize),
     landscapeSize: size(o.landscapeSize, fallback.landscapeSize),
   };

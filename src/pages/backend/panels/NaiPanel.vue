@@ -14,12 +14,14 @@ import {
   buildNaiv4vibe,
   BUILTIN_NAI_ARTISTS,
   encodeVibeImage,
+  generateNaiImage,
   isBuiltinNaiArtist,
   isNai45,
   isNai5,
   naiDefaultQualityTags,
   naiDefaultUndesired,
   naiFixedSettings,
+  naiRandomSeed,
   naiSamplers,
   naiSupportsVibes,
   NAI_NOISE_SCHEDULES,
@@ -38,9 +40,10 @@ import {
 } from '@/backends/vibeStore';
 import { applyArtistVibeState } from '@/backends/naiArtistLib';
 import NaiArtistLibrary from '@/pages/backend/panels/NaiArtistLibrary.vue';
+import { artistPreviewSrc, bumpArtistPreview } from '@/pages/backend/panels/artistPreview';
 import { acquireNaiSlot } from '@/floor/genQueue';
-import { makeJpegThumbnail } from '@/st/imageFile';
-import { deleteUserImage } from '@/st/images';
+import { makeJpegThumbnail, readFileAsDataUrl } from '@/st/imageFile';
+import { deleteUserImage, NAI_PLAN_PREVIEW_FOLDER, uploadUserImage } from '@/st/images';
 import {
   groupKey,
   groupVibes,
@@ -62,6 +65,7 @@ import {
   activeNaiArtist,
   activeNaiEndpoint,
   activeNaiPlan,
+  effectiveNai,
   newNaiArtist,
   newNaiEndpoint,
   newNaiPlan,
@@ -350,6 +354,7 @@ function duplicatePlan(source: NaiPlan) {
     name: `${source.name} 副本`,
     vibeIds: [...source.vibeIds],
   };
+  delete copy.previewPath; // 预览图不随副本走,避免两条目共指一个文件
   const index = conn.value.plans.findIndex(p => p.id === source.id);
   conn.value.plans.splice(index + 1, 0, copy);
   setActiveNaiPlan(copy.id, conn.value);
@@ -357,19 +362,141 @@ function duplicatePlan(source: NaiPlan) {
   toastr.success(`已复制为「${copy.name}」`, '出图方案');
 }
 
-function deletePlan(target: NaiPlan) {
+async function deletePlan(target: NaiPlan) {
   if (conn.value.plans.length <= 1) return;
   const index = conn.value.plans.findIndex(p => p.id === target.id);
   conn.value.plans.splice(index, 1);
   const next = conn.value.plans[Math.min(index, conn.value.plans.length - 1)];
   setActiveNaiPlan(next.id, conn.value);
   applyPlanVibes(next);
+  if (target.previewPath) {
+    try {
+      await deleteUserImage(target.previewPath);
+    } catch (error) {
+      toastr.warning(`方案已删除,但预览图文件清理失败：${errorMessage(error)}`, '出图方案');
+    }
+  }
   toastr.success(`已删除「${target.name}」`, '出图方案');
 }
 
 /** 用户手动勾选 vibe 时同步进当前方案:方案记住「叠加哪几张」,切走再切回来还在。 */
 function syncPlanVibes() {
   plan.value.vibeIds = conn.value.vibes.filter(vibe => vibe.enabled).map(vibe => vibe.id);
+}
+
+/* ============ 方案预览图:用当前方案真实出一张 ============ */
+
+const planPreviewBusy = ref<string | null>(null);
+const planPreviewAbort = ref<AbortController | null>(null);
+const planPreviewFileInput = ref<HTMLInputElement | null>(null);
+let planPreviewTarget: NaiPlan | null = null;
+
+function planPreviewBase64(url: string): Promise<string> {
+  return (url.startsWith('data:')
+    ? Promise.resolve(url)
+    : fetch(url)
+        .then(response => response.blob())
+        .then(
+          blob =>
+            new Promise<string>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(String(reader.result ?? ''));
+              reader.onerror = () => reject(reader.error ?? new Error('读取图片失败'));
+              reader.readAsDataURL(blob);
+            }),
+        )
+  ).then(dataUrl => makeJpegThumbnail(dataUrl, 512, 0.85));
+}
+
+async function generatePlanPreview(target: NaiPlan): Promise<void> {
+  if (planPreviewBusy.value) return;
+  if (!conn.value.key.trim()) {
+    toastr.error('请先填写 NAI API Key', '出图方案');
+    return;
+  }
+  if (!target.previewPrompt.trim()) {
+    toastr.error('请先填写示例提示词', '出图方案');
+    return;
+  }
+  planPreviewBusy.value = target.id;
+  const controller = new AbortController();
+  planPreviewAbort.value = controller;
+  let release: (() => void) | null = null;
+  let resultUrl = '';
+  try {
+    release = await acquireNaiSlot(controller.signal, activeNaiEndpoint(conn.value).id);
+    const output = await generateNaiImage(
+      effectiveNai(conn.value, target),
+      {
+        prompt: target.previewPrompt,
+        nl: '',
+        characters: [],
+        seed: target.seed > 0 ? target.seed : naiRandomSeed(),
+        size: target.orientationLock === 'auto' ? 'portrait' : target.orientationLock,
+      },
+      controller.signal,
+    );
+    resultUrl = output.result.url;
+    const jpeg = await planPreviewBase64(resultUrl);
+    target.previewPath = await uploadUserImage(
+      NAI_PLAN_PREVIEW_FOLDER,
+      target.id,
+      jpeg.split(',')[1] ?? '',
+      'jpg',
+    );
+    bumpArtistPreview(target.id);
+    toastr.success(`「${target.name}」预览图已更新`, '出图方案');
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      toastr.info('已取消生成预览图', '出图方案');
+    } else {
+      toastr.error(errorMessage(error), '生成预览图失败');
+    }
+  } finally {
+    if (resultUrl) URL.revokeObjectURL(resultUrl);
+    planPreviewBusy.value = null;
+    planPreviewAbort.value = null;
+    release?.();
+  }
+}
+
+function pickPlanPreview(target: NaiPlan): void {
+  if (planPreviewBusy.value) return;
+  planPreviewTarget = target;
+  planPreviewFileInput.value?.click();
+}
+
+async function onPlanPreviewFileChange(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  const target = planPreviewTarget;
+  planPreviewTarget = null;
+  if (!file || !target) return;
+  try {
+    const dataUrl = await readFileAsDataUrl(file);
+    const jpeg = await makeJpegThumbnail(dataUrl, 512, 0.85);
+    target.previewPath = await uploadUserImage(
+      NAI_PLAN_PREVIEW_FOLDER,
+      target.id,
+      jpeg.split(',')[1] ?? '',
+      'jpg',
+    );
+    bumpArtistPreview(target.id);
+  } catch (error) {
+    toastr.error(errorMessage(error), '预览图上传失败');
+  }
+}
+
+async function removePlanPreview(target: NaiPlan): Promise<void> {
+  const path = target.previewPath;
+  if (!path) return;
+  target.previewPath = undefined;
+  try {
+    await deleteUserImage(path);
+  } catch (error) {
+    toastr.warning(`预览图引用已移除,但文件清理失败：${errorMessage(error)}`, '出图方案');
+  }
 }
 
 /** 当前选中的是内置配方:只读(改名/删除/内容编辑禁用),「复制」是自定义的唯一入口。 */
@@ -1342,6 +1469,16 @@ async function removeVibe(vibe: NaiVibe) {
             @click="planId = p.id"
           >
             <span class="plan-dot" aria-hidden="true" />
+            <span class="plan-thumb" aria-hidden="true">
+              <img
+                v-if="p.previewPath"
+                :src="artistPreviewSrc(p)"
+                alt=""
+                loading="lazy"
+                decoding="async"
+              />
+              <Icon v-else name="palette" :size="12" />
+            </span>
             <input class="bbi-input plan-name" v-model="p.name" @click.stop />
             <span class="plan-meta">{{ p.model }} · {{ p.portraitSize }}</span>
             <button class="bbi-icon-btn" type="button" title="复制方案" @click.stop="duplicatePlan(p)">
@@ -1360,6 +1497,77 @@ async function removeVibe(vibe: NaiVibe) {
           <button class="bbi-btn bbi-btn-sm" type="button" @click="addPlan">
             <Icon name="plus" :size="12" /> 新建方案
           </button>
+        </div>
+
+        <!-- 方案预览图:用当前方案真实出一张,出图后也会自动取一张当封面 -->
+        <div class="plan-preview">
+          <div class="plan-preview-head">
+            <span class="bbi-field-label">方案预览图</span>
+            <span class="plan-preview-hint">用当前方案的模型/画师串/Vibe/参数出一张示例图</span>
+          </div>
+          <div class="plan-preview-body">
+            <img
+              v-if="plan.previewPath"
+              class="plan-preview-img"
+              :src="artistPreviewSrc(plan)"
+              :alt="plan.name"
+            />
+            <div v-else class="plan-preview-img plan-preview-img--empty">
+              <Icon name="palette" :size="20" />
+            </div>
+            <div class="plan-preview-ops">
+              <BbiTextarea
+                v-model="plan.previewPrompt"
+                :rows="2"
+                :max-rows="4"
+                mono
+                placeholder="示例提示词"
+              />
+              <div class="plan-preview-btns">
+                <button
+                  class="bbi-btn bbi-btn-sm"
+                  type="button"
+                  :disabled="!!planPreviewBusy"
+                  @click="generatePlanPreview(plan)"
+                >
+                  <Icon name="generate" :size="12" />
+                  {{ planPreviewBusy === plan.id ? '生成中…' : '生成预览图' }}
+                </button>
+                <button
+                  v-if="planPreviewBusy === plan.id"
+                  class="bbi-btn bbi-btn-sm"
+                  type="button"
+                  @click="planPreviewAbort?.abort()"
+                >
+                  取消
+                </button>
+                <button
+                  class="bbi-btn bbi-btn-sm"
+                  type="button"
+                  :disabled="!!planPreviewBusy"
+                  @click="pickPlanPreview(plan)"
+                >
+                  <Icon name="upload" :size="12" /> 上传
+                </button>
+                <button
+                  v-if="plan.previewPath"
+                  class="bbi-btn bbi-btn-sm bbi-btn-danger"
+                  type="button"
+                  :disabled="!!planPreviewBusy"
+                  @click="removePlanPreview(plan)"
+                >
+                  移除
+                </button>
+              </div>
+            </div>
+          </div>
+          <input
+            ref="planPreviewFileInput"
+            type="file"
+            accept="image/*"
+            hidden
+            @change="onPlanPreviewFileChange"
+          />
         </div>
 
         <!-- 语义配对紧凑行:双字段行两列、数字参数行四列;说明统一收进行下的一行 hint -->
@@ -1980,6 +2188,81 @@ async function removeVibe(vibe: NaiVibe) {
   flex-direction: column;
   gap: 4px;
   margin-bottom: 14px;
+}
+
+.plan-thumb {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-surface-2);
+  overflow: hidden;
+  color: var(--bbi-ink-soft);
+}
+
+.plan-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.plan-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.plan-preview-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.plan-preview-hint {
+  font-size: 11px;
+  color: var(--bbi-ink-soft);
+}
+
+.plan-preview-body {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.plan-preview-img {
+  width: 132px;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: var(--bbi-radius);
+  border: 1px solid var(--bbi-line);
+  background: var(--bbi-surface-2);
+}
+
+.plan-preview-img--empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--bbi-ink-soft);
+}
+
+.plan-preview-ops {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.plan-preview-btns {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .plan-row {

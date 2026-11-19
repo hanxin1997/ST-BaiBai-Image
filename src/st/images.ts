@@ -30,6 +30,12 @@ export const ARTIST_PREVIEW_FOLDER = '柏宝绘_画师串';
  */
 export const LATENT_PROFILE_PREVIEW_FOLDER = '柏宝绘_Latent配置';
 
+/**
+ * NAI 出图方案预览图的固定子目录(user/images 下)。
+ * 与画师串/Latent 配置预览同口径:只当方案封面,不进图库/历史,删方案时连带删文件。
+ */
+export const NAI_PLAN_PREVIEW_FOLDER = '柏宝绘_NAI方案';
+
 async function postImage(
   endpoint: string,
   body: Record<string, unknown>,
