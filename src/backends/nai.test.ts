@@ -229,19 +229,25 @@ describe('配方绑定正/负面词(解析链:配方 → 渠道 → 官方)', ()
   const withPreset = (extra: Partial<NaiArtistPreset>, rest: Partial<NaiRunConfig> = {}) =>
     nai({ artist: preset(extra), ...rest });
 
-  it('配方绑定的质量词/负面词优先于渠道覆盖值与官方词', () => {
+  it('方案值优先于画师串绑定值', () => {
     const s = withPreset(
       { quality: 'recipe quality', negative: 'recipe negative' },
       { qualityTags: 'channel quality', undesiredContent: 'channel negative' },
     );
+    expect(fullPositivePrompt(s, '1girl')).toBe('artist:a, 1girl, channel quality');
+    expect(fullNegativePrompt(s)).toBe('channel negative');
+  });
+
+  it('方案留空 → 回退画师串绑定值', () => {
+    const s = withPreset({ quality: 'recipe quality', negative: 'recipe negative' }, {});
     expect(fullPositivePrompt(s, '1girl')).toBe('artist:a, 1girl, recipe quality');
     expect(fullNegativePrompt(s)).toBe('recipe negative');
   });
 
-  it('配方字段留空 → 跟随渠道覆盖值', () => {
-    const s = withPreset({}, { qualityTags: 'channel quality', undesiredContent: 'channel negative' });
-    expect(fullPositivePrompt(s, '1girl')).toBe('artist:a, 1girl, channel quality');
-    expect(fullNegativePrompt(s)).toBe('channel negative');
+  it('方案与画师串都留空 → 跟随官方词', () => {
+    const s = withPreset({}, {});
+    expect(fullPositivePrompt(s, '1girl')).toBe('artist:a, 1girl, location, very aesthetic, masterpiece, no text');
+    expect(fullNegativePrompt(s)).toBe(naiDefaultUndesired('nai-diffusion-4-5-full'));
   });
 
   it('配方与渠道都留空 → 模型官方词(与本功能上线前逐字节一致)', () => {

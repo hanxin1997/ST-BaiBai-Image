@@ -394,9 +394,9 @@ export interface NaiRunConfig extends SizePair {
   model: NaiModel;
   /** 本方案的画师串;未选 / 悬空 = null。 */
   artist: NaiArtistPreset | null;
-  /** 渠道级正面质量词覆盖值;画师串绑定值优先。 */
+  /** 方案级正面质量词;空 = 回落画师串/官方。 */
   qualityTags: string;
-  /** 渠道级负面提示词覆盖值;画师串绑定值优先。 */
+  /** 方案级负面提示词;空 = 回落画师串/官方。 */
   undesiredContent: string;
   sampler: string;
   steps: number;
@@ -2401,8 +2401,8 @@ export function effectiveNai(
     key: endpoint.key,
     model: plan.model,
     artist: findNaiArtist(conn, plan.artistId),
-    qualityTags: plan.qualityTags || conn.qualityTags,
-    undesiredContent: plan.undesiredContent || conn.undesiredContent,
+    qualityTags: plan.qualityTags,
+    undesiredContent: plan.undesiredContent,
     sampler: plan.sampler,
     steps: plan.steps,
     scale: plan.scale,

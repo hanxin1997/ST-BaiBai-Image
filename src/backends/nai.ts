@@ -363,22 +363,24 @@ export function naiArtistPrompt(nai: NaiRunConfig): string {
 }
 
 /**
- * 正面质量词解析链:配方绑定值 → 渠道覆盖值(qualityTags)→ 内置默认。
- * 任一级空串(或纯空白)= 跟随下一级。内置默认当前 = 模型官方词;
- * 以后插件要换成自己的精选默认,只改 naiDefaultQualityTags,链结构不变。
+ * 正面质量词解析链:**方案值 → 画师串绑定值 → 模型官方词**。
+ * 方案里写了就用方案的;方案留空才回退画师串,再回退官方词。
  */
 export function naiQualityTags(nai: NaiRunConfig): string {
-  const bound = naiActivePreset(nai)?.quality.trim();
-  return bound || nai.qualityTags.trim() || naiDefaultQualityTags(nai.model);
+  const plan = nai.qualityTags.trim();
+  if (plan) return plan;
+  return naiActivePreset(nai)?.quality.trim() || naiDefaultQualityTags(nai.model);
 }
 
-/** 负面提示词解析链:配方绑定值 → 渠道覆盖值(undesiredContent)→ 内置默认(模型官方负面词)。 */
+/**
+ * 负面提示词解析链:**方案值 → 画师串绑定值 → 模型官方词**。
+ * Medium 档的负面词由官方固定:无视方案与画师串,发出去的就是官方 Heavy 原文。
+ */
 export function naiUndesiredContent(nai: NaiRunConfig): string {
-  // Medium 档的负面词由官方固定:无视画师串与渠道覆盖,发出去的就是官方 Heavy 原文。
-  // 画师串里自填过的负面词仍保留着,换回其它模型照常生效。
   if (naiFixedSettings(nai.model)) return naiDefaultUndesired(nai.model);
-  const bound = naiActivePreset(nai)?.negative.trim();
-  return bound || nai.undesiredContent.trim() || naiDefaultUndesired(nai.model);
+  const plan = nai.undesiredContent.trim();
+  if (plan) return plan;
+  return naiActivePreset(nai)?.negative.trim() || naiDefaultUndesired(nai.model);
 }
 
 /**
