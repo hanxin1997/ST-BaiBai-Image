@@ -5,8 +5,14 @@ import { deleteUploadedFile, uploadBase64File } from '@/floor/upload';
 import type { GenerationMeta } from '@/generationMeta';
 import { getContext, type STContext, type STMessage } from '@/st/context';
 import { makeJpegThumbnail } from '@/st/imageFile';
-import { deleteUserImage, LATENT_PROFILE_PREVIEW_FOLDER, NAI_PLAN_PREVIEW_FOLDER, uploadUserImage } from '@/st/images';
-import { activeLatentApiProfile, activeNaiPlan, settings } from '@/state/settings';
+import {
+  ARTIST_PREVIEW_FOLDER,
+  deleteUserImage,
+  LATENT_PROFILE_PREVIEW_FOLDER,
+  NAI_PLAN_PREVIEW_FOLDER,
+  uploadUserImage,
+} from '@/st/images';
+import { activeLatentApiProfile, activeNaiArtist, activeNaiPlan, settings } from '@/state/settings';
 
 /**
  * 楼层卡片结果存储层（DESIGN-FLOOR-UI.md §7）。
@@ -419,7 +425,10 @@ async function maybeSavePlanPreview(
   if (meta?.backend !== 'latentapi' && meta?.backend !== 'nai') return;
   const isLatent = meta.backend === 'latentapi';
   const target = isLatent ? activeLatentApiProfile() : activeNaiPlan();
-  if (target.previewPath) return;
+  const artist = isLatent ? null : activeNaiArtist();
+  const needPlan = !target.previewPath;
+  const needArtist = !!artist && !artist.previewPath;
+  if (!needPlan && !needArtist) return;
   const folder = isLatent ? LATENT_PROFILE_PREVIEW_FOLDER : NAI_PLAN_PREVIEW_FOLDER;
   try {
     const dataUrl = result.url.startsWith('data:')
@@ -437,9 +446,15 @@ async function maybeSavePlanPreview(
           );
     const jpeg = await makeJpegThumbnail(dataUrl, 512, 0.85);
     const base64 = jpeg.split(',')[1] ?? '';
-    target.previewPath = await uploadUserImage(folder, target.id, base64, 'jpg');
+    if (needPlan) {
+      target.previewPath = await uploadUserImage(folder, target.id, base64, 'jpg');
+    }
+    // 同一张图顺手补画师串封面:方案引用了画师串且它还没有图时。
+    if (needArtist && artist) {
+      artist.previewPath = await uploadUserImage(ARTIST_PREVIEW_FOLDER, artist.id, base64, 'jpg');
+    }
   } catch (error) {
-    console.warn('[柏宝绘] 自动保存方案封面失败（不影响出图）', error);
+    console.warn('[柏宝绘] 自动保存方案/画师串封面失败（不影响出图）', error);
   }
 }
 

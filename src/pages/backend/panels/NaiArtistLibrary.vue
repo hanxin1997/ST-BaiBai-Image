@@ -8,7 +8,8 @@ import {
   snapshotNaiPresetParams,
 } from '@/backends/naiArtistLib';
 import { buildPresetExportFile, importPresetFile } from '@/backends/naiPresetFile';
-import { BUILTIN_NAI_ARTISTS } from '@/backends/nai';
+import { BUILTIN_NAI_ARTISTS, generateNaiImage, naiRandomSeed } from '@/backends/nai';
+import { acquireNaiSlot } from '@/floor/genQueue';
 import BbiTextarea from '@/components/BbiTextarea.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
@@ -17,7 +18,7 @@ import ArtistTile from '@/pages/backend/panels/ArtistTile.vue';
 import { artistPreviewSrc, bumpArtistPreview, bumpArtistPreviews } from '@/pages/backend/panels/artistPreview';
 import { makeJpegThumbnail, readFileAsDataUrl } from '@/st/imageFile';
 import { ARTIST_PREVIEW_FOLDER, deleteUserImage, uploadUserImage } from '@/st/images';
-import { newNaiArtist, activeNaiPlan, settings, type NaiArtistPreset } from '@/state/settings';
+import { newNaiArtist, activeNaiPlan, effectiveNai, settings, type NaiArtistPreset } from '@/state/settings';
 
 /**
  * 画师串库(NAI 面板「画师串库」折叠区里就地展开,不再隔一层「管理」窗口)。
@@ -265,6 +266,83 @@ async function onPreviewFileChange(event: Event) {
     toastr.error(errorMessage(error), '预览图上传失败');
   } finally {
     uploadingId.value = null;
+  }
+}
+
+/** 生成预览图:用当前方案的模型/参数 + 这条画师串真实出一张。 */
+const generatingId = ref<string | null>(null);
+const generateAbort = ref<AbortController | null>(null);
+
+function previewBase64(url: string): Promise<string> {
+  return (url.startsWith('data:')
+    ? Promise.resolve(url)
+    : fetch(url)
+        .then(response => response.blob())
+        .then(
+          blob =>
+            new Promise<string>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(String(reader.result ?? ''));
+              reader.onerror = () => reject(reader.error ?? new Error('读取图片失败'));
+              reader.readAsDataURL(blob);
+            }),
+        )
+  ).then(dataUrl => makeJpegThumbnail(dataUrl, 512, 0.85));
+}
+
+async function generatePreview(preset: NaiArtistPreset): Promise<void> {
+  if (generatingId.value) return;
+  const conn = settings.nai;
+  if (!conn.key.trim()) {
+    toastr.error('请先填写 NAI API Key', '画师串');
+    return;
+  }
+  const plan = activeNaiPlan(conn);
+  const prompt = plan.previewPrompt.trim();
+  if (!prompt) {
+    toastr.error('当前方案没有示例提示词，请先在方案里填', '画师串');
+    return;
+  }
+  generatingId.value = preset.id;
+  const controller = new AbortController();
+  generateAbort.value = controller;
+  let release: (() => void) | null = null;
+  let resultUrl = '';
+  try {
+    const run = effectiveNai(conn, { ...plan, artistId: preset.id });
+    release = await acquireNaiSlot(controller.signal, run.endpointId);
+    const output = await generateNaiImage(
+      run,
+      {
+        prompt,
+        nl: '',
+        characters: [],
+        seed: plan.seed > 0 ? plan.seed : naiRandomSeed(),
+        size: plan.orientationLock === 'auto' ? 'portrait' : plan.orientationLock,
+      },
+      controller.signal,
+    );
+    resultUrl = output.result.url;
+    const jpeg = await previewBase64(resultUrl);
+    preset.previewPath = await uploadUserImage(
+      ARTIST_PREVIEW_FOLDER,
+      preset.id,
+      jpeg.split(',')[1] ?? '',
+      'jpg',
+    );
+    bumpArtistPreview(preset.id);
+    toastr.success(`「${preset.name}」预览图已更新`, '画师串');
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      toastr.info('已取消生成预览图', '画师串');
+    } else {
+      toastr.error(errorMessage(error), '生成预览图失败');
+    }
+  } finally {
+    if (resultUrl) URL.revokeObjectURL(resultUrl);
+    generatingId.value = null;
+    generateAbort.value = null;
+    release?.();
   }
 }
 
@@ -566,6 +644,24 @@ async function onImportFileChange(event: Event) {
         <div v-if="!editItem.builtin" class="al-preview-ops">
           <span class="bbi-modal-label">预览图</span>
           <span class="al-preview-btns">
+            <button
+              class="bbi-btn bbi-btn-sm"
+              type="button"
+              :disabled="uploadingId === editItem.preset.id || generatingId === editItem.preset.id"
+              title="用当前方案的模型/参数 + 这条画师串出一张"
+              @click="generatePreview(editItem.preset)"
+            >
+              <Icon name="generate" :size="12" />
+              {{ generatingId === editItem.preset.id ? '生成中…' : '生成预览图' }}
+            </button>
+            <button
+              v-if="generatingId === editItem.preset.id"
+              class="bbi-btn bbi-btn-sm"
+              type="button"
+              @click="generateAbort?.abort()"
+            >
+              取消
+            </button>
             <button
               class="bbi-btn bbi-btn-sm"
               type="button"

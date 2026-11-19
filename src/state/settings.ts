@@ -377,6 +377,11 @@ export interface NaiPlan extends SizePair {
   qualityTags: string;
   /** 方案级负面提示词;空 = 回落画师串/渠道/官方。 */
   undesiredContent: string;
+  /**
+   * 方案级自定义画师串正文;非空时优先于 artistId 引用。
+   * 用于「不想进库、只想这套方案用一次」的画师串;空串 = 走 artistId 引用。
+   */
+  artistPrompt: string;
 }
 
 /**
@@ -2031,6 +2036,7 @@ export function newNaiPlan(name = '方案 1'): NaiPlan {
     previewPrompt: '1girl, portrait, soft light, detailed face, upper body',
     qualityTags: '',
     undesiredContent: '',
+    artistPrompt: '',
     portraitSize: '832×1216',
     landscapeSize: '1216×832',
   };
@@ -2400,7 +2406,15 @@ export function effectiveNai(
     url: endpoint.url,
     key: endpoint.key,
     model: plan.model,
-    artist: findNaiArtist(conn, plan.artistId),
+    artist: plan.artistPrompt.trim()
+      ? {
+          id: `plan_artist_${plan.id}`,
+          name: '自定义画师串',
+          prompt: plan.artistPrompt,
+          quality: '',
+          negative: '',
+        }
+      : findNaiArtist(conn, plan.artistId),
     qualityTags: plan.qualityTags,
     undesiredContent: plan.undesiredContent,
     sampler: plan.sampler,
@@ -3039,6 +3053,7 @@ function normalizeNaiPlan(
     previewPath: typeof o.previewPath === 'string' && o.previewPath ? o.previewPath : undefined,
     qualityTags: text(o.qualityTags, fallback.qualityTags),
     undesiredContent: text(o.undesiredContent, fallback.undesiredContent),
+    artistPrompt: text(o.artistPrompt, fallback.artistPrompt),
     portraitSize: size(o.portraitSize, fallback.portraitSize),
     landscapeSize: size(o.landscapeSize, fallback.landscapeSize),
   };

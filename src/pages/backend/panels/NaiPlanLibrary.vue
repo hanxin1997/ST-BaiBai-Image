@@ -45,9 +45,29 @@ const ARTIST_NONE = '';
 
 const artistOptions = computed(() => [
   { value: ARTIST_NONE, label: '不使用' },
+  { value: CUSTOM_ARTIST, label: '自定义…' },
   ...BUILTIN_NAI_ARTISTS.map(a => ({ value: a.id, label: `${a.name}(内置)` })),
   ...conn.value.artistPresets.map(a => ({ value: a.id, label: a.name || '未命名画师串' })),
 ]);
+
+const CUSTOM_ARTIST = '__custom__';
+
+/** 下拉的「自定义」是方案级 artistPrompt,不是库条目;用独立 ref 记住这个选择。 */
+const customArtist = ref(false);
+const draftArtist = computed<string>({
+  get: () => (customArtist.value ? CUSTOM_ARTIST : draft.value?.artistId ?? ARTIST_NONE),
+  set: value => {
+    if (!draft.value) return;
+    if (value === CUSTOM_ARTIST) {
+      customArtist.value = true;
+      draft.value.artistId = '';
+      return;
+    }
+    customArtist.value = false;
+    draft.value.artistId = value;
+    draft.value.artistPrompt = '';
+  },
+});
 
 function artistName(id: string): string {
   if (!id) return '不使用画师串';
@@ -119,11 +139,13 @@ const draft = ref<NaiPlan | null>(null);
 function openEdit(target: NaiPlan): void {
   editing.value = target;
   draft.value = { ...target, vibeIds: [...target.vibeIds] };
+  customArtist.value = !!target.artistPrompt.trim();
 }
 
 function cancelEdit(): void {
   editing.value = null;
   draft.value = null;
+  customArtist.value = false;
 }
 
 function saveEdit(): void {
@@ -134,6 +156,7 @@ function saveEdit(): void {
   if (target.id === activeId.value) syncNaiMirror(conn.value);
   editing.value = null;
   draft.value = null;
+  customArtist.value = false;
   toastr.success(`已保存「${target.name}」`, '出图方案');
 }
 
@@ -301,7 +324,7 @@ async function removePreview(target: NaiPlan): Promise<void> {
         <div class="npl-body">
           <div class="npl-name">{{ p.name || '未命名方案' }}</div>
           <div class="npl-meta">{{ p.model }} · {{ p.portraitSize }}</div>
-          <div class="npl-meta">{{ artistName(p.artistId) }}</div>
+          <div class="npl-meta">{{ p.artistPrompt.trim() ? '自定义画师串' : artistName(p.artistId) }}</div>
           <div class="npl-ops" @click.stop>
             <button class="bbi-btn bbi-btn-sm" type="button" @click="openEdit(p)">
               <Icon name="edit" :size="12" /> 编辑
@@ -360,7 +383,12 @@ async function removePreview(target: NaiPlan): Promise<void> {
 
         <div class="bbi-select-row">
           <span class="bbi-field-label">画师串</span>
-          <BbiSelect v-model="draft.artistId" :options="artistOptions" aria-label="方案画师串" />
+          <BbiSelect v-model="draftArtist" :options="artistOptions" aria-label="方案画师串" />
+        </div>
+
+        <div v-if="customArtist" class="bbi-modal-field">
+          <span class="bbi-modal-label">自定义画师串(只存在这套方案里,不进库)</span>
+          <BbiTextarea v-model="draft.artistPrompt" :rows="3" :max-rows="8" mono placeholder="artist:xxx, artist:yyy" />
         </div>
 
         <div class="bbi-modal-field">
