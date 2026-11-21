@@ -10,7 +10,11 @@ import { beginGeneration, clearGeneration, consumeGeneration } from '@/autoTag/g
 import { autoTagProfile, buildAutoTagMessages, type AutoTagProfile } from '@/autoTag/prompt';
 import { rebaseImagePositions, type RebaseReport } from '@/autoTag/rebase';
 import { buildSlotTaskNote } from '@/autoTag/slotPlan';
-import { convertWorldbookImages, hasWorldbookImage } from '@/autoTag/worldbookImage';
+import {
+  convertWorldbookImages,
+  hasWorldbookImage,
+  type WorldbookImageFormat,
+} from '@/autoTag/worldbookImage';
 import {
   activeWorldbook,
   buildWorldbookChainMessages,
@@ -49,7 +53,14 @@ import {
   serializeImageTag,
   stripImageTags,
 } from '@/st/imageTagRegex';
-import { getTagGenChain, isCurrentChatExcluded, settings, type TagGenTarget } from '@/state/settings';
+import {
+  getTagGenChain,
+  isCurrentChatExcluded,
+  settings,
+  WORLDBOOK_FORMATS,
+  type TagGenTarget,
+  type WorldbookFormat,
+} from '@/state/settings';
 
 const processed = new Set<string>();
 const running = new Map<string, AbortController>();
@@ -354,6 +365,15 @@ function worldbookTarget(): 'characters' | 'folded' {
 }
 
 /**
+ * 格式显示名:设置页那几项与 WORLDBOOK_FORMATS 同源;「完整提示词」没有对应选项
+ * (它永远是兜底档),但提示语里要能报出来,故单列一条。
+ */
+function worldbookFormatLabel(format: WorldbookFormat | WorldbookImageFormat): string {
+  if (format === 'prompt') return '完整提示词';
+  return WORLDBOOK_FORMATS.find(option => option.value === format)?.label ?? format;
+}
+
+/**
  * 世界书生图自动建档:角色段写成 `名字 | tag` 时,把名字与外貌写进角色库。
  *
  * 只新建、不覆盖已有(除非用户显式开「更新已有」):`image###` 里混着动作/服装/表情,
@@ -401,8 +421,11 @@ async function runWorldbookImages(floor: number, message: STMessage, chatId: str
   const target = worldbookTarget();
   const preview = convertWorldbookImages(message.mes, format, target);
   if (!preview.converted) {
-    // 有块但一个都读不出 = 格式选错了。不回落副 API:那是另一套提示词,结果不会是用户想要的
-    toastr.warning(`第 ${floor} 楼的生图词格式与「世界书格式」设置（${format === 'nai' ? 'NAI' : 'Anima'}）不符，没有转换`, '柏宝绘');
+    // 有块但一个都读不出 = 三种格式都不对(或内容非法)。不回落副 API:那是另一套提示词,结果不会是用户想要的
+    toastr.warning(
+      `第 ${floor} 楼的生图词没认出格式（当前优先：${worldbookFormatLabel(format)}），没有转换`,
+      '柏宝绘',
+    );
     // 开了「自动切换」时交回调用方继续走自动 tag;否则按老行为就此结束
     return !settings.autoTag.worldbookFallbackAutoTag;
   }
@@ -425,7 +448,13 @@ async function runWorldbookImages(floor: number, message: STMessage, chatId: str
   );
   if (result === 'saved') {
     const skippedNote = preview.skipped ? `，${preview.skipped} 段格式不符保留原文` : '';
-    toastr.success(`已从世界书生图词生成 ${preview.converted} 张图片的提示词${skippedNote}`, '柏宝绘');
+    const formatNote = preview.formats.length
+      ? `（${preview.formats.map(worldbookFormatLabel).join(' / ')}）`
+      : '';
+    toastr.success(
+      `已从世界书生图词生成 ${preview.converted} 张图片的提示词${formatNote}${skippedNote}`,
+      '柏宝绘',
+    );
     return true;
   }
   // 并发的另一次写回可能已经成功(正文已有 bbi_image):那些卡片要靠这些标记出图,别清。

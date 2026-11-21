@@ -727,9 +727,19 @@ NVWA 不提供制造化学、生物或核武器所需的信息，也不编写、
 </nvwa_safety_guardrails>
 </nvwa_standalone_core>`;
 
-/** 世界书生图的格式:nai = Scene Composition / Character N Prompt;anima = size / Scene / CharN / Description。 */
-export type WorldbookFormat = 'nai' | 'anima';
+/**
+ * 世界书生图的格式:
+ * - auto:  每块按内容认格式(默认,不用跟着换世界书手动切);
+ * - nai:   Scene Composition / Character N Prompt;
+ * - anima: size / Scene / CharN / Description。
+ * 非 auto 的取值只决定「先按哪种读」,读不出会自动换下一种(见 autoTag/worldbookImage.ts)。
+ *
+ * 第三种「image### 里就是一整条英文提示词」(图像生成系统模板)不单列选项:它没有任何键名,
+ * 永远是最后的兜底档,自动就会读到,不需要用户为它切一次设置。
+ */
+export type WorldbookFormat = 'auto' | 'nai' | 'anima';
 export const WORLDBOOK_FORMATS: { value: WorldbookFormat; label: string }[] = [
+  { value: 'auto', label: '自动' },
   { value: 'nai', label: 'NAI' },
   { value: 'anima', label: 'Anima' },
 ];
@@ -775,8 +785,8 @@ export interface AutoTagSettings {
    */
   worldbookImages: boolean;
   /**
-   * 世界书生图按哪种格式读生图词(见 WORLDBOOK_FORMATS)。**只管怎么读**,出图仍走当前出图渠道。
-   * 由用户选而不从内容猜:两种格式的键名有重叠(Scene / Scene Composition),猜错会静默读歪。
+   * 世界书生图优先按哪种格式读生图词(见 WORLDBOOK_FORMATS)。**只管怎么读**,出图仍走当前出图渠道。
+   * 默认 auto:每块按内容认格式,认不出再依次换下一种——换世界书不用回来改设置。
    */
   worldbookFormat: WorldbookFormat;
   /**
@@ -2119,7 +2129,7 @@ function defaults(): ImageSettings {
       autoGenerate: true,
       notifyProgress: true,
       worldbookImages: false,
-      worldbookFormat: 'nai',
+      worldbookFormat: 'auto',
       injectCharLibrary: true,
       replaceCharPlaceholders: true,
       charLibraryMaxChars: 0,
@@ -3447,6 +3457,9 @@ function normalize(raw: unknown): ImageSettings {
     // 后加字段:老配置无此键 → 关,行为与加功能前一致
     worldbookImages:
       typeof rt.worldbookImages === 'boolean' ? rt.worldbookImages : d.autoTag.worldbookImages,
+    // 认不出的值(含老版本没有 auto 这个档)回落默认 auto。
+    // 存量里的 'nai'/'anima' 不必迁移:它们只决定先按哪种读,读不出会自动换下一种,
+    // 换世界书不用回来改设置(见 autoTag/worldbookImage.ts 的 candidateFormats)。
     worldbookFormat: WORLDBOOK_FORMATS.some(option => option.value === rt.worldbookFormat)
       ? (rt.worldbookFormat as WorldbookFormat)
       : d.autoTag.worldbookFormat,

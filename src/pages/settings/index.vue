@@ -874,25 +874,32 @@ async function confirmUpdate() {
           打开后,没有生图词的楼不会自动生成 tag;楼层上的手动按钮照常可用。
         </p>
         <div v-if="settings.autoTag.worldbookImages" class="bbi-select-row">
-          <span class="bbi-field-label">世界书格式</span>
-          <div class="bbi-segmented" role="tablist" aria-label="世界书格式">
-            <button
-              v-for="opt in WORLDBOOK_FORMATS"
-              :key="opt.value"
-              class="bbi-seg"
-              :class="{ 'is-on': worldbookFormatSel === opt.value }"
-              type="button"
-              role="tab"
-              :aria-selected="worldbookFormatSel === opt.value"
-              @click="worldbookFormatSel = opt.value"
-            >
-              {{ opt.label }}
-            </button>
+          <span class="bbi-field-label">优先格式</span>
+          <div class="bbi-segmented-wrap">
+            <div class="bbi-segmented" role="tablist" aria-label="世界书格式">
+              <button
+                v-for="opt in WORLDBOOK_FORMATS"
+                :key="opt.value"
+                class="bbi-seg"
+                :class="{ 'is-on': worldbookFormatSel === opt.value }"
+                type="button"
+                role="tab"
+                :aria-selected="worldbookFormatSel === opt.value"
+                @click="worldbookFormatSel = opt.value"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
           </div>
         </div>
         <p v-if="settings.autoTag.worldbookImages" class="bbi-field-hint">
-          只决定按哪种格式读生图词,出图仍走当前出图渠道。NAI:Scene Composition / Character N Prompt;
-          Anima:size / Scene / CharN / Description。格式选错时生图词原样保留并提示。
+          选「自动」就按内容认格式,不用跟着换世界书手动切;选 NAI / Anima 只是让它优先按那种读,
+          读不出会自动换下一种,任何一种都不会因此失效。格式只决定怎么读生图词,出图渠道仍按当前设置。
+          NAI:Scene Composition / Character N Prompt;Anima:size / Scene / CharN / Description。
+          第三种是 <code>image###</code> 里直接写一整条英文提示词(末尾的 aspect ratio 16:9, 1344x768
+          会换算成画幅并从提示词里去掉),常配
+          <code>&lt;image&gt;&lt;imgthink&gt;…&lt;/imgthink&gt;</code> 外壳,思考块不会留在正文里——
+          它没有键名,自动就会读到,不用选。
           角色段写成 <code>名字 | tag</code> 时,世界书生图会自动建档;没有名字的段按「角色 N」处理,不建档。
         </p>
 
