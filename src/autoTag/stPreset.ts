@@ -4,7 +4,7 @@ import {
   type STPresetOrder,
   type STPresetPrompt,
 } from '@/st/context';
-import type { AutoTagSettings } from '@/state/settings';
+import type { AutoTagSettings, ImportedPreset } from '@/state/settings';
 
 /**
  * 破限词的「跟随酒馆预设」来源(只读,绝不写回酒馆)。
@@ -40,7 +40,14 @@ export interface StPresetSnapshot {
   entries: StPresetEntry[];
 }
 
-let fallbackWarned = false;
+const warnedMessages = new Set<string>();
+
+/** 同一类回退只吵一次:自动 tag 每楼都跑,不节流会把控制台刷爆。 */
+function warnOnce(message: string): void {
+  if (warnedMessages.has(message)) return;
+  warnedMessages.add(message);
+  console.warn(`[柏宝绘] ${message}`);
+}
 
 /** 取当前生效的顺序表:全局 100001 → 默认 100000 → 条目最多的非空顺序表。 */
 function pickOrder(orders: STPresetOrder[] | undefined): STPresetOrder['order'] {
@@ -127,17 +134,15 @@ function expandMacros(text: string): string {
 }
 
 /**
- * 按勾选的 identifier 取当前预设文本:只拼「勾选 ∩ 存在 ∩ 非空」的条目,
- * 顺序跟预设顺序。启用状态只作提示——用户显式勾选就尊重选择。
- * 读不到/全空返回空串,由调用方回退。
+ * 按勾选的 identifier 拼文本:只拼「勾选 ∩ 存在 ∩ 非空」的条目,顺序跟条目顺序。
+ * 启用状态只作提示——用户显式勾选就尊重选择。
+ * 实时预设与导入快照共用这一份,保证两条来源的拼接口径逐字一致。
  */
-export function resolvePresetJailbreak(identifiers: readonly string[]): string {
+function joinEntries(entries: readonly StPresetEntry[], identifiers: readonly string[]): string {
   if (!identifiers.length) return '';
-  const settings = getContext()?.chatCompletionSettings;
-  if (!settings) return '';
   const wanted = new Set(identifiers);
   const texts: string[] = [];
-  for (const entry of readPresetEntries(settings)) {
+  for (const entry of entries) {
     if (!wanted.has(entry.identifier) || !entry.content) continue;
     const text = expandMacros(entry.content).trim();
     if (text) texts.push(text);
@@ -146,7 +151,66 @@ export function resolvePresetJailbreak(identifiers: readonly string[]): string {
 }
 
 /**
- * 解析最终破限词:stPreset 有内容用预设;否则回退自定义文本,再回退内置默认。
+ * 按勾选的 identifier 取酒馆当前预设文本;读不到/全空返回空串,由调用方回退。
+ */
+export function resolvePresetJailbreak(identifiers: readonly string[]): string {
+  if (!identifiers.length) return '';
+  const settings = getContext()?.chatCompletionSettings;
+  if (!settings) return '';
+  return joinEntries(readPresetEntries(settings), identifiers);
+}
+
+/** 预设文件解析结果:显示名 + 条目(结构与实时预设的条目同构)。 */
+export interface ParsedPresetFile {
+  name: string;
+  entries: StPresetEntry[];
+}
+
+const PRESET_FILE_HINT =
+  '这不是酒馆聊天补全预设文件：缺 prompts / prompt_order。请用「聊天补全」预设的导出文件。';
+
+/**
+ * 解析一份酒馆聊天补全预设 JSON(导入用)。
+ *
+ * 吃两种形态:标准预设(`prompts` + `prompt_order`)与只有 `prompts` 的老导出。
+ * 世界书 JSON 也是 `{ entries: {...} }`,这里靠 prompts/prompt_order 明确拒收,
+ * 免得用户导错文件后得到一份「空预设」还不知道为什么。
+ * 只取文本与顺序,不保留 temperature 等采样参数——破限词只用得上文字。
+ */
+export function parsePresetFile(raw: unknown, fileName = ''): ParsedPresetFile {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(PRESET_FILE_HINT);
+  const value = raw as STChatCompletionSettings;
+  if (!Array.isArray(value.prompts) && !Array.isArray(value.prompt_order)) {
+    throw new Error(PRESET_FILE_HINT);
+  }
+  const entries = readPresetEntries(value);
+  if (!entries.length) throw new Error('文件里没有可用的提示词条目。');
+  const selfName =
+    typeof value.preset_settings_openai === 'string' ? value.preset_settings_openai.trim() : '';
+  const fileBase = fileName.replace(/\.json$/i, '').trim();
+  return { name: selfName || fileBase || '导入的预设', entries };
+}
+
+/** 从导入的预设快照里取文本;preset 不存在时 found=false,由调用方决定怎么回退。 */
+export function resolveImportedJailbreak(
+  presets: readonly ImportedPreset[] | undefined,
+  presetId: string,
+  identifiers: readonly string[],
+): { found: boolean; text: string } {
+  const preset = (presets ?? []).find(item => item.id === presetId);
+  if (!preset) return { found: false, text: '' };
+  return { found: true, text: joinEntries(preset.entries, identifiers) };
+}
+
+/**
+ * 解析最终破限词。
+ *
+ * 顺序:
+ * 1. custom 模式(或没有来源)→ 自定义文本,再回退内置默认;
+ * 2. stPreset + imported → 导入快照;快照找不到 → 回退实时当前预设;
+ * 3. stPreset + current → 实时当前预设;
+ * 4. 最后回退自定义文本 → 内置默认。
+ *
  * 与改动前的 `custom || builtin` 逐字一致——没切到预设模式的用户零变化。
  */
 export function resolveJailbreakPrompt(options: AutoTagSettings, builtin: string): string {
@@ -154,11 +218,23 @@ export function resolveJailbreakPrompt(options: AutoTagSettings, builtin: string
   const source = options.jailbreakSource;
   if (source?.mode !== 'stPreset') return custom || builtin;
 
+  if (source.presetSource === 'imported') {
+    const imported = resolveImportedJailbreak(
+      options.importedPresets,
+      source.presetId ?? '',
+      source.presetEntries ?? [],
+    );
+    if (imported.text) return imported.text;
+    if (imported.found) {
+      warnOnce('导入的预设里取不到所选的破限词条目，已回退自定义文本/内置默认');
+      return custom || builtin;
+    }
+    // 快照被删/悬空:继续往下走,用实时当前预设兜底,再不行才回落自定义
+    warnOnce('找不到导入的预设(可能已被删除)，已回退当前酒馆预设');
+  }
+
   const presetText = resolvePresetJailbreak(source.presetEntries ?? []);
   if (presetText) return presetText;
-  if (!fallbackWarned) {
-    fallbackWarned = true;
-    console.warn('[柏宝绘] 酒馆预设里取不到所选的破限词条目，已回退自定义文本/内置默认');
-  }
+  warnOnce('酒馆预设里取不到所选的破限词条目，已回退自定义文本/内置默认');
   return custom || builtin;
 }

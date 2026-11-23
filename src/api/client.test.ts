@@ -49,6 +49,8 @@ const channel: ApiChannel = {
   stream: false,
   excludeParams: [],
   reasoningEffort: '',
+  allowTools: false,
+  toolsJson: '',
 };
 const messages = [{ role: 'user' as const, content: 'hi' }];
 /** 带 usage 的响应:避免触发 token 估算分支(那需要主界面分词器) */
@@ -144,6 +146,52 @@ describe('buildRequestBody:思考强度与两条源分支', () => {
   });
 });
 
+describe('buildRequestBody:工具调用(有工具才发)', () => {
+  const msgs = [{ role: 'user' as const, content: 'hi' }];
+  const build = (over: Partial<typeof channel> = {}) =>
+    buildRequestBody({ ...channel, ...over }, msgs, 'https://api.example.com/v1', false);
+  const TOOLS = [{ type: 'function', function: { name: 'roll_dice', parameters: {} } }];
+
+  it('开关关着 → 有工具定义也不发(tool_choice 仍是 none,源仍是 openai)', () => {
+    const body = build({ allowTools: false, toolsJson: JSON.stringify(TOOLS) });
+    expect(body.chat_completion_source).toBe('openai');
+    expect(body.tool_choice).toBe('none');
+    expect(body.tools).toBeUndefined();
+  });
+
+  it('开关开着但没填工具 → 等同关闭(没工具不用)', () => {
+    const body = build({ allowTools: true, toolsJson: '  ' });
+    expect(body.chat_completion_source).toBe('openai');
+    expect(body.tool_choice).toBe('none');
+    expect(body.tools).toBeUndefined();
+  });
+
+  it('开关开着 + 工具定义 → 走 custom 源,经 include_body 透传 tools + tool_choice:auto', () => {
+    const body = build({ allowTools: true, toolsJson: JSON.stringify(TOOLS) });
+    expect(body.chat_completion_source).toBe('custom');
+    expect(body.tool_choice).toBe('auto');
+    expect(body.tools).toBeUndefined(); // 顶层不直接发:ST 白名单不保证透传
+    expect(JSON.parse(body.custom_include_body as string)).toEqual({
+      tools: TOOLS,
+      tool_choice: 'auto',
+    });
+  });
+
+  it('工具定义与思考强度并存时同走 custom 源,include_body 合并两者', () => {
+    const body = build({ allowTools: true, toolsJson: JSON.stringify(TOOLS), reasoningEffort: 'high' });
+    expect(JSON.parse(body.custom_include_body as string)).toEqual({
+      reasoning_effort: 'high',
+      tools: TOOLS,
+      tool_choice: 'auto',
+    });
+  });
+
+  it('工具定义不是 JSON 数组 → 当没有工具(静默降级,UI 保存时已校验)', () => {
+    expect(build({ allowTools: true, toolsJson: '{"a":1}' }).chat_completion_source).toBe('openai');
+    expect(build({ allowTools: true, toolsJson: 'not json' }).tool_choice).toBe('none');
+  });
+});
+
 describe('extractContent:标准响应', () => {
   it('message.content 正常提取', () => {
     const data = { choices: [{ message: { role: 'assistant', content: 'hello' } }] };
@@ -204,6 +252,36 @@ describe('extractContent:推理模型把答案塞进 reasoning', () => {
   });
 });
 
+describe('extractContent:工具调用把答案放进 tool_calls', () => {
+  it('content 为空时取 tool_calls 的 arguments,多个调用按顺序拼接', () => {
+    const data = {
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            { id: 'a', type: 'function', function: { name: 'x', arguments: '{"images":[]}' } },
+            { id: 'b', type: 'function', function: { name: 'y', arguments: '{"changes":[]}' } },
+          ],
+        },
+      }],
+    };
+    expect(extractContent(data)).toBe('{"images":[]}\n{"changes":[]}');
+  });
+
+  it('content 非空时优先 content,不混入工具参数', () => {
+    const data = {
+      choices: [{
+        message: {
+          content: '正文',
+          tool_calls: [{ function: { arguments: '{"images":[]}' } }],
+        },
+      }],
+    };
+    expect(extractContent(data)).toBe('正文');
+  });
+});
+
 describe('readSseContent:流式', () => {
   it('拼接 delta.content', async () => {
     const sse = [
@@ -235,6 +313,17 @@ describe('readSseContent:流式', () => {
       '',
     ].join('\n');
     await expect(readSseContent(sseResponse(sse))).resolves.toBe('答案!');
+  });
+
+  it('content 与 reasoning 全空时回退拼接 tool_calls 参数(按 index 累积)', async () => {
+    const sse = [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"images\\":"}}]}}]}',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"[]}"}}]}}]}',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{}"}}]}}]}',
+      'data: [DONE]',
+      '',
+    ].join('\n');
+    await expect(readSseContent(sseResponse(sse))).resolves.toBe('{"images":[]}\n{}');
   });
 });
 

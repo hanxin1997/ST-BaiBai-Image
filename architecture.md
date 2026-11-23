@@ -590,6 +590,8 @@ genState 同构(chatId|messageId|swipeId|seq),重建后按 key 认领。手动�
 | Vibe 分组 / 搜索 / 启用集合判定 | src/backends/vibeGroups.ts(纯逻辑)+ NaiPanel.vue(交互) |
 | 副 API 请求(代理/SSE/超时/测试) | src/api/client.ts |
 | 思考强度(渠道弹窗 + custom 源请求体) | src/state/settings.ts 的 `ApiChannel.reasoningEffort` + api/client.ts 的 `buildRequestBody`(UI 在 settings/index.vue) |
+| 渠道工具调用(有工具才发 tools,解析 tool_calls) | src/api/client.ts 的 `buildRequestBody` / `extractContent` / `readSseContent` + src/state/settings.ts 的 `ApiChannel.allowTools` / `toolsJson`(UI 在 settings/index.vue 渠道弹窗) |
+| 破限词来源(自定义 / 跟随酒馆当前预设 / 导入预设快照) | src/autoTag/stPreset.ts + src/state/settings.ts 的 `JailbreakSource` / `ImportedPreset`(UI 在 settings/index.vue 破限词弹窗) |
 | 跟随主 API | src/api/client.ts 的 requestViaMainApi |
 | ComfyUI 工作流 / 出图 / 通道回退 | src/backends/comfyui.ts |
 | ComfyUI 简易模式(模板组装/校验) | src/backends/comfyTemplates.ts(UI 在 ComfyUIPanel.vue) |

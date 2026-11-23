@@ -7,7 +7,12 @@ import { deleteCharLibraryWorldbook } from '@/autoTag/charLibraryWorldbook';
 import Icon from '@/components/Icon.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import { fetchModels, testChannel } from '@/api/client';
-import { readCurrentChatPreset, type StPresetSnapshot } from '@/autoTag/stPreset';
+import {
+  parsePresetFile,
+  readCurrentChatPreset,
+  type StPresetEntry,
+  type StPresetSnapshot,
+} from '@/autoTag/stPreset';
 import { parseWorldbookImport } from '@/autoTag/worldbookChain';
 import {
   ASSIGN_MAIN_API,
@@ -22,6 +27,7 @@ import {
   DEFAULT_LATENT_API_SPEC,
   DEFAULT_LATENT_API_THINKING,
   IMAGE_DISPLAY_SIZES,
+  IMPORTED_PRESET_MAX,
   SELECTABLE_BACKENDS,
   WORLDBOOK_CHAIN_MAX_BOOKS,
   WORLDBOOK_CHAIN_MAX_IMAGES,
@@ -36,6 +42,7 @@ import {
   type AutoTagPrompts,
   type BackendId,
   type ImageDisplaySize,
+  type ImportedPreset,
   type WorldbookChainBook,
   type WorldbookFormat,
 } from '@/state/settings';
@@ -338,9 +345,62 @@ const tagPromptArea = ref<InstanceType<typeof BbiTextarea> | null>(null);
 
 /* —— 破限词来源草稿:只在编辑「破限词」时使用,与文本草稿一起在「完成」时落盘 —— */
 const jailbreakModeDraft = ref<'custom' | 'stPreset'>('custom');
+/** 预设来源:跟随酒馆当前预设,还是用导入的快照。 */
+const jailbreakPresetSourceDraft = ref<'current' | 'imported'>('current');
+/** 选中导入快照的 id(仅 imported 模式有意义)。 */
+const jailbreakPresetIdDraft = ref('');
 const jailbreakEntriesDraft = ref<string[]>([]);
 /** 打开弹窗时的酒馆预设快照;null = 读不到(旧版酒馆/非浏览器环境)。 */
 const jailbreakPreset = ref<StPresetSnapshot | null>(null);
+/** 列表默认只显示可拼接/已勾选;勾上才铺全部(预设动辄上百条,全铺没法用)。 */
+const showAllJailbreakEntries = ref(false);
+const jailbreakPresetInput = ref<HTMLInputElement | null>(null);
+const confirmDeletePresetOpen = ref(false);
+
+/** 导入快照下拉项。 */
+const importedPresetOptions = computed(() =>
+  (settings.autoTag.importedPresets ?? []).map(preset => ({ value: preset.id, label: preset.name })),
+);
+const jailbreakImportedPreset = computed<ImportedPreset | null>(
+  () =>
+    (settings.autoTag.importedPresets ?? []).find(preset => preset.id === jailbreakPresetIdDraft.value) ??
+    null,
+);
+/** 当前草稿指向的条目表:导入快照 或 酒馆实时预设。 */
+const jailbreakEntries = computed<StPresetEntry[]>(() =>
+  jailbreakPresetSourceDraft.value === 'imported'
+    ? (jailbreakImportedPreset.value?.entries ?? [])
+    : (jailbreakPreset.value?.entries ?? []),
+);
+/** 可拼接 = 有正文且不是占位项。占位项/空条目勾了也发不出东西。 */
+function isSelectableEntry(entry: StPresetEntry): boolean {
+  return !!entry.content.trim() && !entry.marker;
+}
+/** 酒馆会真正发送的条目:在顺序表里且启用。默认列表只铺这一批,否则上百条糊屏。 */
+function isActiveEntry(entry: StPresetEntry): boolean {
+  return isSelectableEntry(entry) && entry.inOrder && entry.enabled;
+}
+const jailbreakUsableCount = computed(
+  () => jailbreakEntries.value.filter(entry => isActiveEntry(entry)).length,
+);
+const jailbreakVisibleEntries = computed(() =>
+  showAllJailbreakEntries.value
+    ? jailbreakEntries.value
+    : jailbreakEntries.value.filter(
+        entry => isActiveEntry(entry) || jailbreakEntriesDraft.value.includes(entry.identifier),
+      ),
+);
+/** 已选合计字符数:143 KB 的噪声锚点这类条目要能一眼看出来。 */
+const jailbreakSelectedChars = computed(() =>
+  jailbreakEntries.value
+    .filter(entry => jailbreakEntriesDraft.value.includes(entry.identifier))
+    .reduce((sum, entry) => sum + entry.content.length, 0),
+);
+const jailbreakSourceLabel = computed(() =>
+  jailbreakPresetSourceDraft.value === 'imported'
+    ? jailbreakImportedPreset.value?.name || '未选择导入的预设'
+    : jailbreakPreset.value?.presetName || '未命名预设',
+);
 
 // 该条是否已自定义(非空即视为已覆盖内置)
 function isTagPromptCustom(key: keyof AutoTagPrompts): boolean {
@@ -356,24 +416,135 @@ function tagPromptState(key: keyof AutoTagPrompts): { label: string; custom: boo
   return { label: custom ? '已自定义' : '默认', custom };
 }
 
-/** 已勾选但当前预设里不存在的 identifier:请求时会被跳过,UI 明确列出。 */
+/** 已勾选但当前来源里不存在的 identifier:请求时会被跳过,UI 明确列出。 */
 const missingJailbreakEntries = computed(() => {
-  if (!jailbreakPreset.value) return [];
-  const present = new Set(jailbreakPreset.value.entries.map(entry => entry.identifier));
+  // 读不到实时预设时不能把「全部勾选」都报成缺失——那只是没读到,不是选错了
+  if (jailbreakPresetSourceDraft.value === 'current' && !jailbreakPreset.value) return [];
+  const present = new Set(jailbreakEntries.value.map(entry => entry.identifier));
   return jailbreakEntriesDraft.value.filter(identifier => !present.has(identifier));
+});
+
+/** 勾选项里真正能拼出文本的条数:为 0 说明选错了预设,请求会回退到回退文本。 */
+const jailbreakSelectedAvailable = computed(() => {
+  const usable = new Set(
+    jailbreakEntries.value.filter(entry => isSelectableEntry(entry)).map(entry => entry.identifier),
+  );
+  return jailbreakEntriesDraft.value.filter(identifier => usable.has(identifier)).length;
 });
 
 function refreshJailbreakPreset() {
   jailbreakPreset.value = readCurrentChatPreset();
 }
 
+/**
+ * 换预设后,若已勾选项在新预设里一条都对不上,自动改勾「越狱 + NSFW」。
+ * 不这么做的话,切换来源会静默回退到回退文本——用户以为在用预设,其实没生效。
+ * 只要还有一条对得上就不动,尊重用户原来的勾选。
+ */
+function ensureJailbreakSelection() {
+  const usable = new Set(
+    jailbreakEntries.value.filter(entry => isSelectableEntry(entry)).map(entry => entry.identifier),
+  );
+  if (!usable.size) return;
+  if (jailbreakEntriesDraft.value.some(identifier => usable.has(identifier))) return;
+  jailbreakEntriesDraft.value = DEFAULT_JAILBREAK_PRESET_ENTRIES.filter(identifier =>
+    usable.has(identifier),
+  );
+}
+
+/** 导入快照下拉:换一份就顺带修勾选(见 ensureJailbreakSelection)。 */
+const jailbreakPresetIdSel = computed<string>({
+  get: () => jailbreakPresetIdDraft.value,
+  set: value => {
+    jailbreakPresetIdDraft.value = value;
+    ensureJailbreakSelection();
+  },
+});
+
 function loadJailbreakDraft() {
   const source = settings.autoTag.jailbreakSource;
   jailbreakModeDraft.value = source?.mode === 'stPreset' ? 'stPreset' : 'custom';
+  jailbreakPresetSourceDraft.value = source?.presetSource === 'imported' ? 'imported' : 'current';
+  jailbreakPresetIdDraft.value = source?.presetId ?? '';
   jailbreakEntriesDraft.value = [
     ...(source?.presetEntries ?? DEFAULT_JAILBREAK_PRESET_ENTRIES),
   ];
+  showAllJailbreakEntries.value = false;
   refreshJailbreakPreset();
+  // 选中项悬空(删过/换过设备)→ 落到第一份;一份都没有 → 回到跟随当前
+  if (jailbreakPresetSourceDraft.value === 'imported' && !jailbreakImportedPreset.value) {
+    jailbreakPresetIdDraft.value = settings.autoTag.importedPresets?.[0]?.id ?? '';
+    if (!jailbreakPresetIdDraft.value) jailbreakPresetSourceDraft.value = 'current';
+  }
+}
+
+/** 导入预设文件:同名覆盖(便于更新),不同名追加。只取文本,不保留采样参数。 */
+function onImportPresetFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data: unknown = JSON.parse(String(reader.result ?? ''));
+      const parsed = parsePresetFile(data, file.name);
+      const list = settings.autoTag.importedPresets ?? (settings.autoTag.importedPresets = []);
+      const existingIndex = list.findIndex(preset => preset.name === parsed.name);
+      if (existingIndex < 0 && list.length >= IMPORTED_PRESET_MAX) {
+        toastr.warning(`最多保存 ${IMPORTED_PRESET_MAX} 份预设，请先删除不用的`, '柏宝绘');
+        return;
+      }
+      const preset: ImportedPreset = {
+        id: existingIndex >= 0 ? list[existingIndex].id : `imp_${Date.now()}`,
+        name: parsed.name,
+        sourceFile: file.name,
+        importedAt: Date.now(),
+        entries: parsed.entries.map(entry => ({ ...entry })),
+      };
+      if (existingIndex >= 0) list.splice(existingIndex, 1, preset);
+      else list.push(preset);
+      // 导入即切到这份:用户点导入就是要用它,不用再手动切一次
+      jailbreakPresetSourceDraft.value = 'imported';
+      jailbreakPresetIdDraft.value = preset.id;
+      ensureJailbreakSelection();
+      const usable = preset.entries.filter(entry => isActiveEntry(entry)).length;
+      toastr.success(
+        `已导入「${preset.name}」：${preset.entries.length} 条，可用 ${usable} 条`,
+        '柏宝绘',
+      );
+    } catch (error) {
+      console.error('[柏宝绘] 预设导入失败', error);
+      toastr.error(error instanceof Error ? error.message : '预设文件格式无法识别', '柏宝绘');
+    }
+  };
+  reader.onerror = () => toastr.error('读取文件失败', '柏宝绘');
+  reader.readAsText(file);
+}
+
+function askDeleteImportedPreset() {
+  if (!jailbreakImportedPreset.value) return;
+  confirmDeletePresetOpen.value = true;
+}
+
+/** 删除当前选中的导入预设:删完落到第一份,一份不剩就回到「跟随当前预设」。 */
+function confirmDeleteImportedPreset() {
+  const target = jailbreakImportedPreset.value;
+  const list = settings.autoTag.importedPresets ?? [];
+  if (target) {
+    const index = list.findIndex(preset => preset.id === target.id);
+    if (index >= 0) list.splice(index, 1);
+  }
+  confirmDeletePresetOpen.value = false;
+  const next = list[0];
+  if (next) {
+    jailbreakPresetIdDraft.value = next.id;
+    ensureJailbreakSelection();
+  } else {
+    jailbreakPresetSourceDraft.value = 'current';
+    jailbreakPresetIdDraft.value = '';
+  }
+  toastr.success('已删除导入的预设', '柏宝绘');
 }
 
 function openTagPrompt(meta: TagPromptMeta) {
@@ -396,6 +567,8 @@ function saveTagPrompt() {
     settings.autoTag.jailbreakSource = {
       mode: jailbreakModeDraft.value,
       presetEntries: [...jailbreakEntriesDraft.value],
+      presetSource: jailbreakPresetSourceDraft.value,
+      presetId: jailbreakPresetIdDraft.value,
     };
   }
   closeTagPrompt();
@@ -408,6 +581,9 @@ function resetTagPromptDraft() {
   if (meta.key === 'jailbreak') {
     jailbreakModeDraft.value = 'custom';
     jailbreakEntriesDraft.value = [...DEFAULT_JAILBREAK_PRESET_ENTRIES];
+    jailbreakPresetSourceDraft.value = 'current';
+    jailbreakPresetIdDraft.value = '';
+    showAllJailbreakEntries.value = false;
   }
 }
 // 点宏标签 → 插入到文本框光标处(无焦点则追加到末尾);光标定位由组件内部处理
@@ -450,6 +626,19 @@ function closeChannel() {
 function confirmChannel() {
   const draft = editingChannel.value;
   if (draft) {
+    // 工具定义先校验:坏 JSON 会在发请求时被静默当「没有工具」,用户根本看不出问题
+    if (draft.allowTools && draft.toolsJson.trim()) {
+      try {
+        const parsed: unknown = JSON.parse(draft.toolsJson);
+        if (!Array.isArray(parsed)) throw new Error('顶层必须是数组');
+      } catch (error) {
+        toastr.error(
+          `工具定义不是合法的 tools 数组：${error instanceof Error ? error.message : String(error)}`,
+          '柏宝绘',
+        );
+        return;
+      }
+    }
     draft.timeoutSec =
       Number.isFinite(draft.timeoutSec) && draft.timeoutSec > 0
         ? Math.floor(draft.timeoutSec)
@@ -1498,6 +1687,29 @@ async function confirmUpdate() {
         </div>
         <span class="bbi-field-hint">思考强度不知道的就选 auto，DS 系推荐 max</span>
         <label class="bbi-switch-row">
+          <span class="bbi-modal-label">允许工具调用</span>
+          <input v-model="editingChannel.allowTools" type="checkbox" class="bbi-checkbox" />
+        </label>
+        <p class="bbi-field-hint">
+          默认关。关时请求固定带 tool_choice: none，防第三方 fetch 拦截器把生图 tag 改写成工具调用。
+          开了并且下面填了工具定义，才会发 tools + tool_choice: auto，并把模型返回的 tool_calls 参数当正文解析；
+          没填工具定义等同关闭——有工具用工具，没工具不用。
+        </p>
+        <label v-if="editingChannel.allowTools" class="bbi-modal-field">
+          <span class="bbi-modal-label">工具定义（OpenAI tools 数组的 JSON，可留空）</span>
+          <BbiTextarea
+            v-model="editingChannel.toolsJson"
+            class="bbi-prompt-area"
+            :rows="5"
+            :max-rows="14"
+            mono
+          />
+          <span class="bbi-field-hint">
+            例：[{"type":"function","function":{"name":"roll_dice","description":"掷骰","parameters":{"type":"object","properties":{}}}}]。
+            走 custom 源透传，不受 ST 的参数白名单限制。
+          </span>
+        </label>
+        <label class="bbi-switch-row">
           <span class="bbi-modal-label">流式传输</span>
           <input v-model="editingChannel.stream" type="checkbox" class="bbi-checkbox" />
         </label>
@@ -1581,26 +1793,98 @@ async function confirmUpdate() {
           </div>
 
           <div v-if="jailbreakModeDraft === 'stPreset'" class="bbi-jb-preset">
+            <!-- 预设来源:酒馆当前在用的那套,还是本插件导入的快照 -->
+            <div class="bbi-segmented bbi-jb-subseg" role="group" aria-label="预设来源">
+              <button
+                class="bbi-seg"
+                :class="{ 'is-on': jailbreakPresetSourceDraft === 'current' }"
+                type="button"
+                @click="jailbreakPresetSourceDraft = 'current'"
+              >
+                跟随当前预设
+              </button>
+              <button
+                class="bbi-seg"
+                :class="{ 'is-on': jailbreakPresetSourceDraft === 'imported' }"
+                type="button"
+                @click="jailbreakPresetSourceDraft = 'imported'; ensureJailbreakSelection()"
+              >
+                使用导入的预设
+              </button>
+            </div>
+
+            <template v-if="jailbreakPresetSourceDraft === 'imported'">
+              <div class="bbi-channel-bar">
+                <BbiSelect
+                  v-if="importedPresetOptions.length"
+                  v-model="jailbreakPresetIdSel"
+                  :options="importedPresetOptions"
+                  aria-label="导入的预设"
+                />
+                <span v-else class="bbi-field-hint">还没有导入的预设。</span>
+                <button
+                  class="bbi-btn bbi-btn-primary bbi-btn-sm"
+                  type="button"
+                  @click="jailbreakPresetInput?.click()"
+                >
+                  <Icon name="upload" /> 导入预设文件
+                </button>
+                <button
+                  class="bbi-btn bbi-btn-danger bbi-btn-sm"
+                  type="button"
+                  :disabled="!jailbreakImportedPreset"
+                  @click="askDeleteImportedPreset"
+                >
+                  <Icon name="trash" /> 删除
+                </button>
+              </div>
+              <input
+                ref="jailbreakPresetInput"
+                type="file"
+                accept=".json,application/json"
+                style="display: none"
+                @change="onImportPresetFile"
+              />
+              <p class="bbi-field-hint">
+                导入酒馆「聊天补全」预设的 JSON（含 prompts / prompt_order）。同名文件再次导入会整体替换，便于更新到最新版；只取文本，不保留采样参数。导入的是静态副本，酒馆里改预设不影响它。
+              </p>
+            </template>
+
             <div class="bbi-jb-preset-head">
               <span class="bbi-jb-preset-name">
-                当前预设：{{ jailbreakPreset?.presetName || '未命名预设' }}
-                <template v-if="jailbreakPreset">（{{ jailbreakPreset.entries.length }} 条）</template>
+                {{ jailbreakPresetSourceDraft === 'imported' ? '导入预设' : '当前预设' }}：{{ jailbreakSourceLabel }}
+                <template v-if="jailbreakEntries.length">
+                  （共 {{ jailbreakEntries.length }} 条 · 可用 {{ jailbreakUsableCount }} 条）
+                </template>
               </span>
-              <button class="bbi-btn bbi-btn-sm" type="button" @click="refreshJailbreakPreset">
+              <button
+                v-if="jailbreakPresetSourceDraft === 'current'"
+                class="bbi-btn bbi-btn-sm"
+                type="button"
+                @click="refreshJailbreakPreset"
+              >
                 <Icon name="refresh" /> 刷新
               </button>
             </div>
 
-            <p v-if="!jailbreakPreset" class="bbi-field-hint bbi-jb-warn">
+            <p
+              v-if="jailbreakPresetSourceDraft === 'current' && !jailbreakPreset"
+              class="bbi-field-hint bbi-jb-warn"
+            >
               读不到酒馆聊天补全预设（可能是旧版酒馆）。保存后会回退到下方文本。
             </p>
-            <template v-else>
-              <ul v-if="jailbreakPreset.entries.length" class="bbi-jb-list">
+            <template v-if="jailbreakPresetSourceDraft === 'imported' ? !!jailbreakImportedPreset : !!jailbreakPreset">
+              <label class="bbi-switch-row bbi-jb-filter">
+                <span class="bbi-field-label">显示全部条目（含占位 / 空 / 未启用）</span>
+                <input v-model="showAllJailbreakEntries" type="checkbox" class="bbi-checkbox" />
+              </label>
+
+              <ul v-if="jailbreakVisibleEntries.length" class="bbi-jb-list">
                 <li
-                  v-for="entry in jailbreakPreset.entries"
+                  v-for="entry in jailbreakVisibleEntries"
                   :key="entry.identifier"
                   class="bbi-jb-item"
-                  :class="{ 'is-off': !entry.content }"
+                  :class="{ 'is-off': !isSelectableEntry(entry) }"
                 >
                   <label class="bbi-jb-row">
                     <input
@@ -1608,13 +1892,14 @@ async function confirmUpdate() {
                       class="bbi-checkbox"
                       type="checkbox"
                       :value="entry.identifier"
-                      :disabled="!entry.content && !jailbreakEntriesDraft.includes(entry.identifier)"
+                      :disabled="!isSelectableEntry(entry) && !jailbreakEntriesDraft.includes(entry.identifier)"
                     />
                     <span class="bbi-jb-name">{{ entry.name }}</span>
                     <span class="bbi-jb-id">{{ entry.identifier }}</span>
+                    <span v-if="entry.content" class="bbi-jb-chars">{{ entry.content.length }} 字</span>
                     <span v-if="entry.marker" class="bbi-jb-badge">占位项</span>
                     <span v-else-if="!entry.inOrder" class="bbi-jb-badge">未加入顺序</span>
-                    <span v-else-if="!entry.enabled" class="bbi-jb-badge">酒馆中未启用</span>
+                    <span v-else-if="!entry.enabled" class="bbi-jb-badge">未启用</span>
                   </label>
                   <p v-if="entry.content" class="bbi-jb-preview">{{ entry.content }}</p>
                   <p v-else class="bbi-jb-preview is-empty">
@@ -1622,13 +1907,21 @@ async function confirmUpdate() {
                   </p>
                 </li>
               </ul>
-              <p v-else class="bbi-field-hint">当前预设没有可拼接的提示词条目。</p>
+              <p v-else class="bbi-field-hint">这份预设里没有可拼接的提示词条目。</p>
 
               <p v-if="missingJailbreakEntries.length" class="bbi-field-hint bbi-jb-warn">
                 已勾选但当前预设里不存在（请求时会跳过）：{{ missingJailbreakEntries.join('、') }}
               </p>
+              <p
+                v-if="jailbreakEntries.length && jailbreakEntriesDraft.length && !jailbreakSelectedAvailable"
+                class="bbi-field-hint bbi-jb-warn"
+              >
+                已勾选的条目都不在这份预设里（或没有正文），请求时会回退到下方回退文本。
+              </p>
               <p class="bbi-field-hint">
-                列表包含预设里的全部提示词条目；占位项与空内容不可勾选。勾选后按预设顺序用空行连接，启用状态只作提示。预设改动无需重开插件。
+                已选 {{ jailbreakEntriesDraft.length }} 条 · 合计 {{ jailbreakSelectedChars }} 字符<template
+                  v-if="jailbreakSelectedChars > 8000"
+                >（偏长：会显著抬高每楼输入 token）</template>。默认只列「启用且可拼接」的条目，其余收在「显示全部」里；占位项与空内容不可勾选。勾选后按预设顺序用空行连接，启用状态只作提示。
               </p>
             </template>
           </div>
@@ -1672,6 +1965,17 @@ async function confirmUpdate() {
         </footer>
       </div>
     </ModalMask>
+
+    <ConfirmDialog
+      v-model:open="confirmDeletePresetOpen"
+      title="删除导入的预设"
+      tone="danger"
+      confirm-text="删除"
+      confirm-icon="trash"
+      @confirm="confirmDeleteImportedPreset"
+    >
+      确定删除导入的预设「{{ jailbreakImportedPreset?.name ?? '' }}」吗？删除后需要重新导入才能使用。
+    </ConfirmDialog>
 
     <ConfirmDialog
       v-model:open="updateConfirmOpen"
@@ -2168,6 +2472,37 @@ async function confirmUpdate() {
 .bbi-jb-id {
   font-family: var(--bbi-font-mono);
   font-size: 11px;
+  color: var(--bbi-ink-muted);
+}
+/* 条目字符数:143 KB 的噪声锚点这类要能一眼看出来 */
+.bbi-jb-chars {
+  margin-left: auto;
+  font-family: var(--bbi-font-mono);
+  font-size: 11px;
+  color: var(--bbi-ink-muted);
+  white-space: nowrap;
+}
+.bbi-jb-chars + .bbi-jb-badge {
+  margin-left: 0;
+}
+/* 导入行的下拉 + 两个按钮:窄屏允许换行,别把删除挤出弹窗 */
+.bbi-jb-preset .bbi-channel-bar {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+/* 来源切换(跟随当前 / 导入快照):比主分段小一号,避免和「自定义/跟随预设」抢视线 */
+.bbi-jb-subseg {
+  margin-bottom: 10px;
+}
+.bbi-jb-subseg .bbi-seg {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+.bbi-jb-filter {
+  margin-bottom: 8px;
+}
+.bbi-jb-filter .bbi-field-label {
+  font-size: 12px;
   color: var(--bbi-ink-muted);
 }
 .bbi-jb-badge {

@@ -159,20 +159,41 @@ export async function requestCompletion(
 }
 
 /**
+ * 解析渠道里手填的 tools JSON;不是数组/解析失败一律当「没有工具」。
+ * 静默降级而不是抛错:工具是可选项,一份坏 JSON 不该让整条出图链路失败;
+ * 保存渠道时 UI 会先做一次校验并报错。
+ */
+export function parseToolsJson(raw: string | undefined): unknown[] {
+  const text = (raw ?? '').trim();
+  if (!text) return [];
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
  * 构造发给 ST 代理的请求体(纯函数,便于测两条分支的产物)。
  *
- * 两条分支,按渠道有没有设思考强度二选一:
+ * 三条分支:
  *
- * ① 未设(reasoningEffort 为空 = auto):走 `chat_completion_source: 'openai'`,
+ * ① 没设思考强度、也没工具:走 `chat_completion_source: 'openai'`,
  *    除下面固定的 `tool_choice` 外,与加本功能之前**逐字节一致**——存量用户零变化。
  *
- * ② 已设:走 `'custom'`。因为 ST 代理对 openai 源的 reasoning_effort 卡**模型名白名单**
+ * ② 设了思考强度:走 `'custom'`。因为 ST 代理对 openai 源的 reasoning_effort 卡**模型名白名单**
  *    (src/constants.js 的 OPENAI_REASONING_EFFORT_MODELS,精确匹配 o1/o3/gpt-5 那批),
  *    模型名对不上就静默丢弃、还照样返回 200(实测确认),用户设了却无效且看不出来。
  *    custom 源的 custom_include_body 由服务端 mergeObjectWithYaml 直接并进上游请求体,
  *    不过任何白名单,任意字段/嵌套对象都能透传。
  *
- * 两条路都仍然走 ST 服务端转发(同一个 /generate 端点),没有浏览器直连,
+ * ③ 渠道开了「允许工具调用」且 toolsJson 解析出非空数组:同样走 `'custom'`,
+ *    把 tools + tool_choice:'auto' 一起塞进 custom_include_body(顶层字段走 ST 的
+ *    白名单,不保证透传;include_body 是纯 merge,稳)。没有工具定义时**不发 tools**,
+ *    回落成 ① 的 `tool_choice:'none'`——「有工具用工具,没工具不用」。
+ *
+ * 三条路都仍然走 ST 服务端转发(同一个 /generate 端点),没有浏览器直连,
  * 因此 CORS、密钥不落浏览器、SSE 转发等性质完全不变。
  *
  * custom 源的两个坑(都已规避):
@@ -184,7 +205,7 @@ export async function requestCompletion(
  *   退回用 ST 的 Custom 密钥,可能把用户另一个服务商的 key 发到本端点。
  *   故一律用 JSON.stringify 生成(YAML 是 JSON 的超集),转义交给它,不手拼。
  *
- * 另:请求体固定带 `tool_choice: 'none'`,这是给第三方 fetch 拦截器的声明式放行握手。
+ * 另:默认请求体固定带 `tool_choice: 'none'`,这是给第三方 fetch 拦截器的声明式放行握手。
  * 酒馆助手预设脚本(如 Kemini Dramatron 面板)可能 monkey-patch `window.parent.fetch`,
  * 拦截所有 `/api/backends/…/generate` 请求并注入合成工具 + 控制消息,让模型把整段输出
  * 塞进工具调用。对生图 tag 这种「要严格 JSON 协议」的请求,它会把控制消息插进对话、
@@ -192,7 +213,7 @@ export async function requestCompletion(
  * 这类拦截器普遍支持「调用方自带 tool_choice 就放行」(Dramatron 的 callerControlsTools
  * 对 'none' 明确 bypass),所以我们主动声明不用工具。
  * 对上游无影响:ST 服务端只在 tools 为非空数组时才转发 tool_choice
- * (src/endpoints/backends/chat-completions.js),本函数从不发 tools,该字段到不了服务商。
+ * (src/endpoints/backends/chat-completions.js),默认分支从不发 tools,该字段到不了服务商。
  *
  * (与柏宝书 src/api/client.ts 的同名函数同源,行为保持一致。)
  */
@@ -203,33 +224,45 @@ export function buildRequestBody(
   stream: boolean,
 ): Record<string, unknown> {
   const effort = channel.reasoningEffort?.trim() ?? '';
+  // 只有「开了开关 + 真的给了工具」才算有工具;否则与加功能前完全一致
+  const tools = channel.allowTools === true ? parseToolsJson(channel.toolsJson) : [];
+  const withTools = tools.length > 0;
   const common = {
     model: channel.model,
     messages,
     temperature: channel.temperature ?? 1.0,
     max_tokens: channel.maxTokens ?? 65535,
     stream,
-    // 不用工具:见函数头注释,防第三方 fetch 拦截器把生图 tag 改写成工具调用
-    tool_choice: 'none',
+    // 默认不用工具:见函数头注释,防第三方 fetch 拦截器把生图 tag 改写成工具调用
+    tool_choice: withTools ? 'auto' : 'none',
     // 静默:不影响主对话状态
     presence_penalty: 0,
     frequency_penalty: 0,
   };
 
-  const body: Record<string, unknown> = effort
-    ? {
-        chat_completion_source: 'custom',
-        custom_url: reverseProxy,
-        custom_include_headers: JSON.stringify({ Authorization: `Bearer ${channel.key || ''}` }),
-        custom_include_body: JSON.stringify({ reasoning_effort: effort }),
-        ...common,
-      }
-    : {
-        chat_completion_source: 'openai',
-        reverse_proxy: reverseProxy,
-        proxy_password: channel.key || '',
-        ...common,
-      };
+  const include: Record<string, unknown> = {};
+  if (effort) include.reasoning_effort = effort;
+  if (withTools) {
+    include.tools = tools;
+    // 显式写进 include_body:顶层 tool_choice 走 ST 白名单,不保证透传
+    include.tool_choice = 'auto';
+  }
+
+  const body: Record<string, unknown> =
+    effort || withTools
+      ? {
+          chat_completion_source: 'custom',
+          custom_url: reverseProxy,
+          custom_include_headers: JSON.stringify({ Authorization: `Bearer ${channel.key || ''}` }),
+          custom_include_body: JSON.stringify(include),
+          ...common,
+        }
+      : {
+          chat_completion_source: 'openai',
+          reverse_proxy: reverseProxy,
+          proxy_password: channel.key || '',
+          ...common,
+        };
 
   // 排除参数:把用户指定的字段从 body 删掉,规避不接受这些参数的兼容端点报错。
   for (const p of channel.excludeParams ?? []) {
@@ -342,6 +375,8 @@ export async function readSseContent(resp: Response): Promise<string> {
   let buf = '';
   let out = '';
   let reasoningOut = '';
+  /** 工具调用的 arguments 按 index 累积(流式下分片到达,同一条要拼起来)。 */
+  const toolArgs = new Map<number, string>();
   for (; ;) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -364,13 +399,23 @@ export async function readSseContent(resp: Response): Promise<string> {
         const reasoningPiece =
           textOf(src?.reasoning) || textOf(src?.reasoning_content) || textOf(src?.thinking);
         if (reasoningPiece) reasoningOut += reasoningPiece;
+        for (const call of Array.isArray(src?.tool_calls) ? src.tool_calls : []) {
+          const index = typeof call?.index === 'number' ? call.index : 0;
+          const args = call?.function?.arguments;
+          if (typeof args === 'string' && args) toolArgs.set(index, (toolArgs.get(index) ?? '') + args);
+        }
       } catch (e) {
         if (e instanceof ApiError) throw e;
         // 单行解析失败忽略(可能是注释行/心跳)
       }
     }
   }
-  return out.trim() || reasoningOut.trim();
+  const toolText = [...toolArgs.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, args]) => args)
+    .join('\n')
+    .trim();
+  return out.trim() || reasoningOut.trim() || toolText;
 }
 
 /** 把可能是 string / content-parts 数组 / 其他类型的值转成文本;非字符串成分一律丢弃。 */
@@ -390,11 +435,24 @@ function textOf(value: unknown): string {
   return '';
 }
 
+/** 把 tool_calls 里的 arguments 拼成文本(多个调用按顺序用换行连接)。 */
+function toolCallsText(calls: unknown): string {
+  if (!Array.isArray(calls)) return '';
+  const parts: string[] = [];
+  for (const call of calls) {
+    const args = (call as { function?: { arguments?: unknown } } | null)?.function?.arguments;
+    if (typeof args === 'string' && args.trim()) parts.push(args.trim());
+  }
+  return parts.join('\n');
+}
+
 /**
  * 从响应体提取答案文本。
  * 标准链:message.content / choices[0].text / data.content;
+ * 开了「允许工具调用」时,模型可能把答案整段放进 tool_calls[].function.arguments,
+ * 标准链全空就取它(argument 本身通常就是我们要的那段 JSON)。
  * 推理模型(如 deepseek-v4-flash)可能把整段答案(思维链+最终 JSON)全放进
- * reasoning / reasoning_content / thinking 而 content 为空——标准链全空时回退取之,
+ * reasoning / reasoning_content / thinking 而 content 为空——最后才回退取之,
  * 混入的思维链由 parseImagePlan 的 JSON 块扫描自然剔除。
  */
 export function extractContent(data: any): string {
@@ -402,6 +460,8 @@ export function extractContent(data: any): string {
   const content =
     textOf(msg?.content) || textOf(data?.choices?.[0]?.text) || textOf(data?.content);
   if (content.trim()) return content.trim();
+  const tools = toolCallsText(msg?.tool_calls);
+  if (tools) return tools;
   return (
     textOf(msg?.reasoning) || textOf(msg?.reasoning_content) || textOf(msg?.thinking)
   ).trim();

@@ -688,11 +688,28 @@ export interface ApiChannel {
    * 用户设了却毫无效果、还看不出来。custom 源的 custom_include_body 是纯 merge,不过白名单。
    *
    * ⚠️ 跨插件:本字段是绘独有的,柏宝书 ≤ 当前版本的 normalizeChannel 是「逐字段重建对象」,
-   * 不认识的键会被丢掉。在书里**新增/编辑/删除渠道**、或**点测试渠道**(可能自动改写 url)
-   * 会触发共享存储回写,进而抹掉本字段。只开书、或在书里改摘要/提示词/排除名单则不受影响。
-   * 等书那边补上同名字段后此风险消失。
+   * 不认识的键会被丢掉。缓解:readSharedChannels 发现来件里**压根没有**这个键时,按渠道 id
+   * 把本地值补回来(见该函数注释),所以在书里点测试/改渠道不会再静默清零。
+   * 书那边补上同名字段后这层补丁就没用了,但留着无害。
    */
   reasoningEffort: string;
+  /**
+   * 允许工具调用(后加字段,默认关 = 现状逐字节不变)。
+   *
+   * 关:请求固定 `tool_choice: 'none'` 且从不发 tools——给酒馆助手类 fetch 拦截器的
+   * 放行握手,防止它把生图 tag 改写成工具调用(见 api/client.ts 的 buildRequestBody)。
+   *
+   * 开:只有在 toolsJson 解析出非空数组时才发 `tools` + `tool_choice: 'auto'`
+   * (没有工具就不发,与预设「有工具用工具、没工具不用」一致),并把模型返回的
+   * tool_calls 参数当正文解析。没填工具定义时等同关闭。
+   *
+   * ⚠️ 跨插件风险同 reasoningEffort:本字段是绘独有的,柏宝书侧 normalizeChannel
+   * 会逐字段重建对象、丢掉不认识的键。readSharedChannels 对「来件里没有这个键」的情况
+   * 按 id 回填本地值,所以在书里改渠道不会把工具配置清零。
+   */
+  allowTools: boolean;
+  /** 工具定义(OpenAI tools 数组的 JSON 文本);空串 = 没有工具,不发 tools。 */
+  toolsJson: string;
 }
 
 /**
@@ -753,10 +770,53 @@ export interface JailbreakSource {
   mode: 'custom' | 'stPreset';
   /** stPreset 模式下勾选的提示词 identifier;拼接顺序跟预设顺序,不按此数组顺序。 */
   presetEntries: string[];
+  /**
+   * stPreset 模式下的预设来源(后加字段,缺省 = current,行为与加功能前一致):
+   * - current: 实时读酒馆当前在用的聊天补全预设;
+   * - imported: 用本插件导入的预设快照(见 AutoTagSettings.importedPresets)。
+   */
+  presetSource?: 'current' | 'imported';
+  /** presetSource === 'imported' 时选中的快照 id;悬空时回退当前预设。 */
+  presetId?: string;
 }
 
 /** 新装/切到跟随预设时的默认勾选:越狱 + NSFW 两条,最贴近「破限词」的用途。 */
 export const DEFAULT_JAILBREAK_PRESET_ENTRIES = ['jailbreak', 'nsfw'];
+
+/**
+ * 导入的聊天补全预设里的一条提示词(只留拼破限词要用的字段)。
+ * 与 stPreset.ts 的 StPresetEntry 同构——那是「读酒馆实时预设」的产物,这是「读文件」的产物,
+ * 两者共用同一套勾选/拼接逻辑。
+ */
+export interface ImportedPresetEntry {
+  identifier: string;
+  name: string;
+  content: string;
+  /** 导出时酒馆里的启用状态;只作提示,勾选后仍会使用其文本。 */
+  enabled: boolean;
+  /** 是否在预设的提示词顺序表里。 */
+  inOrder: boolean;
+  /** 占位项(聊天历史/角色卡字段等),没有固定文本,不能作为破限词。 */
+  marker: boolean;
+}
+
+/** 一份导入的预设快照。静态副本:酒馆里改预设不会影响它,要更新就重新导入。 */
+export interface ImportedPreset {
+  id: string;
+  /** 显示名:预设自报的名字优先,否则取文件名。 */
+  name: string;
+  /** 导入时的文件名,便于分辨同名来源。 */
+  sourceFile: string;
+  importedAt: number;
+  entries: ImportedPresetEntry[];
+}
+
+/** 预设库上限:预设快照可能很大(单份 1.6 MB 的见过),不设限会撑爆 settings.json。 */
+export const IMPORTED_PRESET_MAX = 10;
+/** 单份预设允许的条目上限;再多也不是拿来当破限词的料。 */
+export const IMPORTED_PRESET_MAX_ENTRIES = 2000;
+/** 单份预设允许的总字符上限(约 4 MB):超了直接拒收,避免把设置文件写到同步超时。 */
+export const IMPORTED_PRESET_MAX_CHARS = 4_000_000;
 
 export interface AutoTagSettings {
   /** 新 AI 正文落地后自动请求模型。 */
@@ -821,6 +881,11 @@ export interface AutoTagSettings {
    * 选 stPreset 时才读取酒馆当前聊天补全预设;读不到自动回退 custom/内置默认。
    */
   jailbreakSource?: JailbreakSource;
+  /**
+   * 导入的聊天补全预设快照库(后加字段,缺省 = 空)。
+   * 「跟随酒馆预设」可以切到其中任意一份,不再只认酒馆当前在用的那套。
+   */
+  importedPresets?: ImportedPreset[];
 }
 
 /** 世界书链条目的**消息角色**(发给 AI 的 system/user/assistant),与角色卡里的角色无关。 */
@@ -2301,7 +2366,10 @@ function defaults(): ImageSettings {
       jailbreakSource: {
         mode: 'custom',
         presetEntries: [...DEFAULT_JAILBREAK_PRESET_ENTRIES],
+        presetSource: 'current',
+        presetId: '',
       },
+      importedPresets: [],
     },
     // 后加大类:老配置无此键 → 关、空书库,行为与加功能前完全一致。
     worldbookChain: {
@@ -2339,6 +2407,9 @@ function normalizeChannel(c: Partial<ApiChannel>): ApiChannel {
       : [],
     // 后加字段:老渠道无此键 → 空串(auto,不发参数),行为与加字段前完全一致
     reasoningEffort: typeof c.reasoningEffort === 'string' ? c.reasoningEffort.trim() : '',
+    // 后加字段:老渠道无此键 → 关(不碰工具),行为与加字段前完全一致
+    allowTools: c.allowTools === true,
+    toolsJson: typeof c.toolsJson === 'string' ? c.toolsJson : '',
   };
 }
 
@@ -2356,6 +2427,8 @@ export function newChannel(): ApiChannel {
     stream: false,
     excludeParams: [],
     reasoningEffort: '',
+    allowTools: false,
+    toolsJson: '',
   };
 }
 
@@ -3410,6 +3483,8 @@ function normalizeJailbreakSource(raw: unknown): JailbreakSource {
   const fallback: JailbreakSource = {
     mode: 'custom',
     presetEntries: [...DEFAULT_JAILBREAK_PRESET_ENTRIES],
+    presetSource: 'current',
+    presetId: '',
   };
   if (!raw || typeof raw !== 'object') return fallback;
   const value = raw as Partial<JailbreakSource>;
@@ -3426,7 +3501,79 @@ function normalizeJailbreakSource(raw: unknown): JailbreakSource {
   return {
     mode: value.mode === 'stPreset' ? 'stPreset' : 'custom',
     presetEntries,
+    presetSource: value.presetSource === 'imported' ? 'imported' : 'current',
+    presetId: typeof value.presetId === 'string' ? value.presetId.trim() : '',
   };
+}
+
+/** 单条导入条目归一化;坏行直接丢,不做「补个空条目」这种假数据。 */
+function normalizeImportedPresetEntry(raw: unknown): ImportedPresetEntry | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const value = raw as Partial<ImportedPresetEntry>;
+  const identifier = typeof value.identifier === 'string' ? value.identifier.trim() : '';
+  if (!identifier) return null;
+  return {
+    identifier,
+    name: typeof value.name === 'string' && value.name.trim() ? value.name.trim() : identifier,
+    content: typeof value.content === 'string' ? value.content : '',
+    enabled: value.enabled === true,
+    inOrder: value.inOrder === true,
+    marker: value.marker === true,
+  };
+}
+
+/**
+ * 导入预设库归一化:坏快照丢弃、条目去重、按上限截断。
+ * 上限不是洁癖——预设快照动辄 1.6 MB,不设限会把 settings.json 写到同步超时。
+ */
+function normalizeImportedPresets(raw: unknown): ImportedPreset[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ImportedPreset[] = [];
+  const seenIds = new Set<string>();
+  for (const item of raw) {
+    if (out.length >= IMPORTED_PRESET_MAX) break;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const value = item as Partial<ImportedPreset>;
+    if (!Array.isArray(value.entries)) continue;
+    const entries: ImportedPresetEntry[] = [];
+    const seen = new Set<string>();
+    let chars = 0;
+    for (const entryRaw of value.entries) {
+      if (entries.length >= IMPORTED_PRESET_MAX_ENTRIES) break;
+      const entry = normalizeImportedPresetEntry(entryRaw);
+      if (!entry || seen.has(entry.identifier)) continue;
+      seen.add(entry.identifier);
+      chars += entry.content.length;
+      if (chars > IMPORTED_PRESET_MAX_CHARS) break;
+      entries.push(entry);
+    }
+    if (!entries.length) continue;
+    const id = typeof value.id === 'string' && value.id.trim() ? value.id.trim() : `imp_${out.length + 1}`;
+    if (seenIds.has(id)) continue;
+    seenIds.add(id);
+    out.push({
+      id,
+      name:
+        typeof value.name === 'string' && value.name.trim() ? value.name.trim() : '导入的预设',
+      sourceFile: typeof value.sourceFile === 'string' ? value.sourceFile : '',
+      importedAt:
+        typeof value.importedAt === 'number' && Number.isFinite(value.importedAt)
+          ? value.importedAt
+          : 0,
+      entries,
+    });
+  }
+  return out;
+}
+
+/** 导入预设的引用修复:presetSource=imported 但 presetId 悬空时落到第一份,避免 UI 空白。 */
+function fixJailbreakPresetRef(
+  source: JailbreakSource,
+  presets: readonly ImportedPreset[],
+): JailbreakSource {
+  if (source.presetSource !== 'imported') return source;
+  if (source.presetId && presets.some(preset => preset.id === source.presetId)) return source;
+  return { ...source, presetId: presets[0]?.id ?? '' };
 }
 
 const WORLDBOOK_CHAIN_ROLES: ReadonlySet<string> = new Set(['system', 'user', 'assistant']);
@@ -3584,6 +3731,7 @@ function normalize(raw: unknown): ImageSettings {
     typeof rt.minImages === 'number' && Number.isFinite(rt.minImages)
       ? Math.min(maxImages, Math.max(0, Math.floor(rt.minImages)))
       : d.autoTag.minImages;
+  const importedPresets = normalizeImportedPresets(rt.importedPresets);
   merged.autoTag = {
     enabled: typeof rt.enabled === 'boolean' ? rt.enabled : d.autoTag.enabled,
     contextMessages:
@@ -3669,7 +3817,8 @@ function normalize(raw: unknown): ImageSettings {
         latentApiThinking: typeof rp.latentApiThinking === 'string' ? rp.latentApiThinking : '',
       };
     })(),
-    jailbreakSource: normalizeJailbreakSource(rt.jailbreakSource),
+    jailbreakSource: fixJailbreakPresetRef(normalizeJailbreakSource(rt.jailbreakSource), importedPresets),
+    importedPresets,
   };
   // 后加大类:老配置无 worldbookChain 键 → 关、空书库,行为与加功能前一致。
   merged.worldbookChain = normalizeWorldbookChain(r.worldbookChain);
@@ -3744,7 +3893,28 @@ function readSharedChannels(raw: unknown): SharedChannelsStore | null {
       typeof store.revision === 'number' && Number.isFinite(store.revision)
         ? Math.max(0, Math.floor(store.revision))
         : 0,
-    channels: store.channels.map(normalizeChannel),
+    channels: store.channels.map(rawChannel => {
+      const channel = normalizeChannel(rawChannel as Partial<ApiChannel>);
+      // 柏宝书侧不认识 reasoningEffort / allowTools / toolsJson,它回写共享存储时会把
+      // 这三个键丢掉。只要来的对象里压根没有它们,就按 id 把本地值补回来——
+      // 否则在书里点一次「测试渠道」,这边的思考强度与工具配置就被静默清零。
+      const source =
+        rawChannel && typeof rawChannel === 'object'
+          ? (rawChannel as unknown as Record<string, unknown>)
+          : null;
+      if (!source || !('reasoningEffort' in source)) {
+        const local = settings.channels.find(item => item.id === channel.id);
+        if (local) channel.reasoningEffort = local.reasoningEffort;
+      }
+      if (!source || (!('allowTools' in source) && !('toolsJson' in source))) {
+        const local = settings.channels.find(item => item.id === channel.id);
+        if (local) {
+          channel.allowTools = local.allowTools;
+          channel.toolsJson = local.toolsJson;
+        }
+      }
+      return channel;
+    }),
   };
 }
 
