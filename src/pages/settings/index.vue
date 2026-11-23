@@ -264,7 +264,7 @@ const TAG_PROMPT_METAS: TagPromptMeta[] = [
   {
     key: 'naiV5Spec',
     label: 'NAI \u89c4\u8303',
-    hint: '\u9ed8\u8ba4\u540e\u7aef\u4e3a NAI \u65f6\u62fc\u8fdb\u81ea\u52a8 tag \u8bf7\u6c42\uff0c\u5b9a\u4e49 Base Prompt\u3001\u539f\u751f Character Prompts \u4e0e\u82f1\u6587\u81ea\u7136\u8bed\u8a00\uff08nl \u4e00\u5f8b\u5199\u82f1\u6587\uff09\u30024.5 \u4e0e V5 \u5171\u7528\u8fd9\u4e00\u4efd\uff1achar_captions \u672c\u5c31\u662f v4 \u65f6\u4ee3\u7684\u534f\u8bae\uff0c\u4e24\u4ee3\u5199\u6cd5\u53e3\u5f84\u76f8\u540c\u3002\u7559\u7a7a\u7528\u5185\u7f6e\u9ed8\u8ba4\u3002',
+    hint: '默认后端为 NAI 时拼进自动 tag 请求，定义 Base Prompt、原生 Character Prompts 与英文自然语言（nl 一律写英文）。内置默认照 绘境物语 的分镜体系重写：分级前置、景别净空、可见结构锁死、衣着与饰品冻结、状态继承、施受三要素与主被动防反转、内部透视靶向、人体家具承重、防崩坏。4.5 与 V5 共用这一份：char_captions 本就是 v4 时代的协议，两代写法口径相同。留空用内置默认。',
     builtin: DEFAULT_NAI_V5_SPEC,
     macros: NL_SECTION_MACROS,
   },
@@ -298,7 +298,7 @@ const TAG_PROMPT_METAS: TagPromptMeta[] = [
   {
     key: 'imgRouterSpec',
     label: 'ImgRouter 规范',
-    hint: '默认后端为 ImgRouter 时拼进自动 tag 请求，约束 tag / nl 的书写规范。也可用 {{#nl}}…{{/nl}} / {{^nl}}…{{/nl}} 条件段。留空用内置默认。',
+    hint: '默认后端为 ImgRouter 时拼进自动 tag 请求，约束 tag / nl 的书写规范。内置默认照 太空猫猫 的十项定语（性别人数 / 交互位置 / 眼神神态 / 外貌 / 服装状态 / 姿势 / 动作 / 面部 / 光影 / 背景世界观）重写，并写明本协议没有负面输入、种子与权重语法。可用 {{nl}} 宏或 {{#nl}}…{{/nl}} 条件段。留空用内置默认。',
     builtin: DEFAULT_IMGROUTER_SPEC,
     macros: [
       {
@@ -311,14 +311,14 @@ const TAG_PROMPT_METAS: TagPromptMeta[] = [
   {
     key: 'imgRouterThinking',
     label: 'ImgRouter 思维链',
-    hint: '默认后端为 ImgRouter 时使用的输出前思考清单，作为 system 压在任务消息之后（解析时会自动剥掉思考块）。与「ImgRouter 规范」配套，同样支持 {{#nl}}…{{/nl}} / {{^nl}}…{{/nl}} 条件段。留空用内置默认。',
+    hint: '默认后端为 ImgRouter 时使用的输出前思考清单，作为 system 压在任务消息之后（解析时会自动剥掉思考块）。内置默认照 太空猫猫 的 <imgthink> 十项重排，再补上本插件需要的建档、服装时间线与选段判断。与「ImgRouter 规范」配套，同样支持条件段。留空用内置默认。',
     builtin: DEFAULT_IMGROUTER_THINKING,
     macros: NL_SECTION_MACROS,
   },
   {
     key: 'latentApiSpec',
     label: 'Latent 原生 API 规范',
-    hint: '默认后端为 Latent 原生 API 时拼进自动 tag 请求，按 Anima 写法（Scene / Char / Description）约束书写；内置默认照 anima寻迹 与 绘境成章 提炼。{{#nl}}…{{/nl}} / {{^nl}}…{{/nl}} 按该渠道「生成自然语言」开关取舍。这里是全局默认；渠道页的每套配置里可以单独覆盖（留空则回落到这一份）。',
+    hint: '默认后端为 Latent 原生 API 时拼进自动 tag 请求，按 Anima 写法（Scene / Char / Description）约束书写；内置默认照 分镜师系统 的编译口径重写（分级与人数排序、身份串固定顺序、服装分层、画外裁剪表、冲突表、构图与轴线、Description 短句写法）。不写权重语法，也没有 source#/target#。{{#nl}}…{{/nl}} / {{^nl}}…{{/nl}} 按该渠道「生成自然语言」开关取舍。这里是全局默认；渠道页的每套配置里可以单独覆盖（留空则回落到这一份）。',
     builtin: DEFAULT_LATENT_API_SPEC,
     macros: NL_SECTION_MACROS,
   },

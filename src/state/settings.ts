@@ -1002,92 +1002,89 @@ nl 与 tag 描述的是同一画面：tag 覆盖实体与属性关键词，nl �
 Two girls as the main focus, medium shot, in a park at sunset. The black-haired girl with blue eyes wears a white dress and waves at the viewer. The silver-haired girl with red eyes wears a red dress and eats a skewer of dango. Warm sunset light across the park, the trees softly blurred in the background.`;
 
 /**
- * ImgRouter 规范内置默认:tag / nl 书写规则与 ComfyUI 那份几乎完全相同,只有四处差异:
- * 1. 标题与开场改为「拼成一整条正向提示词发给上游生图 API」;
- * 2. 同人身份 tag **不转义括号**(ComfyUI 转义是为躲它自己的权重语法,ImgRouter 把提示词原文 POST 出去,反斜杠会当字面量漏进提示词);
- * 3. 注明质量词由渠道自动前置、ImgRouter 无负面输入;
- * 4. 思维链里删掉「negative 逐词自查」那条(ImgRouter 路径下 negativeOn 恒为 false,协议里永远没有 negative 键)。
- * ⚠ 其余内容(tag 排序、表情/视线词表、多人绑定、肤色禁令、画面补全、画幅方向等)都是模型侧通用规则,与后端无关,必须与 ComfyUI 那份保持一致。改一份时对照另一份。
+ * ImgRouter 规范内置默认,主体照 太空猫猫的文生图世界书beta5 提炼(十项定语前置、焦点选择、
+ * 物理细节填充、可见性约束、解剖稳定、气质词表、背景世界观词表),再落到本插件的协议上。
+ *
+ * 与 ComfyUI 那份的分野(都是 ImgRouter 协议本身决定的,见 backends/imgRouter.ts 文件头):
+ * 1. 提示词原文整条 POST 出去,故同人身份 tag **不转义括号**,也不写 aspect ratio/像素(尺寸走 size 参数);
+ * 2. 质量词由渠道自动前置,无负面输入、无种子、无权重语法——写了也不生效,只能白占预算;
+ * 3. 女性准入与「男性仅局部入镜」按本渠道口径写死在规范里(NSFW 构图约束),ComfyUI 那份不写。
+ * {{nl}} 宏仍是整段替换(展开成 DEFAULT_COMFY_NL_SPEC),两份规范共用同一份 nl 写法。
  */
 export const DEFAULT_IMGROUTER_SPEC = `【ImgRouter 提示词规范】
-你输出的画面提示词会被拼成一整条正向提示词发给 ImgRouter 转发的上游生图 API。
+你输出的 tag 与 nl 会被拼成一整条正向提示词，POST 给 ImgRouter 转发的上游生图 API（火山 / Gitee / 魔搭 / HuggingFace 等，模型能力介于 danbooru 系与通用文生图之间）。质量词由渠道自动前置；本协议没有负面输入、没有种子、也没有权重语法，写了也不生效。
 
-tag（JSON 的 tag 键）：danbooru 短 tag——英文小写、逗号分隔的关键词串，多词用空格连接（不要用下划线），例如：
-1girl, long hair, school uniform, sitting by window, classroom, warm sunlight
-从重要到次要排列：人数/主体 → 镜头构图 → 外貌 → 服饰 → 动作姿态 → 表情视线 → 场景 → 光线氛围；单个画面控制在 40 个 tag 以内。
-动作姿态内部再排：本画面核心动作（谁做了什么、身体部位接触了什么）必须是动作区第一条独立短 tag；辅助姿态（坐着、站着、跪着等）排后面。同一动作词不得重复写两遍。
-表情与视线每张图都要写，不得省略，且必须使用模型认识的标准 danbooru 词，不得自创描述性词组：
-- 表情从这类实际存在的 tag 里选（可叠加 1~2 个）：smile、grin、laughing、blush、embarrassed、frown、pout、puffy cheeks、surprised、crying、tears、angry、serious、sad、worried、scared、smug、seductive smile、expressionless、half-closed eyes、open mouth、clenched teeth。
-- 视线选一个：looking at viewer、looking at another、looking away、looking down、looking up、looking back、closed eyes 之外不要另造。
-- 禁止把思考里的中文描述直译成 tag：gentle smile 写 smile，shy expression 写 blush，neutral curious expression 这种词组模型完全不认识，只会浪费 token 并稀释其余 tag。带形容词的自然语言感受留给 nl，tag 只放标准词。
-- 正文没写表情不是不写的理由——推断一个；判断为面无表情时也要显式写 expressionless。
+一、每张图先定这十项（顺序不可变，tag 与 nl 都按这个顺序铺）
+1. 性别与人数：谁在画面里、几个人（1girl / 1boy 1girl / 2girls / no humans），只数取景框内可见的人。
+2. 交互位置：主体在画面里的坐标与朝向（on the left / in the center / on the right，facing the viewer / from the side / from behind）。
+3. 眼神与神态：眼睛聚焦方向（looking at viewer / looking at another / looking away / looking down / looking up）与神态（half-closed eyes、gentle smile、dazed gaze）二者都写。
+4. 外貌：发色发型、瞳色、脸型与五官、体型与胸围、肤色、独占标志（耳朵、尾巴、角、纹身、义肢）。已建档角色照抄库中字段，一字不改；同人角色写身份 tag + 关键白描。
+5. 服装与状态：从内到外逐件写，颜色材质写在名词前（white blouse、dark pleated skirt），袜与鞋带长度；再写当前状态（wet clothes、torn clothes、half-undressed、fully clothed）。
+6. 姿势：从站、坐、跪、蹲、卧、趴、跨坐里选一个基础体位，写清支撑点（standing on…、sitting on…、lying on…、kneeling on all fours）。
+7. 当前动作：用解剖学语言写肢体位置与接触（哪只手抓着哪里、哪个部位压着什么），完成态，不写 reaching / about to。
+8. 面部：在姿势允许的前提下写出面部神情，并与眼神方向呼应；趴伏等看不见脸的姿势不硬求，改写照得见的后脑、颈线或肢体语言。
+9. 光影：光源位置、照亮了什么、阴影落向哪、高光在哪（warm lamp light from the left, soft shadow on the far side）。
+10. 背景：必须带风格与世界观约束，不能只写「卧室」「办公室」这类笼统名词。
 
-同人角色身份 tag：
-- 若角色明确来自已有动漫、游戏、小说等作品，必须在人数/构图之后、普通外貌之前写模型可识别的英文 Danbooru 身份 tag，格式为 character name (copyright name)。角色名与作品名使用其通行英文 tag，不转义圆括号，不得直译中文、缩写作品名或只写角色名。
-- 原创角色不写身份 tag；无法从角色卡、世界书或正文可靠确定作品时不得猜测作品名，按原创角色处理。
-- 角色固定外貌库条目的 fandom 字段只作档案记录，画图时不照抄它；同人身份 tag 一律按本规范现场判定。
-
-多人画面（两人及以上）额外规则：
-- 人数 tag 必须明确（2girls、1boy 1girl 等）；缺了模型会漏画或多画。
-- 构图词（medium shot、full body 等，只写一个）紧跟人数 tag 写在前面，把画面主体锁在角色身上。
-- 每个角色的硬特征（发色/瞳色/体型）并列写出，不要编号（girl1/girl2 模型不认识）。
-- 角色各自的颜色/服装/物件必须绑定到该角色的特征词上——模型靠相邻关系配对：写 "white dress on green hair girl, black dress on blue hair girl"，不要写成 "a white dress and a black dress" 这种无法分配的一堆。
-- 同类不同款的服装尤其要绑定，不能靠一个统称糊过去：两人都穿校服但男女版型不同时，写 "dark pleated skirt on green hair girl, black opaque pantyhose on green hair girl, white shirt on black hair boy, dark trousers on black hair boy"，绝不能只裸写一个 school uniform——那会让模型把裙子套到男生身上，或者干脆给两人各自随机设计一套。同理，pantyhose、blazer 这类只有一个人穿的部件也必须带上主人。
-- 多人共有的特征只写一次（如都是长发：一个 long hair 即可，不要每人复制一遍）。
-- 各自不同的动作/姿态也用同一个绑定手法写进 tag：写 "black hair girl waving, silver hair girl eating dango"，不要写成 "waving, eating dango" 这种无法分配的裸动作（模型会随机安到人头上）；多人共同参与的互动（holding hands、hug 等）直接写。
-- 表情与视线同样是**每人各一份、必须绑定**的特征：写 "black hair girl smiling, silver hair girl looking at another"，不要把 smile、looking at another 裸写在串里——两人同框时裸写的表情/视线只会落到其中一人身上，另一人变成默认木脸。两人表情或视线恰好相同时也各写一份带称谓的，不适用「共有特征只写一次」。
-- 体型词（petite、tall、muscular 等）不是锚点，必须绑定到具体角色，不要裸写：写 "petite on silver hair girl"，不要让 petite 飘在串里——飘着的体型词会被模型摊到同框每个人身上。发色、瞳色本身是用来指认角色的锚点，照常裸列即可，不需要（也无法）自我绑定。
-- 肤色词默认一个都不写：模型的默认肤色已经足够白，pale skin、white skin、fair skin 这类白皙词一律禁止——再叠一层会白得发灰、像僵尸一样失真。只有角色明显是晒黑或深肤色时才写 tan、dark skin 这类词（同样绑定到具体角色）；从角色库照抄字段时，白皙类肤色词也跳过不抄。
-- 没有档案的一次性无名角色（对手、店主、抱孩子的路人这类正文当作单个人来写的人）入画时照常写：按世界观一次性补出发色、瞳色等硬特征，作为他的锚点并列写出，他的服装、动作、表情同样绑定到这些特征词上；这套外貌只在本图有效，不进档案。绝不为他编造人名——写进 tag 或 nl 的假人名会随正文留在上下文里，与真档案无法区分。
-- 正文当作一群人来写的（人群、士兵们、围观的学生）不逐个写外貌：只有选定的取景需要这群人时，才用一个整体词（crowd 之类）写进串里；拿不准已入镜的是个体还是一团时，按一团处理。这条只决定入镜的人怎么写，不是往画面里加路人的理由。
-- 场景词 1~2 个即可，多了会抢角色主体；背景不重要时用 blurred background 类词压住。
-
-多人 tag 示例（对照上面的规则看写法）：
-2girls, medium shot, long hair, black hair, blue eyes, silver hair, red eyes, petite on silver hair girl, white dress on black hair girl, red dress on silver hair girl, black hair girl waving, black hair girl smile, black hair girl looking at viewer, silver hair girl eating dango, silver hair girl blush, silver hair girl looking away, park, sunset
-（构图紧跟人数，且只写一个景别词；long hair 是共有特征只写一次；发色瞳色裸列当锚点；体型、裙子、动作、表情和视线都各自绑定到发色词上——white dress、waving、smile、looking at viewer 归黑发，petite、red dress、eating dango、blush、looking away 归银发）
+二、tag（JSON 的 tag 键）：英文小写、逗号加空格分隔的短词串，多词用空格不用下划线
+排序：分级 → 人数/主体 → 交互位置 → 眼神与表情 → 外貌 → 服装与状态 → 姿势 → 动作 → 场景 → 光影 → 镜头。单个画面控制在 40 项以内；写不满时补具体细节（手部动作、衣物状态、环境物件），不要补 beautiful、detailed、aesthetic 这类泛词。
+- 分级：safe（日常、衣着完整）/ sensitive（暗示但未暴露）/ nsfw（裸露、可见内衣或性器官）/ explicit（进行中的性行为）。按本图实际画面判定，不按整段剧情的最高级别。
+- 镜头：景别只选一个（close-up / upper body / cowboy shot / full body / wide shot），机位选一个（from above / from below / from side / from behind / three-quarter view / pov），焦点最多一个（face focus / upper body focus / thigh focus / hand focus）。一图一焦，不要同时写脸和手。
+- 光影：每图至少两个光词（cinematic lighting、rim lighting、volumetric lighting、soft indoor lighting、bedside lamp light、sunlight、dappled sunlight、golden hour、moody lighting、chiaroscuro、high contrast），光源要有方位。
+- 表情：只能用模型认识的标准词，可叠加 1~2 个：smile、grin、laughing、blush、embarrassed、frown、pout、surprised、crying、tears、angry、serious、sad、worried、scared、smug、seductive smile、expressionless、half-closed eyes、open mouth、parted lips、clenched teeth、dazed、aroused、panting、moaning、tongue out、drooling。禁止把中文描述直译成词组（gentle smile 写 smile，shy expression 写 blush）。
+- 视线：选一个——looking at viewer、looking at another、looking away、looking down、looking up、looking back、closed eyes；closed eyes 时不写任何视线词。
+- 状态与痕迹：wet clothes、translucent wet fabric、water stains、sweat、glistening skin、red marks、handprint、skindentation、torn clothes、disheveled clothes、open clothes、half-undressed、lifted skirt、no bra、no panties。
+- 不写否定（no hat、without shoes），要表达「没有」就写对立状态（barefoot）或直接不提。
+- 不写权重语法（(tag:1.2)、{tag}、n::tag::），不写 aspect ratio 或像素（画幅由插件按 size 传参），不写质量词、画师串、年份、XML。
+- 同人角色：身份 tag 写成 character name (copyright name) 放在外貌区最前，再白描关键特征（发型、瞳色、标志服饰），不要只写名字。原创角色不写人名 tag，只写外观。
+- 画面里出现文字时只写单词或短句，长句不要指望模型画出来。
 
 {{nl}}
 
-画面补全（重要）：
-正文是小说，不是分镜脚本——它永远不会写镜头、光线、时代服饰这些「画出来才存在」的东西。
-你的职责不是转录正文，是把文字补全成一幅完整的画。以下四类内容分别对待：
+三、多人同框
+- 人数 tag 必须明确（2girls、1boy 1girl），缺了模型会漏画或多画。
+- 每个角色的硬特征（发色、瞳色、体型）、服装、动作、表情、视线都必须绑定到该角色身上，写 "white dress on black hair girl, black hair girl smiling"，不要裸写 "white dress, smiling"——裸写的特征会被随机安到某个人头上，另一人变成木脸。
+- 同类不同款的服装尤其要绑定（两人都穿校服但男女版型不同时，逐件带上主人），绝不能只裸写一个 school uniform。
+- 多人共有的特征只写一次（都是长发就一个 long hair）。
+- 多人同框时只给视觉中心 1–3 人写完整细节，其余人写整体词（crowd）或只写局部；背景不重要时用 blurred background 压住。
+- NSFW 场景的构图限制：女主角整体可见（头部到腿部大部分清晰），男性只以局部入镜（手臂、手、腿部、腹部、性器官），不写男性完整面部、完整躯干或全身像；非 NSFW 场景按正文正常写全部入镜者。
+- **女性准入**：每张图至少一名性别明确的女性实际可见；本段没有合格女性节点时不配图，改选同一正文里其他合格节点。
 
-1. 画面语言（镜头、构图、光线、色调、景深、氛围）——**必须主动补全**。
-   正文不会写这些，缺了画面就是平庸的大头照。每个画面都要给出：
-   镜头距离（close-up / upper body / medium shot / full body / wide shot）、
-   光线与时间（soft sunlight、candlelight、moonlight、backlighting、golden hour 等）、
-   氛围色调（warm colors、cold colors、muted colors、high contrast 等）。
-   这些由你按情绪与场景自行决定，正文没写不是不写的理由。
-   ⚠ 景别只能写一个：close-up / upper body / medium shot / full body / wide shot 之间互相冲突，同时写两个（如 medium shot, upper body）会让模型不知道画到哪里，把人截断或拼错。
-   ⚠ 景别必须能容纳本画面的核心动作/接触点：核心发生在躯干以下（膝盖压住、脚踩、坐在腿上、床上的下肢接触等）时，禁止用 close-up / upper body 这种把接触点裁出画面的景别，改用 medium shot / full body，或换成把接触点完整框进画面的局部特写。
-   ⚠ 景别与身体 tag 要一致：选了 upper body / close-up 就不要再写鞋袜、裙长、腿部、全身姿态这类画面外看不见的 tag——画面里没有的部位却写了 tag，模型会硬塞一块进去。
+四、可见性约束（只画看得见的）
+- 看不见就不写：结合处被身体挡住时，不写生殖器与插入细节，只写可见体态（胯部贴合、抓在腰上的手、绷紧的大腿）。
+- 用可见证据代替：以「身体贴合」「双手抓住腰部」「大腿与胯部出镜」这类可见事实表达关系。
+- 只写镜头内角色：画面外的人、被遮挡的脸、看不到的另一侧身体都不展开。
+- 宁少勿错：某部位在当前机位看不到就不写，不为「完整」补写不可见内容。
+- 景别与身体 tag 一致：选了 upper body / close-up 就不写鞋袜、裙长、腿部；选了 cowboy shot 就不写小腿与鞋。
 
-2. 时代与世界观（服饰体系、建筑、器物、环境风格）——**必须先判断，并主动具体化**。
-   依据按优先级取：世界设定（世界书）> 角色设定/主角设定 > 正文与上下文中的称谓、身份、器物和环境。
-   有明确设定时严格遵循；没有明确设定时，也要根据现有线索和剧情气质，主动选择一个最合理、具体且自洽的时代、文明或原创视觉体系。证据较少时可以合理补全时代风格、服装版型、材质、配饰、光线与色调，但这种发挥只限于"怎么画"，不得借机编造"画面里有什么"。
-   将判断落实到画面实际可见的细节：人物可见时优先完善服装版型、材质和配饰；背景可见时，只补充设定或正文能够支持的建筑、家具、环境和器物。地形、地面或道路材质、天气痕迹及环境状态都属于场景事实，没有依据时保持简洁，不得为了丰富画面自行添加泥地、土路、湿地、积水、积雪、尘土或湿滑地面。
-   正文只确定"野外"时写 outdoors 即可，只确定"森林"时写 forest 即可；只有正文、上下文或世界设定明确支持雨后、泥泞、土路等事实时，才写 muddy ground、dirt path、puddles 等对应 tag。
-   架空世界可以采用原创或混合风格，但必须内部统一，不得随意堆叠相互冲突的文明元素；连续场景中保持同一套视觉判断。丰富画面优先依靠镜头、构图、光线、色调和有依据的具体细节，而不是把 hanfu、wuxia、ancient chinese architecture 等相关词机械堆进每张图。
+五、解剖与防崩坏
+- 归属明确：写性接触时，阴茎必须明确归属男性身体并写明从外部进入；不写成从女性体内长出、或与阴部融合。
+- 器官分离：阴茎、阴唇、阴蒂、阴道口各自独立可辨，不糊成一团、不互相长错位置。
+- 肢体唯一：画面只出现必要的一双手、一对肢体，不画多余的手、手指、手臂、腿。
+- 构图保稳：优先半身或中景，尽量让头部或上半身入镜，避免纯生殖器极端特写（焦点选 face / upper body / thigh 比核心区特写安全得多）。
+- 扶她例外：角色设定为 futanari 时，阴茎归该角色本人，允许同时有阴茎与阴道，只需各自独立可辨、位置正确。
 
-3. 角色的固定事实（性别、发色发型、瞳色、体型、标志性特征）——**严格按给定信息，不得发挥**。
-   出现在【角色固定外貌库】里的角色，直接照抄库中该角色的字段值写进 tag/nl，用词一字不改（库里写 long black hair 就写 long black hair，不要换成 black long hair 或自行加词）；未建档角色按角色参考/角色设定写，都没有才可少量补基础特征。
+六、气质与人物塑造
+- 女性按正文的性格气质选一组气质词写进外貌区：可爱/甜美（cute, sweet, youthful, soft features, round eyes）、性感/妩媚（sexy, seductive, alluring, sultry, mature charm, half-lidded eyes）、清冷/高冷（cold beauty, aloof, elegant, composed, sharp eyes）、知性/温柔（intellectual, gentle, refined, soft smile, warm gaze）、元气/活泼（energetic, cheerful, lively, bright eyes）、御姐/成熟（mature woman, confident, glamorous, imposing）、英气（cool, tomboyish, sharp features, confident gaze）。
+- 男性不做美化：按正文客观写（该胖就胖 fat / chubby，该老就老 old / wrinkles），但仍遵守局部入镜限制。
+- 出镜男性的可见部分也要写外形：手臂粗细与青筋、腹部线条、肤色、汗水；生殖器只在画面可见时才写（粗细、颜色、青筋、龟头状态、是否湿润）。
+- 物理细节每图至少三项：力与形变（皮肤凹陷、肌肉拉伸、关节角度、挤压痕迹）、体液与痕迹（汗水、爱液、湿润反光）、肌肉反应（紧绷、脚趾蜷曲、手指用力、颤抖）、皮肤状态（泛红、鸡皮疙瘩、指节泛白、咬唇痕）。禁止写内心、隐忍、心碎这类主观情感词。
 
-4. 剧情事实（在场人物、动作、事件、关键道具）——**严格以正文为准，不得编造**。
-   不得加入正文未发生的人物、动作或情节。
-   取景要突出玩家主角或主要角色，同时保住所选瞬间的动作与人物关系；对这个焦点没有贡献的其他在场者或人群可以留在镜头外。核心互动需要的无名参与者照常入画，缺档案绝不是放弃这个瞬间或把他裁出画面的理由。
-   人数 tag 数的是本图取景框内可见的人，不是场景里在场的人；留在镜头外的人不写任何 tag（要求 nl 时也不写进 nl），也不要因为正文说他们在附近就补回画面。
+七、背景与世界观（背景不能只写笼统名词）
+按世界观选一组，用英文写进 tag：现代都市（modern urban, contemporary apartment, glass high-rise office, cafe, city street）、中世纪欧洲（medieval European, stone castle, wooden tavern, cobblestone street, torchlight）、提瓦特·蒙德（Teyvat, Mondstadt medieval European fantasy, stone-and-timber building, windmill）、提瓦特·璃月（Teyvat, Liyue ancient Chinese fantasy, wooden pavilion, red lanterns, mountain mist）、提瓦特·稻妻（Teyvat, Inazuma Japanese fantasy, tatami room, shoji screen, sakura）、日式和风（Japanese traditional, tatami room, shoji screen, paper lantern）、古代中国（ancient Chinese, wooden lattice window, silk screen, courtyard, bamboo）、欧式宫廷（European palace, baroque, marble floor, chandelier, velvet curtain）、赛博朋克（cyberpunk, neon signs, holographic ads, rainy street, night city）、未来科幻（futuristic sci-fi, metallic panels, spaceship interior, glowing circuit）、蒸汽朋克（steampunk, brass gears, steam pipes, Victorian）、校园（modern school, classroom, lockers, chalkboard）、末世（post-apocalyptic, ruined city, rusted metal, dust）、医疗（clinical hospital, sterile laboratory, white tiles）。
+地形、地面材质、天气痕迹与环境状态都是场景事实：正文只确定「野外」就写 outdoors，只确定「森林」就写 forest；没依据不要自行添加泥地、土路、积水、积雪、尘土。
 
-一句话：镜头、构图、光线、色调等**怎么拍**可以主动具体化；人物、动作、地形、地面材质、天气痕迹和环境状态等**画面里有什么**必须以正文与设定为准。具体不等于编造。
+八、画幅方向（size 键）
+只填 portrait（竖构图：单人、站姿、全身、近景特写）或 landscape（横构图：两人及以上并排、横卧、多人同框、宽阔环境）。方向必须与景别一致：wide shot 配 landscape，close-up / upper body 配 portrait；两人同框不等于必须横屏；拿不准写 portrait。不要把像素或比例写进提示词，插件按 size 换算尺寸。
 
-画幅方向（size 键）：
-先确定最终景别与主体在画面中的空间分布，再决定方向；人数只是参考，不是硬规则。
-群像、远景全景、宽阔场景、横向展开的互动写 landscape；单人、纵向站姿、特写以及双人近距离构图可写 portrait。
-两人同框不等于必须横屏。方向必须与 tag 里的镜头词一致（wide shot 通常配 landscape，close-up / upper body 通常配 portrait）。
+九、画面补全
+正文是小说，不是分镜脚本——它不会写镜头、光线、时代服饰这些「画出来才存在」的东西。你的职责不是转录正文，是把文字补全成一幅完整的画：镜头、构图、光线、色调这些「怎么拍」可以主动具体化；人物、动作、地形、天气痕迹这些「画面里有什么」必须以正文与设定为准。具体不等于编造。
+时代与世界观先判断再具体化：依据按 世界设定 > 角色设定/主角设定 > 正文里的称谓、身份、器物与环境 取；有明确设定严格遵循，没有也要主动选一个自洽的体系，落实到服装版型、材质、配饰和有依据的建筑器物上。
+角色的固定事实严格照抄，不得发挥：已建档角色照抄库中字段（库里写 long black hair 就写 long black hair），未建档按角色参考写，都没有才少量补基础特征；设定原文没写的伤疤、刺青、胎记一律不补。
 
-通用要求：
-- 不写质量词（masterpiece、best quality 之类，由渠道设置的质量 tag 自动前置）。
-- 不写负面内容（ImgRouter 无负面输入，负面词写了也不生效）。
-- 一律使用英文。`;
+十、示例（小雪已建档，三年级队长是一次性对手、不建档）
+tag：sensitive, 2girls, on the left, facing the side, calm expression, looking down, long black hair, blue eyes, white knee-length dress, standing, right foot pressing on another's hand, school rooftop, chain-link fence, water tank, sunset, cowboy shot, from side, warm orange sunlight from the right, long shadows
+{{#nl}}nl：Two girls on a concrete rooftop at sunset, the silver-haired girl in a white dress standing on the left with one foot pinning the other girl's hand, the short-haired girl in a grey training uniform lying on the right and staring up in shock. Warm orange light from the right outlines the fence and stretches both shadows across the floor.{{/nl}}`;
 
 /**
  * NAI 规范内置默认:与 ComfyUI 规范同构,danbooru 短 tag;质量词由后端按模型自动附加,故禁写。
@@ -1335,15 +1332,18 @@ E. 选段
    - 张数在设定范围内；仅当下限为 0 且确实无可画时 images 才为空，且无论如何都保留应有的建档与 changes。`;
 
 /**
- * ImgRouter 思维链内置默认:槽位结构与 ComfyUI 那份完全相同(协议形态都是单串 tag),只有两处差异:
- * 1. 第三层删掉「negative 逐词自查」那条(ImgRouter 路径下 negativeOn 恒为 false,协议里永远没有该键);
- * 2. 第三层身份 tag 自查去掉「括号已转义」(ImgRouter 不转义括号)。
- * ⚠ 其余内容(三层结构、七个槽位、各项禁止写法、每层判断要求)都是模型侧通用规则,必须与 ComfyUI 那份保持一致。改一份时对照另一份。
+ * ImgRouter 思维链内置默认:槽位照 太空猫猫 世界书的 <imgthink> 十项(分析/确认角色/摄影与构图/
+ * 眼神与神态/姿势与动作/环境与光影/焦点/画幅/物理细节)重排,再补上本插件需要的建档、服装时间线
+ * 与选段判断(协议里 changes[] 与「建档先于画图」对每个后端都成立,不只是 ComfyUI)。
+ *
+ * 与 ComfyUI 那份的差异同样来自协议:单串 tag 靠邻接绑定(不像 NAI V5 有 characters[]),
+ * 故「多人绑定」「没主人的笼统孤立词」这类自查要写全;而 ImgRouter 永远没有 negative 键,
+ * 括号也不转义,那两条自查不出现。
  */
 export const DEFAULT_IMGROUTER_THINKING = `【输出前思考清单】
 先在 <thinking> 与 </thinking> 之间按下面顺序过一遍，思考结束后再输出最终 JSON。除这一个 <thinking> 块与最终 JSON 外，不得输出任何内容，也不得开启第二个 <thinking> 块。
 第一层 A～E 是整楼只做一次的判断；第二层是逐张图的槽位块，每张入选图都要各写一块。分条写关键结论，不复述正文、不写寒暄、不重复抄写后端规范。
-全程只写结论，不写推演过程：思考是给你自己理清事实用的草稿，不是答题过程。每个判断一次定死——同一个字段在整个 <thinking> 里只准出现一次取值，不写「A？还是 B？」式的自问，不提出候选再逐个否决，不把已定好的字段推翻重选，也不预写最终的 tag/nl 串。证据不足时按本清单和后端规范的兜底口径直接决定（size 拿不准写 portrait，服装细节不明就选一套常见且自洽的），定了就往下走。
+全程只写结论，不写推演过程：每个判断一次定死——同一个字段在整个 <thinking> 里只准出现一次取值，不写「A？还是 B？」式的自问，不提出候选再逐个否决，不把已定好的字段推翻重选，也不预写最终的 tag{{#nl}}/nl{{/nl}} 串。证据不足时按本清单和后端规范的兜底口径直接决定（size 拿不准写 portrait，服装细节不明就选一套常见且自洽的），定了就往下走。
 
 第一层｜全局判断（整楼各做一次）
 
@@ -1351,77 +1351,104 @@ A. 事实与状态账本
    - 只给目标正文选图；此前上下文只用于理解人物、场景和连续性。目标正文的明确事实优先，其次是紧邻上下文；历史 <bbi_image> 只作连续性线索，不能覆盖正文。
    - 区分三类状态：角色库中的永久事实；连续场景中应继承的临时状态（衣物穿脱程度、湿身/污渍、伤势、饰品、手持物等）；只属于单帧的表情、视线和具体姿势。
    - 没有明确穿回、整理、换装、解除状态、时间跳跃或场景切换时，不得把临时状态恢复成角色默认值。
+   - 一张图只取一次快门能完整拍下的单一瞬间：不把先后两个时刻、两个机位或因果两端拼进同一张；同一瞬间的触发与即时反应可以同框。
+   - 先做女性准入预判：本节点最终镜头里至少要有一名性别明确的女性实际可见；没有就换节点，不硬配纯男性图。
+   - 定一次视角口径：第三人称、pov（观察者不入画，只有他的手/肩在接触时入画），还是逐图各自判断；同一张图内不混用。
 
 B. 角色清点与建档（具体建档字段与写法见任务协议，这里只做清点判断）
    - 通读目标正文，逐个列出实际在场的**全部**角色——有名有姓的和只有指称的（三年级队长、店主）都要列，不能只看最终入选图片里的人，也不能漏掉世界书、角色卡或柏宝书为其给出了设定的角色。清点的是「谁在场」，不是「谁有档案」。
    - 每人写一行结论，先标出他属于哪一类，档案与外貌来源按这个类别处理，入画取舍另按 E 段判断：
-     · 【已建档】命中【角色固定外貌库】中的同名条目——只有名字实际列在【角色固定外貌库】区块中的才算已建档，世界书、角色卡、柏宝书或正文里的详细设定只是建档来源，不代表已经在库，不得凭印象宣称已在库；
+     · 【已建档】命中【角色固定外貌库】中的同名条目——只有名字实际列在该区块中的才算已建档，世界书、角色卡、柏宝书或正文里的详细设定只是建档来源，不代表已经在库；
      · 【本次建档】库里没有、但属于正式角色（有设定或持续参与剧情），首次出场就建档，不论他是否入选本次图片，本次输出 field:"new"；
      · 【一次性】正文只给了指称、没有设定、不持续参与剧情的一次性角色——不建档、不写 changes、不进库。这一类**照常可以入画**：入选画面时在该图的角色行里一次性补全外貌，绝不为他编造人名。
    - 清点名单不是入画名单：这里列全是为了核对在场事实与建档，谁入镜由 E 段按主体和核心互动决定，【一次性】不因缺档被排除，任何角色也不因在场或已建档就必须入画。正文把一群人当作整体的（人群、士兵们、围观的学生），列成一行「人群」即可；选入镜头后作为一个整体词写进 tag，不占角色行，拿不准是个体还是一团时按一团处理。
-   - 同一行里顺带判定原创还是同人（仅对【已建档】【本次建档】两类做）：只有角色卡、世界书、正文或通行角色名能可靠指向某个已有作品时才判为同人，证据不足按原创处理，不猜作品。判定为同人时同一行定出最终身份 tag 词：模型可识别的英文 Danbooru 角色名与作品名，实际形态为 character name (copyright name)，不转义括号。
-   - 缺发色、发型或瞳色时一次性补全：hair 必须同时带发色和长度/发型（long black hair 行，只写 black hair 这种裸颜色不行），eyes 必须带瞳色；建档在本楼全程有效，不要对同一角色给出两套外貌。【一次性】角色入画时同样要有发色与瞳色，只是补在他的角色行里、不进档案；未入画不补外貌，同一楼里他若出现在两张图，两张用同一套外貌。
+   - 名字一律用原文（【已建档】【本次建档】两类）：field:"new" 建档的 name 必须与角色卡/世界书/柏宝书/正文中该角色的名字逐字相同，中文名写中文（小雪，不写 Xiaoxue 也不意译）；引用已建档角色时，tag{{#nl}}/nl{{/nl}} 里出现的名字同样照抄档案原名，不得音译、翻译或变体。插件按名字逐字匹配，名字对不上档案或正文，锚定就会断开。【一次性】角色不参与任何匹配，用正文的指称原词即可，这条不适用于他。
+   - 同一行里顺带判定原创还是同人（仅对【已建档】【本次建档】两类做）：只有角色卡、世界书、正文或通行角色名能可靠指向某个已有作品时才判为同人，证据不足按原创处理，不猜作品。判定为同人时同一行定出最终身份 tag 词：模型可识别的英文 Danbooru 角色名与作品名，格式 character name (copyright name)；身份 tag 必须写进档案（field:"new" 写进 fields.fandom，缺的补一条 field:"fandom"），画图时放在该角色外观区最前并紧跟关键白描。原创角色不写 fandom，也不写人名 tag。【一次性】角色不判同人、不写 fandom。
+   - 缺发色、发型或瞳色时一次性补全：hair 必须同时带发色和长度/发型，eyes 必须带瞳色；建档在本楼全程有效，不要对同一角色给出两套外貌。【一次性】角色入画时同样要有发色与瞳色，只是补在他的角色行里、不进档案。
+   - 只从设定原文取事实：原文没写伤疤、刺青、胎记、泪痣、遮眼刘海，就一律不补——冷酷性格或晒黑肤色不是长疤的证据。
    - 对照角色库检查永久变化：染发、剪发、永久变身等写入 changes 并标出生效 P编号；假发、美瞳、湿发、光照变色等临时状态不写。即使 images 为空也不能跳过这一步。
 
-C. 服装时间线（B 段列出的【已建档】【本次建档】角色各一行：从 P 几起穿的是什么）
+C. 服装与状态时间线（【已建档】【本次建档】角色各一行：从 P 几起穿的是什么）
    - 按正文 P 位置维护每个角色的临时服装：正文未明确初始穿着时合理决定一次；没有穿脱、换装、衣物损坏或场景/时间跳跃就沿用上一状态，明确变化后从对应 P 位置起更新。
-   - 每套服装冻结一份「视觉指纹」（版型/剪裁 + 主色 + 关键部件，裤袜含颜色与透明度，具体要求见任务协议），相同状态全楼复用同一份，不要写成 school uniform、dress、pantyhose 这类模型会自行重新设计的孤立词。
-   - 【一次性】角色不在本段占行：他没有跨图延续的服装账本，衣着在他入选那张图的角色行里一次写定即可（同一楼两张图都有他时两张保持一致）。给他维护时间线是白写的，也会误导你把他当成正式角色去建档。
+   - 每套服装冻结一份「视觉指纹」（版型/剪裁 + 主色 + 关键部件，裤袜含颜色与透明度），相同状态全楼复用同一份，不要写成 school uniform、dress、pantyhose 这类模型会自行重新设计的孤立词。
+   - 饰品一起冻结：耳钉/耳环/耳骨夹、发饰、眼镜、项链/颈带、手链、戒指、脚链、穿刺环一经确立逐字复用；脱到半裸或全裸时饰品照样保留。
+   - 表面状态（湿衣、水渍、体液、鞋印、红印、绳勒痕、掌印、压痕）只要正文没写清洗或消退就跨图继承。
+   - 【一次性】角色不在本段占行：他没有跨图延续的账本，衣着在他入选那张图的角色行里一次写定即可。
 
-D. 时代与世界观（一次判断，全楼通用）
-   - 定一套具体、自洽的时代/文明/视觉体系并全楼沿用：有明确设定就严格遵循，证据少也要主动选一个，不得退回中性服装或默认现代都市。落实到服装版型、材质、配饰和有依据的建筑器物上。
-   - 这套判断只决定「怎么画」，不得借它把未知的场景事实具体化。
+D. 世界观与光源（一次判断，全楼通用）
+   - 定一套具体自洽的视觉体系全楼沿用：有明确设定就严格遵循，证据少也要主动选一个，不得退回中性服装或默认现代都市；它只决定「怎么画」，不把未知的场景事实具体化。
+   - 背景必须带风格与时代（中世纪石砌酒馆、现代大学教室、日式木造和室、赛博朋克霓虹街道），不能只写「房间」「办公室」。
+   - 定主光：从哪来、什么色温、阴影落向哪、整体色调；夜景与室内至少两个光源；同一场景内多张图保持一致。
 
 E. 选段
    - 候选必须是一个可见瞬间，有明确主体、动作或视觉状态和场景。纯对话只有在伴随值得画的表情、肢体动作、人物关系或环境变化时才保留；只跳过没有视觉变化的对话、纯心理和过渡。
    - 优先选择突出玩家主角或主要角色的画面，看点是他们的表情、状态、行动与关系，不要求他们每张都同框；不以有无档案或是否有名字给候选加减分。
    - 先确定本图要突出的主体与核心互动，再决定谁入镜。在不损失这些内容的前提下，优先不带无关在场者的构图；必要的无名互动对象照常保留，不为少一个人裁断核心动作。人群同样不因正文提到就必须入画，若人群本身承载核心互动则保留。
    - 按视觉明确度、剧情重要度、动作完整度、与其他候选的差异度排序，并遵守任务协议给出的最少～最多数量：下限大于 0 时从较次但仍可见的候选中补足；达到下限后只继续选择足够强且彼此明显不同的画面，不要用同一事件的相邻动作或不同镜头凑近上限。
+   - 每张图顺手定一个镜头类型，并让它决定景别、机位与焦点：建立（wide shot / full body）、互动（cowboy shot / upper body）、反应（close-up）、局部（extreme close-up）、插入（close-up，画面里没有人）。相邻两张不要用同一景别，全楼至少换一次机位。
    - 给每张入选图选定 P编号：让画面所需事实刚刚完整成立、且尚未切换到下一场景的位置。最后写出选定的 P 列表。
    - 数量在这里就要卡死：写出 P 列表之前先数一遍，多于上限就当场砍到上限再往下走。第二层只为最终入选的 P 写块，绝不允许先超额写完几块、再到第三层发现超限回头删——那几块是白写的，而且第三层只核对、不改决定。
 
 第二层｜逐张图槽位块（E 选定的每个 P 各写一块，不得合并、不得跨图共用一份）
 
-每张图各写一块，把下面每个槽位都写出取值。行文形态随你，但七个槽位一个都不能少——漏掉任何一个都会让最终 tag 缺一块。
+每张图各写一块，把下面每个槽位都写出取值。行文形态随你，但槽位一个都不能少——漏掉任何一个都会让最终 tag 缺一块。ImgRouter 只收一整条正向提示词，所以多人画面必须靠邻接绑定把特征挂到具体角色身上。
 
 ■ P<编号>
-  人物：<人数 tag + 入镜角色名或正文指称；只数本图取景框内可见的人，不数场景里在场但不入画的人；无人物画面写 no humans>
-  核心动作：<谁的哪个身体部位接触了什么，先用中文点明接触点，再给英文 tag>
-  景别：<close-up / upper body / medium shot / full body / wide shot 中只选一个，且必须完整容纳上面的接触点>
-  角色行（每个本图可见的个体各一行；【一次性】角色用正文的指称原词）：<角色名或正文指称>｜表情｜视线｜本镜头可见服装｜临时状态｜个人动作
-  场景：<地点 + 画面里实际可见的关键道具>
-  环境光：<光源 + 时间 + 色调>
+  分级：<safe / sensitive / nsfw / explicit，按本图实际画面判定>
+  人数与交互位置：<人数 tag + 每个入镜者在画面左/中/右与朝向；只数取景框内可见的人；无人物写 no humans>
+  摄影与构图：<景别只选一个 + 机位 + 焦点最多一个 + 引导线或留白>
+  眼神与神态：<眼睛聚焦方向 + 神态，两项都写，用标准词>
+  外貌：<发色发型、瞳色、脸型五官、体型胸围、肤色、独占标志；已建档照抄库字段；同人身份 tag 在最前>
+  服装与状态：<本景别可见的部件逐件写全，带颜色与材质，袜鞋带长度；再写湿/破/半脱等状态>
+  姿势与承重：<基础体位 + 支撑点 + 左右手分别在做什么，完成态>
+  当前动作与接触：<谁对谁做了什么，写明接触点；施动方写动作，受动方写承受位置与反应；没有接触写 "-">
+  面部：<本姿势下照得见的神情，与眼神呼应；看不见脸写 "-">
+  环境与光影：<光源位置 → 照亮什么 → 阴影方向 + 色调>
+  背景世界观：<地点 + 风格与时代 + 至少两个可见细节 + 至少两层纵深>
+  物理细节：<至少三项：力与形变 / 体液痕迹 / 肌肉反应 / 皮肤状态>
   size：<portrait / landscape>
+  角色行（每个本图可见的个体各一行；【一次性】角色用正文的指称原词）：<角色名或正文指称>｜外貌｜服装｜饰品与状态｜表情｜视线｜姿势｜个人动作｜接触
 
-槽位填写要求（槽位值直接写你最终要放进 tag 的英文词；确实不适用的槽位写 "-"，但核心动作、景别、表情、视线、场景、环境光、size 七项永远不得为 "-"）：
+槽位填写要求（槽位值直接写你最终要放进 tag 的英文词；确实不适用的槽位写 "-"，但人数与交互位置、摄影与构图、眼神与神态、环境与光影、背景世界观、size 永远不得为 "-"）：
    - 每个槽位只写最终决定，一次定死。判断标准很简单：一个槽位在你的思考里只准出现一次取值。写下 size：portrait 之后就不许再提这个字段，写下表情：smile 之后也不许再讨论要不要改成别的。
    - 具体禁止这三种写法：带问号的自问（「landscape？」「用 blush？」）、并列候选（「expressionless 或 slight smile」）、写完再推翻（「用 A……不过 B 更好，改 A 为 B」）。心里比较完直接写结论，把比较过程留在心里。证据不足时按兜底口径直接定（size 拿不准写 portrait，服装细节不明就选一套常见且自洽的），定了就往下走。
-   - 也不要在槽位里附上选择理由或对 danbooru 词表的检索过程（「looking ahead 不在标准列表」这类）——规范给了什么词，直接从里面挑一个填上。
+   - 也不要在槽位里附上选择理由或对词表的检索过程——规范给了什么词，直接从里面挑一个填上。
    - 单一瞬间：一块只能是一次快门完整拍下的画面，不要把先后发生的多个动作、多个时间点或因果过程塞进同一块；剧情事实严格按正文，不编造人物、动作或人数。
-   - 表情与视线填后端规范给出的标准 danbooru 词，不写中文感受也不自创词组（想写「温柔地笑」就填 smile）；只能从规范列出的词里挑，规范没列的词一律不许用，拿不准就填 expressionless / looking at another。两项都不得留空，面无表情也要主动填 expressionless。多人画面每人各填一份，落 tag 时各自绑定，不得合并或裸写——裸写的表情只会落到一个人身上，另一人变成默认木脸。
-   - 角色行是每个本图可见的个体各一行（镜头外的人不写行，入镜的人群作为一个整体词写进 tag、不占行）；【一次性】角色在行首先补一次外貌（至少性别、发色发型、瞳色），这几个词就是落 tag 时绑定他的锚点。配角也要写全，不许只给主角写完整一行、配角用一句中文动作带过。每一行的表情与视线都必须各是一个独立的英文 danbooru 词：写成「看向另一侧、弯腰换鞋」这种中文短语等于这一行没有表情词，落 tag 时这个角色就会没有表情，被模型画成木脸。
-   - 可见服装照 C 中该角色当前状态的视觉指纹逐件写全，只写本景别看得见的部件；镜头外不可见的部件可以省略，但省略不等于脱掉，后续重新可见且中间没有变化时必须恢复。槽位里不许退回 school uniform、dress、pantyhose 这种笼统孤立词——C 段定的是 navy school blazer 就写 navy school blazer，写笼统词等于让模型自己重新设计这套衣服，同一角色每张图都会换个款式。多人画面每人的服装各写各的，落 tag 时各自绑定：两人都穿校服但男女版型不同，裸写一个 school uniform 会让模型把裙子套到男生身上。
-   - 场景和环境光：场景只写正文、上下文或世界设定能支持的事实，地形、地面材质、天气痕迹和环境状态都算事实，没依据就别写；环境光则相反，光源、时间和色调正文不会写，必须由你主动定，缺了画面就是平庸的大头照。
+   - 表情与视线填后端规范给出的标准词，不写中文感受也不自创词组（想写「温柔地笑」就填 smile）；两项都不得留空，面无表情也要主动填 expressionless。多人画面每人各填一份，落 tag 时各自绑定，不得合并或裸写——裸写的表情只会落到一个人身上，另一人变成默认木脸。
+   - 角色行是每个本图可见的个体各一行（镜头外的人不写行，入镜的人群作为一个整体词写进 tag、不占行）；【一次性】角色在行首先补一次外貌（至少性别、发色发型、瞳色），这几个词就是落 tag 时绑定他的锚点。配角也要写全，不许只给主角写完整一行、配角用一句中文动作带过。每一行的表情与视线都必须各是一个独立的英文标准词：写成「看向另一侧、弯腰换鞋」这种中文短语等于这一行没有表情词，落 tag 时这个角色就会没有表情，被模型画成木脸。
+   - 可见服装照 C 中该角色当前状态的视觉指纹逐件写全，只写本景别看得见的部件；镜头外不可见的部件可以省略，但省略不等于脱掉，后续重新可见且中间没有变化时必须恢复。槽位里不许退回 school uniform、dress、pantyhose 这种笼统孤立词——C 段定的是 navy school blazer 就写 navy school blazer。多人画面每人的服装各写各的，落 tag 时各自绑定：两人都穿校服但男女版型不同，裸写一个 school uniform 会让模型把裙子套到男生身上。
+   - 可见性：只写本图镜头、朝向、裁切与遮挡下真正看得见的部位；结合处被身体挡住时不写生殖器与插入细节，只写可见体态。
+   - 场景和环境光：场景只写正文、上下文或世界设定能支持的事实，地形、地面材质、天气痕迹和环境状态都算事实，没依据就别写；环境光则相反，光源、方向和色调正文不会写，必须由你主动定，缺了画面就是平庸的大头照。
 
 第三层｜落笔前自查（只核对，不预写答案）
 
-这一层只逐张核对下面几条，每点写一句结论即可。<thinking> 里禁止出现任何最终答案的草稿——不写完整 tag 串、不写完整 nl 句、更不要写出 JSON 对象或 "JSON:" 之类的标题。答案只在 </thinking> 之后出现一次，在思考里先写一遍等于把整份输出付两遍钱。核对完直接闭合 </thinking> 并输出 JSON：
-   - 每张图的 tag 覆盖了它自己那一块的全部非 "-" 槽位，没有漏掉表情、视线或环境光；要求 nl 时与 tag 描述同一画面。
+这一层只逐张核对下面几条，每点写一句结论即可。<thinking> 里禁止出现任何最终答案的草稿——不写完整 tag 串、{{#nl}}不写完整 nl 句、{{/nl}}更不要写出 JSON 对象或 "JSON:" 之类的标题。答案只在 </thinking> 之后出现一次，在思考里先写一遍等于把整份输出付两遍钱。核对完直接闭合 </thinking> 并输出 JSON：
+   - 每张图的 tag 覆盖了它自己那一块的全部非 "-" 槽位，没有漏掉表情、视线、光影或背景世界观；{{#nl}}要求 nl 时与 tag 描述同一画面。{{/nl}}{{^nl}}本次只写 tag，不写 nl。{{/nl}}
+   - 分级与画面一致：日常穿衣没有露点写 safe，有裸露写 nsfw，进行中的性行为写 explicit。
+   - 人数 tag 与入镜人数一致；每个入镜者都有一行角色行，镜头外的人没有写进 tag。
    - 每个剧情 tag 都能追溯到正文/设定；地形、地面、道路、天气和环境状态 tag 没依据就删除。
-   - 多人画面里服装、体型、物件、表情、视线和个人动作都已绑定到各自角色，没有散落的无主特征；每个入镜角色的服装都在 tag 里实际出现了，没有谁的衣服只写在槽位里却没进 tag，也没有 school uniform、pantyhose 这类没主人的笼统孤立词；每个入镜角色都各有一个绑定到自己的表情词和视线词，没有谁只有动作没有表情。
-   - 没有 pale skin、white skin、fair skin 这类白皙肤色词混进任何一张图（角色库字段里有也跳过不抄）：默认肤色已经够白，写了会白得发灰失真；角色真是晒黑/深肤色时用的 tan、dark skin 不在此列。
+   - 多人画面里服装、体型、物件、表情、视线和个人动作都已绑定到各自角色，没有散落的无主特征；没有 school uniform、pantyhose 这类没主人的笼统孤立词；每个入镜角色都各有一个绑定到自己的表情词和视线词，没有谁只有动作没有表情。
+   - 景别净空已执行：只写了一个景别；选了 close-up / upper body 就没有写鞋袜、裙长、腿部；选了 cowboy shot 就没有写小腿与鞋；核心接触点没有被景别裁出画面。
+   - 可见性：被遮挡、画外、朝向背面的部位都没有写；结合处看不见时没有写生殖器与插入细节。
+   - 解剖：器官归属明确、彼此可辨，没有多余的手或手指；优先半身或中景，没有走纯生殖器极端特写。
+   - 饰品与状态没有回弹：脱衣后饰品还在，湿身/污渍/勒痕/鞋印没有被自动清干净；同一场景内同一角色的服装与饰品逐字一致。
+   - 没有写否定词（no hat / without shoes 这类）、没有权重语法、没有 aspect ratio 或像素、没有质量词与泛词（beautiful、detailed、aesthetic）。
+   - 本图至少有一名性别明确的女性实际可见，没有纯男性图。
    - 这一层只核对、不改决定：发现问题就在落 tag 时直接改对，不要在思考里写出「超限，需精简」「让位」「改为」这类修订过程。张数在 E 段就已经定死，这里不该再变。
-   - 每个同人角色的 tag 串里都有 B 段定下的 character name (copyright name) 身份 tag（人数/构图之后、普通外貌之前），原创角色没有被误加作品名。
-   - 每个在场角色都能三选一：指出【角色固定外貌库】中的同名条目、在 changes 中有 field:"new"、或标为【一次性】（不建档不写 changes，入画时才在他自己的角色行里补外貌）；世界书里有详细设定不能代替建档。每条 field:"new" 建档的 hair 都同时带发色和长度/发型、eyes 都带瞳色。【一次性】角色没有被写进 changes——写进去就是错的。永久变化的 P编号合法，临时状态没被误写进 changes。
-   - 画面保持 E 段选定的主体和核心互动，没有为了减人数破坏核心互动，也没有把无关在场者补进画面；缺档未成为放弃画面或裁掉必要参与者的理由。人数 tag 只计取景框内可见的人，镜头外的人不写进 tag（要求 nl 时也不写进 nl）。
-   - 张数在设定范围内；仅当下限为 0 且确实无可画时 images 才为空，且无论如何都保留应有的建档与 changes。`;
+   - 每个在场角色都能三选一：指出【角色固定外貌库】中的同名条目、在 changes 中有 field:"new"、或标为【一次性】（不建档不写 changes，入画时才在他自己的角色行里补外貌）；世界书里有详细设定不能代替建档。每条 field:"new" 建档的 hair 都同时带发色和长度/发型、eyes 都带瞳色。【一次性】角色没有被写进 changes，也没有被编造人名。永久变化的 P编号合法，临时状态没被误写进 changes。
+   - 画面保持 E 段选定的主体和核心互动，没有为了减人数破坏核心互动，也没有把无关在场者补进画面；缺档未成为放弃画面或裁掉必要参与者的理由。
+   - size 与景别一致；张数在设定范围内；仅当下限为 0 且确实无可画时 images 才为空，且无论如何都保留应有的建档与 changes。`;
 
 /**
- * NAI 思维链内置默认(4.5/V5,设置页里显示为「NAI 思维链」)。第一层与第三层沿用同一套
- * 判断顺序,第二层换成这套协议自己的形态:一张图 = 一个 Base 块 + 每个入画个体各一块,
- * 对应 characters[] 数组。模型列表收窄后这是 NAI 后端唯一在用的一份。
+ * NAI 思维链内置默认(4.5/V5,设置页里显示为「NAI 思维链」),内容照 绘境物语1.0 的分镜/状态账本
+ * 体系重排:第一层 A～E 是整楼判断(事实账本 → 角色清点 → 服装与状态时间线 → 世界观与光源 → 选段),
+ * 第二层是逐图槽位(Base 块 + 每个入画个体一块,对应 characters[]),第三层只核对不改决定。
  *
- * ⚠ 这份里不得出现 "X on Y girl" 式邻接绑定——DEFAULT_NAI_V5_SPEC 第 8 条明令禁止,
+ * 槽位与 DEFAULT_NAI_V5_SPEC 一一对应:分级/人数/景别/机位与焦点/核心互动/场景/环境光/size;
+ * 角色块多出饰品与状态、姿态与承重、接触(施受三要素)、可见结构四格,都是 绘境物语 的硬规则
+ * (脱衣不脱饰品、状态不回弹、主被动不许反转、只写看得见的结构)。
+ *
+ * ⚠ 这份里不得出现 "X on Y girl" 式邻接绑定——DEFAULT_NAI_V5_SPEC 明令禁止,
  * 4.5/V5 靠 Character Prompt 天然隔离每个人,写邻接绑定反而是把两套机制混用。
  */
 export const DEFAULT_NAI_V5_THINKING = `【输出前思考清单】
@@ -1435,6 +1462,8 @@ A. 事实与状态账本
    - 只给目标正文选图；此前上下文只用于理解人物、场景和连续性。目标正文的明确事实优先，其次是紧邻上下文；历史 <bbi_image> 只作连续性线索，不能覆盖正文。
    - 区分三类状态：角色库中的永久事实；连续场景中应继承的临时状态（衣物穿脱程度、湿身/污渍、伤势、饰品、手持物等）；只属于单帧的表情、视线和具体姿势。
    - 没有明确穿回、整理、换装、解除状态、时间跳跃或场景切换时，不得把临时状态恢复成角色默认值。
+   - 一张图只取一次快门能完整拍下的单一瞬间：不把先后两个时刻、两个机位或因果两端拼进同一张；同一瞬间的触发与即时反应可以同框。
+   - 定一次本楼的视角口径：第三人称、pov（观察者不入画，只有他的手/肩在接触时入画），还是逐图各自判断。定了就全楼沿用，同一张图内不混用。
 
 B. 角色清点与建档（具体建档字段与写法见任务协议，这里只做清点判断）
    - 通读目标正文，逐个列出实际在场的**全部**角色——有名有姓的和只有指称的（三年级队长、店主）都要列，不能只看最终入选图片里的人，也不能漏掉世界书、角色卡或柏宝书为其给出了设定的角色。清点的是「谁在场」，不是「谁有档案」。
@@ -1446,22 +1475,27 @@ B. 角色清点与建档（具体建档字段与写法见任务协议，这里�
    - 名字一律用原文（【已建档】【本次建档】两类）：field:"new" 建档的 name 必须与角色卡/世界书/柏宝书/正文中该角色的名字逐字相同，中文名写中文（小雪，不写 Xiaoxue 也不意译）；引用已建档角色时，characters[].name 与 tag{{#nl}}/nl{{/nl}} 里出现的名字同样照抄档案里的原名字，不得音译、翻译或变体——插件按名字逐字匹配，名字对不上档案或正文，锚定就会断开。【一次性】角色不参与任何匹配，用正文的指称原词作 name 即可，这条不适用于他。
    - 同一行里顺带判定原创还是同人（仅对【已建档】【本次建档】两类做）：只有角色卡、世界书、正文或通行角色名能可靠指向某个已有作品时才判为同人，证据不足按原创处理，不猜作品。判定为同人时同一行定出最终身份 tag 词：模型可识别的英文 Danbooru 角色名与作品名，格式 character name (copyright name)，不转义圆括号。身份 tag 必须写进档案：本次 field:"new" 建档的写进 fields.fandom；已建档但档案缺 fandom 的补一条 field:"fandom" 的 changes；档案已有 fandom 的直接照抄。画图时逐字放在该角色 characters[].tag 的首位，不得放进 Base。原创角色档案不写 fandom。【一次性】角色不判同人、不写 fandom。
    - 缺发色、发型或瞳色时一次性补全：hair 必须同时带发色和长度/发型（long black hair 行，只写 black hair 这种裸颜色不行），eyes 必须带瞳色；建档在本楼全程有效，不要对同一角色给出两套外貌。【一次性】角色入画时同样要有发色与瞳色，只是补在他的角色块里、不进档案；未入画不补外貌，同一楼里他若出现在两张图，两张用同一套外貌。
+   - 只从设定原文取事实：原文没写伤疤、刺青、胎记、泪痣、遮眼刘海，就一律不补——冷酷性格或晒黑肤色不是长疤的证据。原文没写表情不是不写的理由（表情在第二层推断），原文没写身高也不补身高词。
    - 对照角色库检查永久变化：染发、剪发、永久变身等写入 changes 并标出生效 P编号；假发、美瞳、湿发、光照变色等临时状态不写。即使 images 为空也不能跳过这一步。
 
 C. 服装时间线（B 段列出的【已建档】【本次建档】角色各一行：从 P 几起穿的是什么）
    - 按正文 P 位置维护每个角色的临时服装：正文未明确初始穿着时合理决定一次；没有穿脱、换装、衣物损坏或场景/时间跳跃就沿用上一状态，明确变化后从对应 P 位置起更新。
    - 每套服装冻结一份「视觉指纹」（版型/剪裁 + 主色 + 关键部件，裤袜含颜色与透明度，具体要求见任务协议），相同状态全楼复用同一份，不要写成 school uniform、dress、pantyhose 这类模型会自行重新设计的孤立词。
+   - 同一行里连饰品一起冻结：耳钉/耳环/耳骨夹、发饰、眼镜、项链/颈带、手链、戒指、脚链、穿刺环一经确立就逐字复用；脱到半裸或全裸时饰品照样保留（正文没写摘下就不摘）。
+   - 表面状态（湿身、半透明湿衣、水渍、体液、踩踏鞋印、酒渍食物残渣、绳勒痕、掌印、红印、压痕）只要正文没写换衣、擦洗或消退，就跨图继承，不得自动变回干净。
    - 【一次性】角色不在本段占行：他没有跨图延续的服装账本，衣着在他入选那张图的角色块里一次写定即可（同一楼两张图都有他时两张保持一致）。给他维护时间线是白写的，也会误导你把他当成正式角色去建档。
 
 D. 时代与世界观（一次判断，全楼通用）
    - 定一套具体、自洽的时代/文明/视觉体系并全楼沿用：有明确设定就严格遵循，证据少也要主动选一个，不得退回中性服装或默认现代都市。落实到服装版型、材质、配饰和有依据的建筑器物上。
-   - 这套判断只决定「怎么画」，不得借它把未知的场景事实具体化。
+   - 这套判断只决定「怎么画」，不得借它把未知的场景事实具体化。地形、地面材质、天气痕迹、环境状态都是事实，没依据就不写。
+   - 顺手定下本楼的光源体系：主光从哪来、色温冷暖、阴影落向哪、整体色调；同一场景内多张图保持一致，剧情里点灯/天亮/云散才改。
 
 E. 选段
    - 候选必须是一个可见瞬间，有明确主体、动作或视觉状态和场景。纯对话只有在伴随值得画的表情、肢体动作、人物关系或环境变化时才保留；只跳过没有视觉变化的对话、纯心理和过渡。
    - 优先选择突出玩家主角或主要角色的画面，看点是他们的表情、状态、行动与关系，不要求他们每张都同框；不以有无档案或是否有名字给候选加减分。
    - 先确定本图要突出的主体与核心互动，再决定谁入镜。在不损失这些内容的前提下，优先不带无关在场者的构图；必要的无名互动对象照常保留，不为少一个人裁断核心动作。人群同样不因正文提到就必须入画，若人群本身承载核心互动则保留。
    - 按视觉明确度、剧情重要度、动作完整度、与其他候选的差异度排序，并遵守任务协议给出的最少～最多数量：下限大于 0 时从较次但仍可见的候选中补足；达到下限后只继续选择足够强且彼此明显不同的画面，不要用同一事件的相邻动作或不同镜头凑近上限。
+   - 每张图顺手定一个镜头类型，并让它决定景别、机位与焦点：建立（wide shot / full body，交代地点与站位）、互动（cowboy shot / upper body，肢体接触与对话）、反应（close-up / portrait，情绪与余韵）、局部（extreme close-up，眼/手/唇/物件）、插入（close-up，画面里没有人，只拍关键道具）。相邻两张不要用同一景别，全楼至少换一次机位。
    - 给每张入选图选定 P编号：让画面所需事实刚刚完整成立、且尚未切换到下一场景的位置。最后写出选定的 P 列表。
    - 数量在这里就要卡死：写出 P 列表之前先数一遍，多于上限就当场砍到上限再往下走。第二层只为最终入选的 P 写块，绝不允许先超额写完几块、再到第三层发现超限回头删——那几块是白写的，而且第三层只核对、不改决定。
 
@@ -1470,19 +1504,25 @@ E. 选段
 V5 的一张图 = 一个 Base 块 + 每个本图可见的个体角色各一块，与最终 JSON 的 tag{{#nl}}/nl{{/nl}} 和 characters[] 一一对应。先写 Base 块，再按从左到右、从上到下的顺序逐个写角色块——这个顺序就是 characters[] 的顺序。角色块按 E 段决定的取景写，与他有没有档案无关：【一次性】角色入画时同样各写一块，镜头外的人不写块，也不补进 Base；入画的人群作为整体留在 Base。
 
 ■ P<编号>｜Base
+  分级：<general / sensitive / nsfw / explicit，按本图实际画面判定，不按整段剧情最高级别>
   人数：<2girls / 1boy 1girl 等；只数本图取景框内可见的人，不数场景里在场但不入画的人；无人物画面写 no humans>
-  景别：<close-up / upper body / medium shot / full body / wide shot 中只选一个，且必须完整容纳下面的核心互动>
+  景别：<close-up / upper body / cowboy shot / full body / wide shot 中只选一个，且必须完整容纳下面的核心互动>
+  机位与焦点：<from side / from above / from below / three-quarter view / pov 等只选一个；焦点最多一个 face focus / eye focus / hand focus / thigh focus / crotch focus，没有就写 "-">
   核心互动：<多人共同参与的那个动作：谁的哪个身体部位接触了什么，先用中文点明接触点，再给英文 tag；单人画面本槽写 "-"，唯一角色的动作是他角色块的个人动作，不进 Base>
-  场景：<地点 + 画面里实际可见的关键道具>
-  环境光：<光源 + 时间 + 色调>
+  场景：<地点 + 画面里实际可见的关键道具 + 至少两个环境细节>
+  环境光：<光源 + 方向 + 时间 + 色调 + 阴影落向>
   size：<portrait / landscape>
 
 ■ P<编号>｜<角色名或正文指称>（每个本图可见的个体角色各写一块；【一次性】角色用正文的指称原词作块名）
-  固定外貌：<【已建档】【本次建档】照抄库中/刚建档的字段；【一次性】按世界观一次性补全，至少含性别、发色发型、瞳色。1girl/1boy 一律转成 girl/boy>
-  可见服装：<本景别看得见的部件，逐件写全>
+  固定外貌：<【已建档】【本次建档】照抄库中/刚建档的字段；【一次性】按世界观一次性补全，至少含性别、发色发型、瞳色。1girl/1boy 一律转成 girl/boy；同人的身份 tag 放本块首位>
+  可见服装：<本景别看得见的部件，逐件写全，带颜色与材质；含裤袜时写颜色与透明度>
+  饰品与状态：<本镜头可见的饰品逐件写全；湿/污/痕/勒痕等继承状态；都没有写 "-">
   表情：<一个标准 danbooru 词>
   视线：<一个标准 danbooru 词>
-  个人动作：<这个角色自己在做什么>
+  姿态与承重：<站/坐/跪/卧/趴 + 支撑点（standing on…、sitting on…、lying on…、坐在人身上/脚踩在谁背上）；人体家具的上下两方各写自己的承重与形变>
+  个人动作：<这个角色自己在做什么，完成态；左右手分别写>
+  接触：<施受三要素：谁 source#动作、对方 target#动作 且写明被接触的衣物或部位；没有接触写 "-">
+  可见结构：<只写本图镜头、朝向、遮挡下真正看得见的部位，逐人归属；没有裸露或遮挡全部可见面写 "-">
   相对位置：<画面左 / 中 / 右，供排序与站位用>
 
 槽位填写要求（槽位值直接写你最终要放进 tag 的英文词；确实不适用的槽位写 "-"，但 Base 的景别、场景、环境光、size 与每个角色块的表情、视线永远不得为 "-"——核心互动只在单人画面写 "-"）：
@@ -1490,20 +1530,27 @@ V5 的一张图 = 一个 Base 块 + 每个本图可见的个体角色各一块�
    - 具体禁止这三种写法：带问号的自问（「landscape？」「用 blush？」）、并列候选（「expressionless 或 slight smile」）、写完再推翻（「用 A……不过 B 更好，改 A 为 B」）。心里比较完直接写结论，把比较过程留在心里。证据不足时按兜底口径直接定（size 拿不准写 portrait，服装细节不明就选一套常见且自洽的），定了就往下走。
    - 也不要在槽位里附上选择理由或对 danbooru 词表的检索过程（「looking ahead 不在标准列表」这类）——规范给了什么词，直接从里面挑一个填上。
    - 单一瞬间：一块只能是一次快门完整拍下的画面，不要把先后发生的多个动作、多个时间点或因果过程塞进同一块；剧情事实严格按正文，不编造人物、动作或人数。
-   - **Base 块与角色块的分工是硬边界**：人数、景别、场景、环境光和多人共同参与的互动只进 Base；某一个角色的外貌、服装、表情、视线和个人动作只进他自己那一块，落 JSON 时进他自己的 characters[].tag。绝不能把某人的服装或动作写进 Base，也不能写进别人那一块——V5 靠 Character Prompt 隔离每个人，混进 Base 就等于把这件衣服摊给同框所有人。单人画面唯一角色的动作同样是个人动作：落在他的角色块里，Base 的核心互动槽写 "-"。{{#nl}}这条分工对 Base 的 nl 同样成立：Base nl 只写整体场景、空间关系与事件，不写任何单个角色的外貌与服装细节。{{/nl}}
+   - **Base 块与角色块的分工是硬边界**：人数、景别、机位、场景、环境光、分级和多人共同参与的互动只进 Base；某一个角色的外貌、服装、饰品、表情、视线、姿态、个人动作和可见结构只进他自己那一块，落 JSON 时进他自己的 characters[].tag。绝不能把某人的服装或动作写进 Base，也不能写进别人那一块——V5 靠 Character Prompt 隔离每个人，混进 Base 就等于把这件衣服摊给同框所有人。单人画面唯一角色的动作同样是个人动作：落在他的角色块里，Base 的核心互动槽写 "-"。{{#nl}}这条分工对 Base 的 nl 同样成立：Base nl 只写整体场景、空间关系与事件，不写任何单个角色的外貌与服装细节。{{/nl}}
    - **不要用邻接绑定**：把特征挂到别人的发色词后面（例如把 white dress 直接接在 green hair girl 后面）是单串 tag 后端的做法，V5 不用。这里每个角色有自己独立的一块，直接写 white dress 即可，归属由所在的块决定。
    - 已入画的个体每人各写一块，配角也要写全，不许只给主角写完整一块、配角用一句中文动作带过。表情与视线必须各是一个独立的英文 danbooru 词：写成「看向另一侧、弯腰换鞋」这种中文短语等于这一块没有表情词，落 JSON 时这个角色就会没有表情，被模型画成木脸。
    - 表情与视线填后端规范给出的标准 danbooru 词，不写中文感受也不自创词组（想写「温柔地笑」就填 smile）；只能从规范列出的词里挑，规范没列的词一律不许用，拿不准就填 expressionless / looking at another。两项都不得留空，面无表情也要主动填 expressionless。
-   - 若正文明确为显式 NSFW 场景：每个角色镜头中实际可见的性器官与身体部位写进他自己的角色块（落其 characters[].tag），多人共同参与的性行为与整体接触写进 Base 的核心互动，并按后端规范用 source# / target# / mutual# 标明谁施谁受；不得只用 nsfw、nude、sex 泛化词代替关键解剖信息，被完全遮住或画面外的部位不得写成可见。
+   - 若正文明确为显式 NSFW 场景：每个角色镜头中实际可见的性器官与身体部位写进他自己的角色块（落其 characters[].tag），多人共同参与的性行为与整体接触写进 Base 的核心互动，并按后端规范用 source# / target# / mutual# 标明谁施谁受；不得只用 nsfw、nude、sex 泛化词代替关键解剖信息，被完全遮住或画面外的部位不得写成可见。主被动不许反转：突袭方写发起词，受惊方写承受词与反应，双方都主动才用 mutual#。
    - 可见服装照 C 中该角色当前状态的视觉指纹逐件写全，只写本景别看得见的部件；镜头外不可见的部件可以省略，但省略不等于脱掉，后续重新可见且中间没有变化时必须恢复。槽位里不许退回 school uniform、dress、pantyhose 这种笼统孤立词——C 段定的是 navy school blazer 就写 navy school blazer，写笼统词等于让模型自己重新设计这套衣服，同一角色每张图都会换个款式。
-   - 场景和环境光：场景只写正文、上下文或世界设定能支持的事实，地形、地面材质、天气痕迹和环境状态都算事实，没依据就别写；环境光则相反，光源、时间和色调正文不会写，必须由你主动定，缺了画面就是平庸的大头照。
+   - 场景和环境光：场景只写正文、上下文或世界设定能支持的事实，地形、地面材质、天气痕迹和环境状态都算事实，没依据就别写；环境光则相反，光源、方向和色调正文不会写，必须由你主动定，缺了画面就是平庸的大头照。
 
 第三层｜落笔前自查（只核对，不预写答案）
 
 这一层只逐张核对下面几条，每点写一句结论即可。<thinking> 里禁止出现任何最终答案的草稿——不写完整 tag 串、{{#nl}}不写完整 nl 句、{{/nl}}更不要写出 JSON 对象或 "JSON:" 之类的标题。答案只在 </thinking> 之后出现一次，在思考里先写一遍等于把整份输出付两遍钱。核对完直接闭合 </thinking> 并输出 JSON：
-   - 每张图的 Base tag 逐槽核对过：人数、景别、场景、环境光、多人画面的核心互动，每一项都能在 tag 里找到对应的词，环境光不许漏（光源/时间/色调至少落一个具体词）；{{#nl}}nl 与 tag 描述同一画面，且所有 nl（Base 与每个角色）一律用英文写——正文和上面的思考是中文也不例外，中文 nl 会被生图模型读得更差，还要多花几倍 token；角色名是唯一例外：每个角色的 name 与 nl 里出现的名字都逐字对应档案/正文原名（中文名写中文），没有任何音译或变体；每个角色块都变成了 characters[] 里的一项，name/tag/nl 都不为空。{{/nl}}{{^nl}}每个角色的 name 都逐字对应档案/正文原名（中文名写中文），没有任何音译或变体；每个角色块都变成了 characters[] 里的一项，name/tag 都不为空；本次只写 tag，Base 与各角色都不写 nl。{{/nl}}
+   - 每张图的 Base tag 逐槽核对过：分级、人数、景别、机位、场景、环境光、多人画面的核心互动，每一项都能在 tag 里找到对应的词，环境光不许漏（光源/方向/色调至少落两个具体词）；分级与画面一致（日常穿衣没有露点写 general，有裸露写 nsfw，进行中的性行为写 explicit）。{{#nl}}nl 与 tag 描述同一画面，且所有 nl（Base 与每个角色）一律用英文写——正文和上面的思考是中文也不例外，中文 nl 会被生图模型读得更差，还要多花几倍 token；角色名是唯一例外：每个角色的 name 与 nl 里出现的名字都逐字对应档案/正文原名（中文名写中文），没有任何音译或变体；每个角色块都变成了 characters[] 里的一项，name/tag/nl 都不为空。{{/nl}}{{^nl}}每个角色的 name 都逐字对应档案/正文原名（中文名写中文），没有任何音译或变体；每个角色块都变成了 characters[] 里的一项，name/tag 都不为空；本次只写 tag，Base 与各角色都不写 nl。{{/nl}}
    - 每个剧情 tag 都能追溯到正文/设定；地形、地面、道路、天气和环境状态 tag 没依据就删除。
+   - 景别净空已执行：只写了一个景别；选了 close-up / upper body 就没有写鞋袜、裙长、腿部或全身姿态；选了 cowboy shot 就没有写小腿与鞋；wide shot 没有写瞳色与面部细节；核心接触点没有被景别裁出画面。
+   - 可见结构只写本图真正看得见的部位，且逐人归属：被衣服、身体、镜头或朝向遮住的一律没写；背面露臀只写静态结构词，没有写成 anal 这个动作词；同人身份 tag 与作品名没有被拆错、也没有写进 Base。
    - Base 的 tag {{#nl}}和 nl 里都{{/nl}}{{^nl}}里{{/nl}}没有混进任何单个角色的外貌、服装或个人动作；每个角色的服装和个人动作都在他自己的 characters[].tag 里实际出现了，没有谁的服装或动作只写在槽位{{#nl}}或 nl {{/nl}}里却没进 tag，也没有 school uniform、pantyhose 这类被简写掉的笼统词；每个角色都各有一个表情词和一个视线词，没有谁只有动作没有表情。
+   - 多人画面里服装、体型、物件、表情、视线和个人动作都已归属到各自角色块，没有散落的无主特征；每个入镜角色的服装都在 tag 里实际出现了，没有谁的衣服只写在槽位里却没进 tag。
+   - 接触已配齐三要素：受方写出了被接触的衣物或部位，双方各带 source# / target#，有零距离空间词；主被动没有反转，突袭场景没有给受方写发起词。
+   - 饰品与状态没有回弹：脱衣后饰品还在，湿身/污渍/勒痕/脚印没有被自动清干净；同一场景内同一角色的服装与饰品逐字一致。
+   - 没有从设定原文里不存在的地方补伤疤、刺青、胎记或身高词；身材按设定映射（丰满写 curvy / voluptuous，不写 fat）；肌肤质感没有在平淡日常提前写成油光。
+   - 显式场景里每个器官都归属正确、彼此可辨，没有融合成一块，也没有多出来的手或手指；内部透视只在真正插入的那张图、只在受插方角色块里出现。
    - 这一层只核对、不改决定：发现问题就在落 tag 时直接改对，不要在思考里写出「超限，需精简」「让位」「改为」这类修订过程。张数在 E 段就已经定死，这里不该再变。
    - 每个同人角色的身份 tag 都逐字照抄自档案 fandom 字段、在其 characters[].tag 的首位，没有放进 Base；同人角色的档案都带 fandom（本次建档或 field:"fandom" 补档），原创角色档案没有 fandom、没有被误加作品名。
    - 若本图是显式 NSFW 场景：可见解剖部位都在所属角色的 tag 里、多人共担的性行为与整体接触在 Base，没有只写泛化 NSFW 词；非显式场景本项直接跳过。
@@ -1513,6 +1560,10 @@ V5 的一张图 = 一个 Base 块 + 每个本图可见的个体角色各一块�
 
 /**
  * NAI 规范:4.5 / V5 的 Base Prompt + 原生 Character Prompts。
+ * 主体照 绘境物语1.0 重写(分级前置、景别净空、可见结构锁死、衣着与饰品冻结、状态继承、
+ * 施受三要素与主被动防反转、内部透视三重靶向、人体家具承重、防崩坏、背景世界观约束),
+ * 但输出形态仍是本插件的协议:images[].tag / characters[].tag,不用世界书那套
+ * Scene Composition / Character N Prompt / centers / UC。
  *
  * 模型列表收窄到 4.5/V5 后,这就是 NAI 后端**唯一**的一份规范,设置页里显示为「NAI 规范」。
  *
@@ -1522,51 +1573,84 @@ V5 的一张图 = 一个 Base 块 + 每个本图可见的个体角色各一块�
  * 不值得 —— 面板标签已改成不提代数的「NAI 规范」,键名的历史包袱只留在代码里。
  */
 export const DEFAULT_NAI_V5_SPEC = `[NovelAI 4.5/V5 Prompt Specification]
-Map every image to one Base Prompt plus zero or more native Character Prompts.
+Map every image to one Base Prompt plus zero or more native Character Prompts. NovelAI reads each Character Prompt as its own isolated caption, so use that isolation instead of cramming everybody into one string: what belongs to one person never goes into Base, and Base never repeats what a Character Prompt already says.
 
 Each image must contain:
-- tag: English comma-separated danbooru tags for the Base Prompt. Put global character counts, scene, composition, camera, lighting, atmosphere, and shared interactions here. Do not put one character's appearance, outfit, or individual action in Base.
+- tag: English comma-separated danbooru tags for the Base Prompt. Rating first, then global character counts, scene, composition, camera, lighting, atmosphere, and shared interactions. Do not put one character's appearance, outfit, or individual action in Base.
 {{#nl}}- nl: a coherent English natural-language Base Prompt describing the whole scene, spatial relationships, camera, and overall event. Like the Base tag it stays global: never put one character's appearance, outfit, or individual action in the Base nl; those belong to that character's own nl.
-{{/nl}}- characters: an array of the characters actually visible in this image, ordered left-to-right then top-to-bottom. Every item is {{#nl}}{"name":"...","tag":"...","nl":"..."}{{/nl}}{{^nl}}{"name":"...","tag":"..."}{{/nl}}. Membership is decided by the frame, not by the library: a character who is visible but has no library profile still gets an entry (see rule 9). Names of library characters must follow the Name consistency rules below.
+{{/nl}}- characters: an array of the characters actually visible in this image, ordered left-to-right then top-to-bottom. Every item is {{#nl}}{"name":"...","tag":"...","nl":"..."}{{/nl}}{{^nl}}{"name":"...","tag":"..."}{{/nl}}. Membership is decided by the frame, not by the library: a character who is visible but has no library profile still gets an entry (see rule 10). Names of library characters must follow the Name consistency rules below.
+
+Rule 0 — the Base Prompt, in order:
+0.1 Rating first, judged by this exact frame rather than by the tone of the whole scene: general for everyday, fully clothed moments; sensitive for suggestive framing with nothing exposed; nsfw for nudity, visible underwear, or exposed sex organs; explicit for an ongoing sexual act. A fully clothed daily scene stays general even when the story is erotic elsewhere.
+0.2 Then the visible count (1girl, solo / 1girl, 1boy / 2girls / no humans). Count only people inside this frame, never people merely present in the scene.
+0.3 Then scene and props, then exactly one shot distance, then one camera angle, then at most one focus, then light and color mood, then any interaction shared by two or more characters. Base carries no hair, eyes, body, outfit, expression, or personal action of any single person.
 
 Character Prompt rules:
-1. tag uses English danbooru tags for that character's identity, sex, fixed appearance, current outfit, expression, gaze, pose, action, visible anatomy, and necessary relative position. Use girl/boy rather than 1girl/2girls; numeric counts belong only in Base. Expression and gaze are mandatory for every character and must use real danbooru tags rather than invented descriptive phrases: pick expressions from smile, grin, laughing, blush, embarrassed, frown, pout, puffy cheeks, surprised, crying, tears, angry, serious, sad, worried, scared, smug, seductive smile, expressionless, half-closed eyes, open mouth, clenched teeth; pick one gaze from looking at viewer, looking at another, looking away, looking down, looking up, looking back, closed eyes. Write smile rather than gentle smile and blush rather than shy expression; phrases like neutral curious expression are not tags and only dilute the prompt.{{#nl}} Save adjectival nuance for nl.{{/nl}} When the story does not state an expression, infer one; write expressionless explicitly rather than omitting it.
+1. tag uses English danbooru tags for that character's identity, sex, fixed appearance, current outfit, expression, gaze, pose, action, visible anatomy, and necessary relative position. Order: identity tag → girl/boy → hair → eyes → face marks → body and breasts → skin → outfit top-down → hosiery and shoes → accessories → current state → pose and support → action → contact → visible anatomy → expression → gaze. Use girl/boy rather than 1girl/2girls; numeric counts belong only in Base. Expression and gaze are mandatory for every character and must use real danbooru tags rather than invented descriptive phrases: pick expressions from smile, grin, laughing, blush, embarrassed, frown, pout, puffy cheeks, surprised, crying, tears, angry, serious, sad, worried, scared, smug, seductive smile, expressionless, half-closed eyes, open mouth, clenched teeth; pick one gaze from looking at viewer, looking at another, looking away, looking down, looking up, looking back, closed eyes. Write smile rather than gentle smile and blush rather than shy expression; phrases like neutral curious expression are not tags and only dilute the prompt.{{#nl}} Save adjectival nuance for nl.{{/nl}} When the story does not state an expression, infer one; write expressionless explicitly rather than omitting it. In a multi-character frame every character carries their own expression and gaze inside their own tag — one bare smile in Base lands on a random person and leaves the rest blank-faced.
 2. First decide whether the named character is an original character or a fandom character. Treat a character as fandom only when the character card, lorebook, story, or an unambiguous well-known name reliably identifies an existing anime, game, novel, or other work. If the work is uncertain, do not guess; treat the character as original.
 3. For every fandom character, the model-recognized English Danbooru identity tag, formatted exactly as character name (copyright name), must be the first tag in that character's tag. The identity tag is stored in the fixed appearance library: when creating the entry (changes field:"new"), register it as the fields.fandom of that entry; when an existing entry lacks it and the character is fandom, add it via a changes item with field:"fandom"; then copy it verbatim every time. Do not escape the parentheses for NovelAI, do not translate the names literally, do not abbreviate the copyright, and do not put this per-character identity tag in Base. Original characters receive no copyright identity tag and no fandom field.
-4. For an explicit NSFW scene. Do not rely on vague tags such as nsfw, nude, or sex: name each actually visible, action-relevant anatomical feature or genital in the owning character's tag, such as breasts, nipples, penis, pussy, anus, or testicles. Do not claim fully covered or out-of-frame anatomy is visible.
+4. For an explicit NSFW scene. Do not rely on vague tags such as nsfw, nude, or sex: name each actually visible, action-relevant anatomical feature or genital in the owning character's tag, such as breasts, nipples, penis, pussy, anus, or testicles. Do not claim fully covered or out-of-frame anatomy is visible. Write the contact itself with accurate danbooru action tags (penis in pussy, penis in ass, fellatio, paizuri, handjob, footjob, intercrural) instead of euphemism, and keep each organ separately readable.
 5. Put the shared sexual act and overall contact in Base. Use source# / target# / mutual# tags in Character Prompts when they clarify who acts, which body part is involved, and who or what receives the action. The tags must describe the exact visible contact rather than euphemize it.
-{{#nl}}6. nl uses English natural language for the same character's appearance, outfit, action, facing, interaction, visible anatomy, and approximate position. It may add relationship or spatial detail but must not conflict with tag.{{/nl}}{{^nl}}6. This output is tag-only: write no nl key anywhere, neither in Base nor in any Character Prompt. Everything rule 1 lists for a character — including facing, interaction, and necessary relative position — must be carried by that character's own tag; clarify who acts on whom with source# / target# / mutual# tags (rules 5 and 8).{{/nl}}
-7. For characters in the fixed appearance library, copy the library Tag fields into that character's tag, keeping the fandom identity tag (fields.fandom) first. Keep appearance wording verbatim, but convert the library sex count tag 1girl/1boy to girl/boy.{{#nl}} Library natural-language notes may inform that character's nl.{{/nl}} Tag fields remain canonical.
-8. For other multi-character interactions, use NovelAI source# / target# / mutual# tags when they clarify actor and target. Do not use ComfyUI's multi-person segmentation convention.
-9. Character Prompts are keyed to the frame, not to the library. Do not create Character Prompts for characters absent from this image. A visible character who has no library profile still belongs in characters[]: when the story treats someone as a single identifiable person — an opponent, a shopkeeper, a passer-by carrying a child — give them their own Character Prompt even though they will never be registered. Use the term the story uses for them as the name (三年级队长, 店主), and complete their appearance once, for this image only. Such an entry is valid for this image alone: never report it in changes, never add it to the library, and never carry it into a later floor. Never invent a personal name for them — a made-up name is indistinguishable from a real profile when this image tag is later read back as context.
-10. People the story treats as a mass rather than as individuals — crowds, soldiers, onlooking students — receive no Character Prompt. Only include them when the chosen frame needs the crowd; then describe them in Base as a group. When unsure whether people already selected for the frame are individuals or a mass, leave them in Base. This is a placement rule for visible people, not a reason to add bystanders or crowds to the image.
+6. Contact lock (three elements, every direct physical interaction — collar grab, chin lift, hair pull, kiss, hug, kabedon, pinning, lifting, holding): (a) the receiving character's tag must name the garment or body part being touched (collared shirt, necktie, chin, waist, thigh); (b) both sides carry the paired anchor, source#action on the acting side and target#action on the receiving side; (c) add the zero-distance words (close distance, invading personal space, pulling closer) so the two bodies actually meet. Never write a bare action that names nobody.
+7. Active versus passive must never flip. Decide once whether the story shows mutual participation or a one-sided surprise. The initiator gets the initiating verbs and the controlling hands (leaning in closely, hand on back of another's head, grabbing chin, holding waist, pulling another close); the receiver gets the receiving state and the visible reaction (pulled in, stiff body, hands against another's chest, wide eyes, surprised, shocked). Never give a surprised receiver the initiating verbs, and never write mutual#kiss / french kissing / arms around neck for a one-sided moment.
+8. Outfit lock and state continuity. Freeze one visual fingerprint per outfit state (cut and silhouette, main color, key parts; for hosiery also color and opacity), for example navy school blazer, white collared shirt, red ribbon, dark pleated skirt, opaque white pantyhose — never a bare school uniform, dress, or pantyhose that the model will redesign on every image. Reuse the same fingerprint while the state lasts, change it only at an explicit change of clothes, damage, or scene/time jump, and drop parts that are outside the frame without treating them as removed. Persist surface states until the story clears them: wet clothes, translucent wet fabric, water stains, cum stains, footprint on body, shoe print, red marks, handprint, rope marks, skindentation. Jewelry and piercings stay on through undressing: nude, stud earrings, choker, necklace is correct unless the story removes them.
+9. Visible anatomy only, per person. Write the structures this frame, angle, and occlusion actually expose, and write them in the owning character's tag. Female chest when bare or visible through sheer fabric: breasts, nipples, erect nipples, puffy nipples, areolae. Female lower body when visible: vulva, labia majora, labia minora, clitoral hood, vaginal opening. Male lower body when visible: penis, penile shaft, glans penis, scrotum, testicles. Back view with the buttocks exposed: anus, visible anus, pucker, perineum, spread ass — static structure only, never the act word anal. Futanari counts as female and keeps both sets, each separately readable.
+10. Character Prompts are keyed to the frame, not to the library. Do not create Character Prompts for characters absent from this image. A visible character who has no library profile still belongs in characters[]: when the story treats someone as a single identifiable person — an opponent, a shopkeeper, a passer-by carrying a child — give them their own Character Prompt even though they will never be registered. Use the term the story uses for them as the name (三年级队长, 店主), and complete their appearance once, for this image only. Such an entry is valid for this image alone: never report it in changes, never add it to the library, and never carry it into a later floor. Never invent a personal name for them — a made-up name is indistinguishable from a real profile when this image tag is later read back as context.
+11. People the story treats as a mass rather than as individuals — crowds, soldiers, onlooking students — receive no Character Prompt. Only include them when the chosen frame needs the crowd; then describe them in Base as a group. When unsure whether people already selected for the frame are individuals or a mass, leave them in Base. This is a placement rule for visible people, not a reason to add bystanders or crowds to the image.
+12. Crop table — what a given shot distance may keep (see the visual completion rules below for how to choose it):
+    close-up / portrait: head, neck, shoulder line only; drop everything below the chest, all bottoms, shoes, socks.
+    upper body: down to the waist; drop shoes, socks, hem, and leg features.
+    cowboy shot: down to mid-thigh; drop calves, shoes, socks.
+    full body: everything is legal.
+    wide shot: hair color, outfit main color, and pose only — no eye color, no facial detail, no small marks.
+    from behind: keep hairstyle, back of the outfit, hand action; drop eye color, mouth expression, and front-of-chest detail.
+    pov: the viewer is not in frame; write only the viewer's hands or shoulder when they actually appear.
+13. Internal cross-section only when the frame shows actual penetration: x-ray / cross-section / cutaway view goes into the receiving character's tag only, bound in the same run with the internal channel and the organ that is inside it (cross-section, x-ray, internal view, vaginal penetration, penis in vagina, glans at cervix, uterus). Never put it in Base, never in the penetrating character's tag, never on a bystander who is not being penetrated, and never on a frame that is only foreplay, nudity, or an act that has not entered.
+14. Human furniture and weight bearing. When one character serves as chair, footstool, or table, the lower character's back, hips, thighs, or stomach is the real support surface — never replace it with a wooden chair or sofa. The user side writes the load (sitting on person, sitting on someone's back, feet resting on person, foot on head, stepping on back, crossed legs, dominant); the furniture side writes the posture and the physical deformation (forniphilia, human furniture, kneeling on all fours, beneath person, crushed by weight, back indentation, ass indentation, skindentation, trembling).
+15. Anti-melt. Keep the man's penis attributed to his body and entering from outside; never let it grow out of the woman or fuse with her vulva. Keep penis, labia, clitoris, and vaginal opening separately readable. Show only the limbs the frame needs — one pair of hands, no third arm, no six fingers. Prefer a half-body or medium composition that keeps the head or upper body in frame over an extreme genital close-up.
+16. Age, body, and skin. Express age only through facial maturity (youthful face, soft features, mature face, defined features, aged face, wrinkles) and keep every visible character an adult; family members share facial structure, twins differ by outfit, expression, and pose. Drop height words (tall / short) and use drawable body words instead: petite, slender, slim, toned, curvy, voluptuous, hourglass figure, plump; breasts as flat chest / small breasts / medium breasts / large breasts / huge breasts / heavy breasts. Map 丰满 / 丰腴 / 微胖 to curvy, voluptuous, hourglass figure, soft body, thick thighs — never to fat, obese, or overweight unless the setting says so. Copy the library skin field verbatim when it exists; never invent extra skin-tone words.
+17. Background carries the world. Name the style and era, not a generic room: medieval European stone tavern, Teyvat Mondstadt timber-and-stone office, Inazuma tatami room with shoji screen, ancient Chinese courtyard with lattice window, baroque palace with marble floor and chandelier, cyberpunk neon street, modern university classroom, post-apocalyptic ruined city. Terrain, ground material, weather traces, and environmental state are scene facts — see the visual completion rules below.
 
 Name consistency (critical — the plugin matches names verbatim):
-- Scope: these rules govern characters who have a library entry or are being registered in this output. They exist to protect verbatim matching against the library. A one-off character from rule 9 participates in no matching at all, so these rules do not apply to them — using a story term such as 三年级队长 as their name breaks nothing.
+- Scope: these rules govern characters who have a library entry or are being registered in this output. They exist to protect verbatim matching against the library. A one-off character from rule 10 participates in no matching at all, so these rules do not apply to them — using a story term such as 三年级队长 as their name breaks nothing.
 - First-time registration: when you register a character via changes field:"new", the name must be exactly the name used for that character in the character card, lorebook, book memory, or story text — a Chinese name stays Chinese (小雪, never Xiaoxue or Snow). Never transliterate, translate, or pinyin-ize a name.
 - Existing profiles: when a character already has a library entry (or was just registered above), every reference to that character — characters[].name and any name appearing inside a tag{{#nl}} or nl{{/nl}} — must match the library entry name verbatim. A library entry written 小雪 must be referenced as 小雪, not as Xiaoxue or any other variant. A mismatched name can never be matched or replaced by the plugin, and the character loses its fixed appearance.
 
-{{#nl}}Both Base and Character Prompts must use Tag + English natural language. Write nl in English even when the story text and your own thinking are in another language: the image model reads English natural language far more reliably, and non-English sentences also cost several times more tokens against the shared prompt budget.{{/nl}}{{^nl}}Both Base and Character Prompts are tag-only: write English danbooru tags even when the story text and your own thinking are in another language.{{/nl}} Character names are the only exception: they must stay in their original language and spelling (see Name consistency above).{{#nl}} Tags stabilize identity and attributes; natural language supplies complex relations and spatial semantics.{{/nl}} Do not output quality tags, generic negative tags, artist presets, or XML. The backend adds artist and quality tags.
+{{#nl}}Both Base and Character Prompts must use Tag + English natural language. Write nl in English even when the story text and your own thinking are in another language: the image model reads English natural language far more reliably, and non-English sentences also cost several times more tokens against the shared prompt budget.{{/nl}}{{^nl}}Both Base and Character Prompts are tag-only: write English danbooru tags even when the story text and your own thinking are in another language. This output is tag-only: write no nl key anywhere, neither in Base nor in any Character Prompt.{{/nl}} Character names are the only exception: they must stay in their original language and spelling (see Name consistency above).{{#nl}} Tags stabilize identity and attributes; natural language supplies complex relations and spatial semantics.{{/nl}} Do not output quality tags, generic negative tags, artist presets, or XML. The backend adds artist and quality tags, and its negative prompt is fixed per model — writing your own negative content only wastes the prompt budget. Do not write weight syntax (n::tag::, {tag}, [tag]): Character Prompts already isolate each person, and weights only steal attention from the rest of the string.
 
 Visual completion (important):
 The story text is prose, not a shot list. It will never state camera, lighting, or period costume — the things that only exist once something is drawn. Your job is not to transcribe the text but to complete it into a finished picture. Handle these four classes differently.
 
 1. Pictorial language (camera, composition, lighting, color, depth of field, mood) must be supplied by you, in Base.
-   Give every image a shot distance (close-up / upper body / medium shot / full body / wide shot), a light source and time of day (soft sunlight, candlelight, moonlight, backlighting, golden hour), and a color mood (warm colors, cold colors, muted colors, high contrast). The story not stating them is not a reason to omit them; without them the result is a bland headshot.
-   - Write exactly one shot distance. close-up / upper body / medium shot / full body / wide shot conflict with each other, and writing two (medium shot, upper body) leaves the model unsure where to crop.
-   - The shot distance must contain this image's core contact point. When the core action happens below the torso (a knee pressing, a foot stepping, sitting on a lap, lower-body contact on a bed), do not use close-up or upper body — those crop the contact out of frame. Use medium shot or full body, or a local close-up that frames the contact point completely.
+   Give every image a shot distance (close-up / upper body / cowboy shot / full body / wide shot), a light source and time of day (soft sunlight, candlelight, moonlight, backlighting, golden hour), and a color mood (warm colors, cold colors, muted colors, high contrast). The story not stating them is not a reason to omit them; without them the result is a bland headshot.
+   - Write exactly one shot distance. close-up / upper body / cowboy shot / full body / wide shot conflict with each other, and writing two (medium shot, upper body) leaves the model unsure where to crop.
+   - The shot distance must contain this image's core contact point. When the core action happens below the torso (a knee pressing, a foot stepping, sitting on a lap, lower-body contact on a bed), do not use close-up or upper body — those crop the contact out of frame. Use cowboy shot or full body, or a local close-up that frames the contact point completely.
    - Keep body tags consistent with the shot distance. Having chosen upper body or close-up, do not then write shoes, socks, skirt length, legs, or full-body poses in any Character Prompt: tagging a body part that is outside the frame makes the model force it back in.
+   - Light must have a direction and a consequence: where it comes from, what it lights, where the shadow falls (warm lamp light from the left, soft shadow on the far side, rim lighting outlining her shoulders). Two or three light words per image; a night or indoor scene needs at least two sources or it turns into a black blob.
+   - One focus per image at most (face focus, eye focus, hand focus, thigh focus, crotch focus, upper body focus). Do not stack two focuses; when both face and hands matter, use cowboy shot and say it in the nl instead.
 
 2. Period and worldview (costume system, architecture, objects, environmental style) must be decided first and then made concrete.
    Take evidence in priority order: lorebook world settings > character/persona settings > the forms of address, identities, objects, and environment in the story and context. Follow explicit settings strictly. Where nothing is specified, still actively choose one coherent, specific period, civilization, or original visual system that fits the available clues and the tone. With thin evidence you may reasonably supply period style, garment cut, material, accessories, lighting, and color — but this freedom covers only how it is drawn, never what is present.
    Terrain, ground or road material, traces of weather, and environmental state are all scene facts. With no supporting evidence, keep them simple: never add muddy ground, dirt path, wetland, puddles, snow, dust, or slippery ground just to enrich the picture. When the story establishes only "outdoors", write outdoors; only "forest", write forest. Write muddy ground, dirt path, or puddles only when the story, the context, or the world settings explicitly support rain, mud, or a dirt road.
    A fictional world may use an original or blended style, but it must stay internally consistent; do not stack conflicting civilizations. Keep the same visual judgment across a continuous scene. Enrich a picture through camera, composition, lighting, color, and evidenced specifics rather than by mechanically stuffing style keywords into every image.
 
-3. A character's fixed facts (sex, hair, eyes, body type, signature features) follow the given information exactly, with no invention. Copy library field values verbatim.
+3. A character's fixed facts (sex, hair, eyes, body type, signature features) follow the given information exactly, with no invention. Copy library field values verbatim. Never add scars, tattoos, birthmarks, or a hair-over-eye look that the settings never wrote — a cold personality or a tan body is not evidence for a scar.
 
 4. Story facts (who is present, actions, events, key props) follow the story text exactly. Do not add people, actions, or plot the text does not contain.
    Select framing to emphasize the player character or principal characters while preserving the chosen moment's action and relationships. Other people or crowds may remain off-screen if they add nothing to that focus. Keep an unnamed participant when needed to show the core interaction; a missing profile is never a reason to reject a moment or crop that participant out.
    The Base character count is the number of people visible inside this frame, not the number of people present in the scene. People left off-screen receive no image tags{{#nl}}, natural-language descriptions,{{/nl}} or Character Prompts; do not restore them in Base just because the story says they are nearby.
+
+Vocabulary (pick from these; the model knows them):
+- Shot distance: close-up, upper body, cowboy shot, full body, wide shot, very wide shot, extreme close-up. Camera: from above, from below, from side, from behind, straight-on, three-quarter view, profile, pov, dutch angle. Focus: face focus, eye focus, hand focus, thigh focus, crotch focus, upper body focus, depth of field, blurry background, bokeh.
+- Light: cinematic lighting, rim lighting, backlighting, volumetric lighting, chiaroscuro, low key lighting, warm lighting, soft indoor lighting, bedside lamp light, candlelight, sunlight, dappled sunlight, light rays through window, golden hour, dim lighting, moody lighting, spotlight, high contrast.
+- Outfit and fabric: silk, cotton, linen, wool, leather, latex, patent leather, denim, satin, velvet, lace, knitted, chiffon, fishnet, mesh, sheer, translucent, see-through.
+- Hosiery: black pantyhose, white pantyhose, nude pantyhose, sheer pantyhose, nylon sheen, reinforced toe, black thighhighs, white thighhighs, garter straps, thighband indentation, skindentation, zettai ryouiki, torn pantyhose, runs in pantyhose, creased pantyhose.
+- Accessories and piercings: stud earrings, hoop earrings, drop earrings, ear cuff, necklace, pendant, choker, ribbon choker, glasses, hair ornament, hairpin, hair ribbon, bracelet, ring, anklet, navel piercing, nipple piercing, tongue piercing.
+- Body: petite, slender, slim, toned, curvy, voluptuous, hourglass figure, soft body, thick thighs, wide hips, flat chest, small breasts, medium breasts, large breasts, huge breasts, heavy breasts.
+- Skin and reaction: detailed skin texture, smooth skin, soft skin, subsurface scattering, light sweat, moist skin, flushed skin, glistening skin, body blush, trembling, goosebumps, arched back, clenched teeth, tears.
+- Erotic state: aroused, seductive, panting, moaning, open mouth, tongue out, drooling, heavy breathing, ahegao, rolling eyes, orgasm, convulsing, bra, panties, lingerie, garter belt, no bra, no panties, wet clothes, torn clothes, disheveled clothes, open clothes, half-undressed, lifted skirt.
+- Bondage and tools: bondage, rope bondage, shibari, bound wrists, bound ankles, handcuffs, blindfold, ball gag, collar, leash, spanking, red marks, handprint, whip marks, vibrator, nipple clamps.
+- Pose and support: standing, sitting, kneeling, seiza, squatting, on all fours, lying on back, lying on side, on stomach, leaning against wall, straddling, sitting on person, standing on tiptoes, bent over, spread legs, m-shaped legs, mating press, cowgirl position, doggy style, standing sex, against wall.
 
 In one line: how it is shot may be made concrete by you; what is in the picture must come from the text and the settings. Specific is not the same as invented.
 
@@ -1576,74 +1660,113 @@ Write landscape for group shots, distant or panoramic views, wide scenes, and ho
 Two characters in frame does not mean the image must be landscape. The direction must agree with the shot distance in Base: wide shot usually pairs with landscape, close-up and upper body usually pair with portrait. When unsure, write portrait.
 
 Example (小雪 is the principal character and has a library profile; 三年级队长 is an unnamed opponent needed to show 小雪's action, not an unrelated bystander. She gets her own Character Prompt, is completed once for this image, and is never registered):
-{{#nl}}{"position":"P2","tag":"2girls, rooftop, sunset, medium shot, foot on hand","nl":"Two girls on a rooftop at sunset, one pinning the other's hand under her foot.","characters":[{"name":"小雪","tag":"girl, long black hair, blue eyes, white dress, source#stepping on","nl":"The girl on the left presses her opponent's hand down with one foot."},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, lying on ground, surprised, looking up, target#stepped on","nl":"The other girl lies on the ground on the right, her hand pinned, staring up in shock."}],"size":"landscape"}{{/nl}}{{^nl}}{"position":"P2","tag":"2girls, rooftop, sunset, medium shot, foot on hand","characters":[{"name":"小雪","tag":"girl, long black hair, blue eyes, white dress, source#stepping on"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, lying on ground, surprised, looking up, target#stepped on"}],"size":"landscape"}{{/nl}}`;
+{{#nl}}{"position":"P2","tag":"general, 2girls, rooftop, sunset, cowboy shot, from side, foot on hand","nl":"Two girls on a rooftop at sunset, one pinning the other's hand under her foot.","characters":[{"name":"小雪","tag":"girl, long black hair, blue eyes, white dress, standing, right foot pressing down on hand, looking down, calm expression, source#stepping on","nl":"The girl on the left presses her opponent's hand down with one foot."},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, lying on ground, propped on one elbow, surprised, looking up, target#stepped on","nl":"The other girl lies on the ground on the right, her hand pinned, staring up in shock."}],"size":"landscape"}{{/nl}}{{^nl}}{"position":"P2","tag":"general, 2girls, rooftop, sunset, cowboy shot, from side, foot on hand","characters":[{"name":"小雪","tag":"girl, long black hair, blue eyes, white dress, standing, right foot pressing down on hand, looking down, calm expression, source#stepping on"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, lying on ground, propped on one elbow, surprised, looking up, target#stepped on"}],"size":"landscape"}{{/nl}}`;
 
 /**
- * Latent 原生 API(Anima-2.9B-int8-turbo)规范内置默认,照 anima寻迹 与 绘境成章 世界书提炼。
- * 绘境成章 只取通用规则(事实来源/单帧/衣物非推导/可见结构/施受因果/内部透视),
- * 不搬它的 NAI 专用协议(centers/UC/n::/状态栏/插入位置)。
+ * Latent 原生 API(Anima-2.9B-int8-turbo)规范内置默认,照 分镜师系统 世界书重写。
+ * 分镜师 那套「选拍评分 → 镜头类型 → 人物装配 → 环境装配 → 编译 → 质检」原样搬进思维链,
+ * 这里落的是它的编译口径:分级/人数/场景/镜头/光影的排序、身份串固定顺序、服装分层与差分、
+ * 画外裁剪表、冲突表、构图法则、轴线、Description 的短句写法。
  *
  * 协议形态借 NAI 那套 Base + characters[](runner / 解析 / 角色库 / 编辑弹窗都不用另起一套),
- * 出图时 backends/latentApi.ts 再按世界书格式打包成 `Scene:… Char1:… Description:…`。
+ * 出图时 backends/latentApi.ts 再按 Anima 格式打包成 `Scene:… Char1:… Description:…`。
  * 与 NAI 规范的区别:角色块不写 nl(Description 只有一份,是 Base 的 nl);size 多一档 square;
- * 没有 source#/target#/mutual#;分级标签写进 Scene。
+ * 没有 source#/target#/mutual#(latentApi.ts 会把这些前缀剥掉,写了等于白写);
+ * 分镜师 明令不写权重语法,故 Anima 也不写 (tag:1.2) —— 需要强调就在 Description 里重述一次。
  *
  * 只搬世界书里「怎么写画面」的部分;输出 <image> 块、配图数量、插入位置由插件自己的协议负责。
- * 改为下文「年龄与身份」段的硬规则。
+ * 女性准入是本渠道硬规则(见 autoTag/prompt.ts 的 femaleAdmissionRule),不随世界书取舍。
  */
 export const DEFAULT_LATENT_API_SPEC = `【Latent 原生 API（Anima）提示词规范】
 你写的画面会被插件打包成 Anima 格式发给生图模型：Scene:<tag>. Char1:<角色1 tag>. Char2:<角色2 tag>.{{#nl}} Description:<nl>{{/nl}}
-质量词前缀与负面词由渠道设置注入，你不写质量词、负面词或 XML。
-权重只用 Anima 数字语法 (tag:1.1~1.5)，且只套在少数关键项上：身份、发色、核心着装、核心动作。普通项不加权，不整槽加权；禁止 A1111 的 {tag} 写法（Anima 上不可靠）。
+质量词前缀与负面词由渠道设置注入，你不写质量词、画师串、年份或 XML。不写权重语法（(tag:1.2)、{tag}、n::tag:: 都不写）：需要强调某个元素时，在 Description 里再写一次它的位置与状态，而不是给它加权。
 
 JSON 键与 Anima 段的对应：
-- tag（Base）→ Scene：分级、人数、场景环境、构图镜头、光影氛围、多人共同的互动。不写任何单个角色的外貌、服装或个人动作。
-- characters（每个本图可见的个体各一项，从左到右、从上到下）→ Char1、Char2……：{"name":"…","tag":"…"}，tag 写这个人的身份、外貌、着装、表情、视线、动作。角色项不写 nl。
+- tag（Base）→ Scene：分级、人数、场景与环境细节、构图镜头、光影氛围、多人共同的互动。不写任何单个角色的外貌、服装或个人动作。
+- characters（每个本图可见的个体各一项，从左到右、从上到下）→ Char1、Char2……：{"name":"…","tag":"…"}，tag 写这个人的身份、外貌、着装、状态、表情、视线、动作、可见结构。角色项不写 nl。
 {{#nl}}- nl（Base）→ Description：整幅画面的英文自然语言描述，见下文「Description」。
 {{/nl}}{{^nl}}- 本次只写 tag，Base 与角色都不写 nl。
 {{/nl}}
-标签格式：
-- 英文、全小写、多词用空格不用下划线；保留 danbooru 复合标签（school uniform、wedding dress）。Danbooru 与 Gelbooru 写法不同时优先 Gelbooru。
-- 同人角色：characters[].tag 首位写角色名，紧跟作品名，两个独立 tag（fujiwara chika, kaguya-sama wa kokurasetai）；不要写成 name (series)。原创角色写 name (original)。多人场景每个 Char 都必须写自己的外观，不能只列名字。
-- 画面内文字渲染弱：speech bubble、招牌文字只用单词或短句，长句不要写进画面。
-- Scene 第一个 tag 必须是分级：safe / sensitive / nsfw / explicit 四选一，缺省模型会按 safe 处理。露骨性行为 explicit；裸露或性暗示 nsfw / sensitive；其余 safe。
-- Scene 接着写人数：1girl, solo / 1girl, 1boy / 2girls 等，只数取景框内可见的人。
-- 场景由大到小（indoors/outdoors → 具体地点 → 细节）、由静到动（家具建筑 → 风雨蒸汽）、由远及近（背景 → 中景 → 前景）；至少两个具体环境细节。角色状态与环境相邻联动（wet clothes, rain, puddles）。需要气味、声音、触感时把它们转成可见线索：听觉用 headphones / musical notes / sound waves，嗅觉用 flowers / smoke / rain / food，触觉用材质词；情绪用环境表达（孤独→empty space, cold colors；温馨→warm lighting, cozy interior；紧张→harsh shadows, confined space）。提示词越详细越好，短提示会生成简陋背景。
-- 构图紧跟场景：视角（pov / 第三人称不写）、景别（close-up / bust shot / upper body / cowboy shot / full body / wide shot 只选一个）、机位（eye level / from above / from below / from side / from behind / three-quarter view）、焦点（depth of field 等）。同一轮多图切换景别，避免连续同景别。
-- 光影紧跟构图，写出因果：光源从哪来、照亮了什么、阴影落向哪（warm lamp light from the left, soft shadow on the far side），不要只写 dramatic lighting。
+标签格式（硬规则）：
+- 全部小写英文，逗号加空格分隔，多词用空格不用下划线；Danbooru 与 Gelbooru 写法不同时优先 Gelbooru。
+- 不写否定：不写 no hat、without shoes、no humans 之外的一切「没有X」；想表达没有就写它的对立状态（barefoot 而不是 no shoes）或者干脆不提。
+- 不写泛词与空话：beautiful、detailed、aesthetic、nice、cute（作表情时例外）、best quality、masterpiece 一律不写；写不满时补具体细节（手部动作、身体反应、衣物状态、环境物件、镜头效果），不要补泛用词。
+- 同义标签只取一个，同一维度的并列词去掉更弱的那个；同一件事不重复写两遍。
+- 不写 multiple views、split screen 这类分格标签。
 
-角色（每个 Char 都要回答：他是谁、什么样子、穿什么、什么表情、看哪里、在做什么）：
-- 外貌：身份标识在前——同人写「角色名, 作品名」两个独立 tag，原创写 name (original)；档案 fandom 字段里的 name (series) 必须拆开，不照抄括号。接着写发长/发色/发型、瞳色、肤色、体型、标志配饰。【角色固定外貌库】里有的照抄字段值，一字不改；1girl/1boy 写成 girl/boy，数字人数只在 Scene。
-- 着装：每件服装都带颜色；裙、靴、袜、外套带长度词；从内到外逐件列出；写出当前状态（完整 / 破损 / 湿 / 半脱）。属性只归具体衣物：颜色、材质、厚薄、透明、湿润、破损、敞开、脱下、裸露互不推导；未知不补，破损不扩大范围，敞开不等于脱下，半透明不升级成全透明；可见内层必须有依据，不编内衣或裸露。
-- 表情：默认克制自然（slight smile, soft gaze, calm expression, parted lips）。ahegao、drooling、face distortion 这类夸张颜艺只在正文明确写到极端情绪时才用。
-- 视线：**每个 Char 必写一个视线 tag**，不写模型就默认看镜头。从这些里选：looking at another / looking at object / looking away / looking to the side / looking down / looking up / looking back / closed eyes / eyes off-screen。looking at viewer 只在 pov 里角色直视「你」、自拍直播海报、或正文写明「她看着你」时用；第三人称一律不用。
-- 动作：整体体位 + 支撑点（standing on…, sitting on…, lying on…, leaning against…, kneeling on…），左右手分别写在做什么；写**已经完成**的状态（holding, pressed, kissing），不写 reaching / about to。每处肢体接触写清「谁的哪个部位 → 碰到谁的哪里」：施动方写动作，受动方只写承受位置与可见反应，不把同一个动作在两边各写一遍。
+Scene（JSON 的 tag 键），按这个顺序写：
+1. 分级：safe / sensitive / nsfw / explicit 四选一，按本张图的实际画面判定，不按整段剧情的最高级别。露骨性行为 explicit；裸露或性暗示 nsfw / sensitive；其余 safe。
+2. 人数：1girl, solo / 1girl, 1boy / 2girls / multiple girls / no humans（只有插入镜头允许无人）。人数写错是串色的头号原因，先核对入镜人数再写；只数取景框内可见的人。
+3. 场景由大到小：indoors / outdoors → 具体地点 → 可见细节；至少两个具体环境细节，来自场景设定或本拍正文（洒出的酒、摔碎的杯子、窗上的雨）。背景不能只写笼统名词，要带风格与时代（medieval European stone tavern、modern university classroom、Japanese tatami room、cyberpunk neon street）。
+4. 构图紧跟场景：景别只选一个（close-up / portrait / upper body / cowboy shot / full body / wide shot / very wide shot / extreme close-up）；机位选一个（from above / from below / from side / from behind / straight-on / three-quarter view / profile / pov / dutch angle）；焦点最多一个（face focus / eye focus / hand focus / foot focus / 部位 focus）；镜头效果一到三项（depth of field、blurry background、bokeh、lens flare、motion blur、soft focus、vignetting）。
+5. 光影紧跟构图，写出因果：光源从哪来、照亮了什么、阴影落向哪（warm orange light from the left, cool blue shadows on the right）；每图至少两个光词，夜景与室内至少两个光源；主光暖则阴影偏冷，主光冷则补光暖。
+6. 多人共同参与的互动（holding hands、hug、kiss、人体家具的承重关系）写在 Scene；单人画面的动作不进 Scene。
+
+角色（每个 Char 都要回答：他是谁、什么样子、穿什么、什么状态、什么表情、看哪里、在做什么）：
+- 身份串固定顺序，逐字复用同一套词：发色 → 发型与发长 → 发饰与刘海 → 瞳色与眼型 → 脸部特征（痣、泪痣、雀斑、疤）→ 体型与胸围 → 肤色 → 独占标志（耳朵、尾巴、角、翅膀、纹身、义肢）。
+- 同人角色：先写「角色名 \(作品名\)」，再写作品名，两个都写；括号必须转义成 \( 和 \)，实际提示词里是 character name \(copyright name\)，JSON 字符串里写成 "character name \\\\(copyright name\\\\)"；不得直译中文名、缩写作品名或只写角色名。原创角色不写人名 tag，用 name (original) 标明原创。
+- 着装：按「上衣 → 下装 → 外套 → 袜 → 鞋 → 配饰」从内到外逐件写；颜色与材质写在名词前（white blouse，不写 blouse, white）；裙、靴、袜、外套带长度词；配饰最多两个，选最有辨识度的。
+- 服装差分：湿身写 wet blouse + wet hair + dripping；破损写 torn sleeve、torn skirt；换装整套替换成变体串。同一场景内同一角色的服装与饰品逐字一致，不得多图之间增减件数或改色。
+- 状态互不推导：颜色、材质、厚薄、透明、湿润、破损、敞开、脱下、裸露之间没有推导关系；未知保持未知，破损不扩大范围，敞开不等于脱下，半透明不升级成全透明，可见内层必须有依据，不编内衣或裸露。脱衣不脱饰品：正文没写摘下，耳钉、耳环、choker、项链、手链、脚链、穿刺环一律保留。
+- 表情：至少写「眼 + 嘴 + 脸色」三项里可用的，默认克制自然（slight smile、soft gaze、calm expression、parted lips）；ahegao、drooling、face distortion 只在正文明确写到极端情绪时用。表情不得与视线、朝向冲突。
+- 视线：**每个 Char 必写一个视线 tag**，不写模型就默认看镜头。从这些里选：looking at another / looking at object / looking away / looking to the side / looking down / looking up / looking back / closed eyes / eyes off-screen。looking at viewer 只在 pov 里角色直视「你」、自拍直播海报、或正文写明「她看着你」时用；第三人称一律不用；closed eyes 时不写任何视线词。
+- 动作：整体体位 + 支撑点（standing on…、sitting on…、lying on…、leaning against…、kneeling on…），左右手分别写在做什么；写**已经完成**的状态（holding、pressed、kissing），不写 reaching、about to。每处肢体接触写清「谁的哪个部位 → 碰到谁的哪里」：施动方写动作，受动方只写承受位置与可见反应，同一个动作不在两边各写一遍。主被动不许反转：突袭方写发起动作，受惊方写 stiff body、frozen、wide eyes、surprised，不给受方写 leaning forward、french kissing。
 - 可见结构：只写本图镜头、朝向、裁切和遮挡下真正看得见的外部结构，不整串枚举；按取景选必要项（胸部可见时写 breasts / nipples / areolae；下半身可见时按需写 vulva / labia majora / labia minora / clitoral hood / vaginal opening，男性写 penis / glans penis / scrotum）。外阴不等于内部阴道；遮挡或画外不补；多人逐人写自己的结构，不互抄、不混接。
-- 内部透视：剧情明确涉及体内、贯穿、受孕、内部结构示意等适合节点时，默认用局部内部透视（x-ray / cross-section / cutaway view）；Scene 只写全局表现方式，具体人物、区域、结构写本人 Char；保留外轮廓，不扩散到其他人物；不是衣物透明或背景透明；没有明确内部展示对象时保持普通外观图，不为用效果强行展示器官。
+- 内部透视：剧情明确涉及体内、贯穿、受孕、内部结构示意等适合节点时，默认用局部内部透视（x-ray / cross-section / cutaway view）；Scene 只写全局表现方式，具体人物、区域、结构写本人 Char；保留外轮廓，不扩散到其他人物；不是衣物透明或背景透明；没有明确内部展示对象时保持普通外观图。
+- 防崩坏：器官归属明确、彼此可辨（阴茎、阴唇、阴蒂、阴道口不得糊成一团）；画面只出现必要的一双手、一对肢体，不画多余的手、手指、手臂、腿；优先半身或中景，尽量让头部或上半身入镜，避免纯生殖器极端特写。
 - 每个 Char 只写本角色的锚点，不串别人的特征；共用物品在各 Char 里状态一致。
-- 可见性：只写本景别与朝向下看得见的部位——背对镜头不写正面表情与瞳色，特写不写下半身，被遮挡的不写。
-- 比例匹配正文：正文和设定没写的，不加夸大身材、暴露服装或性感姿态；默认自然比例。
+
+画外裁剪表（按景别，画面里看不到的部位其标签与服装状态全部删除）：
+- extreme close-up（脸/眼/手）：只保留被拍摄的局部。
+- close-up / portrait：头、颈、肩线。删掉胸部以下的服装与体型标签、鞋袜、下装。
+- upper body：到腰。删掉鞋袜、下装下摆、腿部特征。
+- cowboy shot：到大腿中段。删掉小腿、鞋袜。
+- full body：全身，可保留所有标签。
+- wide shot：人物很小，只保留发色、服装主色、姿态，删掉瞳色与面部细节。
+- from behind：删掉瞳色、嘴部表情、胸前服装细节；保留发型、背部服装、手部动作。
+- from above：脚与下装弱化。
+- pov：观察者不入画，不写观察者的外观；只在观察者的手或肩实际入镜时写 pov hands / viewer's shoulder。
+
+冲突表（命中任一对，立刻改掉其中之一）：
+- 景别互斥：full body / wide shot / cowboy shot / upper body / portrait / close-up / extreme close-up 任意两个同现。
+- 视角互斥：from above / from below / from side / from behind 任意两个同现；from behind 与 looking at viewer、face focus、eye contact 同现。
+- 眼部互斥：closed eyes 与 looking at viewer / eye contact / eye focus / wide-eyed / half-closed eyes。
+- 嘴部互斥：closed mouth 与 open mouth / parted lips / grin / clenched teeth。
+- 情绪互斥：smile 与 crying 同现时必须有 tears of joy 或 laughing 之类的合理组合，否则删一个。
+- 人数互斥：solo 与 2girls / multiple girls；1girl 与 2girls。
+- 服装互斥：同一部位出现两种服装（white shirt 与 black shirt 同属一人），以账本为准。
+- 发型互斥：short hair 与 long hair；twintails 与 ponytail（low twintails 这类合理组合除外）。
+- 光线互斥：sunlight 与 night；moonlight 与 sunset（黄昏月出除外）。
+- 朝向互斥：facing away 与 looking at viewer。
+
+构图法则：
+- 主体占比：建立镜头 10–35%，中景 40–65%，特写 70–90%。
+- 三分法：主体放左三分或右三分线，另一侧放环境或对话对象。
+- 视线留白：人物看向哪一侧，那一侧留出空间。
+- 三层纵深：前景（虚化的物件、枝叶、肩膀）→ 中景（人物）→ 远景（墙、窗、天空），每张至少写出两层。
+- 高低关系：from below 表示强势、压迫；from above 表示渺小、被俯视、孤立。
+- 一图一焦：不同时写 face focus 与 hand focus；要同时表现脸与手，用 cowboy shot 且不写焦点，在 Description 里说明。
+- 轴线（180°）：同一场景里两人的画面左右关系不换；正反打时画面左右不换；要换轴先插一张中立镜头（俯拍或正面特写）。
 
 年龄与身份：
-- 年龄用面容成熟度体现，不只写 older/younger：青涩（youthful face, soft features, round cheeks）、成熟（mature face, defined features, sharp jawline）、苍老（aged face, wrinkles）。身份必须匹配面容：写母亲就是成熟面容。
-- 身高、头身比、气质可随年龄变化，但不作为硬约束：儿童通常矮小、圆脸、大眼睛；老年身高略缩、白发皱纹；成年角色按设定写，不默认某种体型。
+- 年龄用面容成熟度体现，不只写 older / younger：青涩（youthful face, soft features, round cheeks）、成熟（mature face, defined features, sharp jawline）、苍老（aged face, wrinkles）。身份必须匹配面容：写母亲就是成熟面容。
 - 家人共享面部基因（眼型、鼻型、脸型相似），年龄差用成熟度区分；双胞胎靠服装、表情、姿势区分。
-- 成年角色的身材按设定写，没写就自然比例，不因年龄或身份套固定体型模板。
+- 身材按设定写，没写就自然比例；不因年龄或身份套固定体型模板，也不加正文没写的夸大身材。
 
 视角（pov 优先）：
 - 对话、互动场景首选 pov：角色看着「你」时写 looking at viewer。男性 / 观众默认不入镜。
 - **有肢体接触时观众肢体必须入镜**，写成一个单独的 Char（如 {"name":"你","tag":"boy, pov hands, holding white lace handkerchief, reaching from lower frame"}）；否则模型会让角色抱自己、摸自己。
-- 不写指向看不见对象的关系（arms around viewer's neck 会变成搂自己）；改写成可见的姿态（both arms extended forward, hands out of frame near camera），或让观众的手 / 肩入镜（pov hands at bottom of frame, viewer's shoulder visible at edge）。
+- 不写指向看不见对象的关系（arms around viewer's neck 会变成搂自己）；改写成可见的姿态（both arms extended forward, hands out of frame near camera），或让观众的手 / 肩入镜。
 - 第三人称时角色绝不 looking at viewer。
 - 每张图单独判断 pov / 第三人称：同一轮允许有的图第一人称、有的第三人称；按本图表现重点选，不机械交替、不按图片编号轮换。
 
 取景与剧情：
-- **女性准入（本渠道硬规则）**：每图至少一名性别明确的女性实际可见，并在 characters[] 里拥有自己的 Char 块；禁纯男性图、无女性图。男性只在有合格女性同框时作为真实互动对象入镜，男性主角/用户不享有单独出图例外。本段没有合格女性节点时不配图，改选同一正文里其他合格节点；这条优先于任务协议里「主要角色单独出镜同样成立」的通用说法。
+- **女性准入（本渠道硬规则）**：每图至少一名性别明确的女性实际可见，并在 characters[] 里拥有自己的 Char 块；禁纯男性图、无女性图。男性只在有合格女性同框时作为真实互动对象入镜。本段没有合格女性节点时不配图，改选同一正文里其他合格节点；这条优先于任务协议里「主要角色单独出镜同样成立」的通用说法。
 - **单帧**：一张图只画一个静态瞬间；不写连续动作、多镜头、分镜；不把先后两个时刻拼成同时发生。同一瞬间的触发行为与即时反应可以同时表达。
 - **事实来源**：只写当前正文、用户设定、有效历史已成立的事实；不从示例、词库、常识补人物、动作、衣物、裸露、道具或场景。
 - 读完整段再构图：先写结果、后写原因的，画出原因与结果同框的完整瞬间（「惊讶 + 被亲吻」，不是只有「惊讶」）。
 - 只画完成态：动作做到哪一步画到哪一步，以段落的最后状态为准；不画正文没发生的事。
-- 同一轮多图仍必须是明显不同的瞬间；如果剧情确实跨越多个动作阶段，按因果链推进，动作相位只进不退（蓄力→执行→命中→后果→余韵），不为同一瞬间换镜头或返回相邻重复动作；场景/时间跳转才重置。
+- 同一轮多图仍必须是明显不同的瞬间；如果剧情确实跨越多个动作阶段，按因果链推进，动作相位只进不退（蓄力→执行→命中→后果→余韵），不为同一瞬间换镜头或返回相邻重复动作；场景/时间跳转才重置。相邻两张不要用同一景别，全楼至少换两种视角。
 - 取景突出玩家主角或主要角色与核心互动；无关的在场者与人群可以留在镜头外；核心互动需要的无名参与者照常入画，没有档案不是裁掉他的理由。人群不逐个写，作为一个整体写进 Scene。
 - 人物不要撑满画面：全身图人物约占 60–70%，环境必须看得见；近景特写可以虚化背景。
 
@@ -1654,102 +1777,125 @@ JSON 键与 Anima 段的对应：
 Description（JSON 的 nl 键）：
 - 英文自然语言，按镜头能直接拍到的事实写：以画面里的人物、肢体、物体为主语，只写可见之物；可以写否定（no visible…）与层级（still wearing…, layered over…）。
 - 能标签化的内容优先写进 tag；微妙语感、空间关系、材质质感、因果这些标签说不清的，用自然语言补。自然语言至少 2 句，越具体越好。
+- 短句，一句一个主语，一句话不超过 25 个英文单词；用名词不用代词（不写 she / he 指代不明时直接重复 the silver-haired girl）；用外观指代人物，不用名字（原创角色必须如此）。
 - 依次覆盖：谁在画面里、在什么位置、在做什么 → 空间关系 → 光源与阴影 → 动态瞬间 → 情绪基调 → 材质质感。通常 6–12 句，画面简单就少写。
+- 位置词用 left / right / center / foreground / background / behind / in front of / next to / above / below。
 - 角色名照抄档案原名（中文名写中文）；【一次性】角色用正文里的指称。
 {{/nl}}
-长度：Scene、全部 Char{{#nl}} 与 Description{{/nl}} 合计控制在约 1800 token 以内（接口上限 2000，前缀要占一部分）。超了按这个顺序删：冗余背景 → 质量词/同义词 → 次要修饰 → 次要 tag；身份、有效状态、衣物、因果接触、可见结构不删。
+长度：Scene、全部 Char{{#nl}} 与 Description{{/nl}} 合计控制在约 1800 token 以内（接口上限 8000 字符，前缀要占一部分）。超了按这个顺序删：冗余背景 → 质量词/同义词 → 次要修饰 → 次要 tag；身份、有效状态、衣物、因果接触、可见结构不删。
 
 落笔前清理：去掉完全重复的词、画面里看不见的词、语义重复的词（留更具体的：white shirt 留，shirt 删）、互相矛盾的词（bra 与 topless、standing 与 lying、pantyhose 与 barefoot 等）。
 
-名字：已建档或本次建档的角色，characters[].name 与 tag{{#nl}}/nl{{/nl}} 里出现的名字照抄档案原名，不音译、不翻译。同人身份 tag 按「角色名, 作品名」两个独立 tag 写，作品名照抄档案 fandom 里的 series 部分；不交换顺序、不加括号。一次性无名角色用正文的指称原词作 name，绝不编造人名。
+名字：已建档或本次建档的角色，characters[].name 与 tag{{#nl}}/nl{{/nl}} 里出现的名字照抄档案原名，不音译、不翻译。同人身份 tag 按「角色名 \(作品名\) + 作品名」写，作品名照抄档案 fandom 里的 series 部分；不交换顺序、不省括号。一次性无名角色用正文的指称原词作 name，绝不编造人名。
 
 示例（小雪是主要角色、已建档；三年级队长是核心互动需要的无名对手，不建档）：
-{{#nl}}{"position":"P2","tag":"safe, 2girls, outdoors, school rooftop, chain-link fence, water tank, concrete floor, sunset, cowboy shot, from side, warm orange sunlight from the right, long shadows","nl":"小雪 stands on the left of the concrete rooftop, pressing her right foot down on the other girl's hand. 三年级队长 lies on her side on the right, propped on one elbow, staring up in shock. Warm orange sunlight from the right catches the edge of the chain-link fence and stretches both of their shadows across the floor.","characters":[{"name":"小雪","tag":"girl, 小雪 (original), long black hair, blue eyes, (white dress:1.2), knee-length dress, standing, right foot pressing down on hand, arms at sides, looking down, calm expression"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, long sleeves, lying on concrete floor, propped on one elbow, hand pinned under foot, looking up, surprised, open mouth"}],"size":"landscape"}{{/nl}}{{^nl}}{"position":"P2","tag":"safe, 2girls, outdoors, school rooftop, chain-link fence, water tank, concrete floor, sunset, cowboy shot, from side, warm orange sunlight from the right, long shadows","characters":[{"name":"小雪","tag":"girl, 小雪 (original), long black hair, blue eyes, (white dress:1.2), knee-length dress, standing, right foot pressing down on hand, arms at sides, looking down, calm expression"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, long sleeves, lying on concrete floor, propped on one elbow, hand pinned under foot, looking up, surprised, open mouth"}],"size":"landscape"}{{/nl}}`;
+{{#nl}}{"position":"P2","tag":"safe, 2girls, outdoors, school rooftop, chain-link fence, water tank, concrete floor, sunset, cowboy shot, from side, depth of field, warm orange sunlight from the right, long shadows","nl":"小雪 stands on the left of the concrete rooftop, pressing her right foot down on the other girl's hand. 三年级队长 lies on her side on the right, propped on one elbow, staring up in shock. Warm orange sunlight from the right catches the edge of the chain-link fence and stretches both of their shadows across the floor.","characters":[{"name":"小雪","tag":"girl, 小雪 (original), long black hair, blue eyes, white dress, knee-length dress, standing, right foot pressing down on hand, arms at sides, looking down, calm expression"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, long sleeves, lying on concrete floor, propped on one elbow, hand pinned under foot, looking up, surprised, open mouth"}],"size":"landscape"}{{/nl}}{{^nl}}{"position":"P2","tag":"safe, 2girls, outdoors, school rooftop, chain-link fence, water tank, concrete floor, sunset, cowboy shot, from side, depth of field, warm orange sunlight from the right, long shadows","characters":[{"name":"小雪","tag":"girl, 小雪 (original), long black hair, blue eyes, white dress, knee-length dress, standing, right foot pressing down on hand, arms at sides, looking down, calm expression"},{"name":"三年级队长","tag":"girl, short brown hair, amber eyes, grey training uniform, long sleeves, lying on concrete floor, propped on one elbow, hand pinned under foot, looking up, surprised, open mouth"}],"size":"landscape"}{{/nl}}`;
 
 /**
  * Latent 原生 API 思维链内置默认。三层结构与 DEFAULT_NAI_V5_THINKING 相同(第一层整楼一次、
- * 第二层逐图槽位、第三层只核对),内容换成 anima寻迹 的「内部构思」与「自检六问」,
- * 并补入 绘境成章 的事实来源/单帧/女性准入/衣物非推导/可见结构检查。
+ * 第二层逐图槽位、第三层只核对),内容换成 分镜师系统 的选拍评分表、镜头类型表、轴线规则、
+ * 画外裁剪表与质检清单,并保留本插件的建档/服装时间线/女性准入判断。
  * 槽位与 DEFAULT_LATENT_API_SPEC 一一对应:Scene 块 + 每个可见个体一块。
  */
 export const DEFAULT_LATENT_API_THINKING = `【输出前思考清单】
 先在 <thinking> 与 </thinking> 之间按下面顺序过一遍，思考结束后再输出最终 JSON。除这一个 <thinking> 块与最终 JSON 外，不得输出任何内容，也不得开启第二个 <thinking> 块。
-第一层 A～E 是整楼只做一次的判断；第二层是逐张图的槽位块，每张入选图都要各写一块。分条写关键结论，不复述正文、不写寒暄、不重复抄写后端规范。
+你在这份清单里兼任分镜师：先判断哪几个瞬间值得画，再设计镜头与构图，再带着人设表和场景设定稿去画，最后把画面编译成提示词。分条写关键结论，不复述正文、不写寒暄、不重复抄写后端规范。
 全程只写结论，不写推演过程：每个判断一次定死，同一个字段在整个 <thinking> 里只准出现一次取值；不写「A？还是 B？」式的自问，不提出候选再逐个否决，也不预写最终的 tag{{#nl}}/nl{{/nl}} 串。证据不足时按规范的兜底口径直接决定（size 拿不准写 portrait，服装细节不明就选一套常见且自洽的）。
 
 第一层｜全局判断（整楼各做一次）
 
 A. 事实与状态账本
    - 只给目标正文选图；此前上下文与历史 <bbi_image> 只作连续性线索，不能覆盖正文。
-   - 只写当前正文、用户设定、有效历史已成立的事实；不从示例、词库、常识补人物、动作、衣物、裸露、道具或场景。
+   - 只写当前正文、用户设定、有效历史已成立的事实；不从示例、词库、常识补人物、动作、衣物、裸露、道具或场景。原文没写伤疤、刺青、胎记、泪痣、遮眼刘海，就一律不补。
    - 一张图只取一个静态瞬间；不写连续动作、多镜头、分镜，不把先后两个时刻拼成同时发生；同一瞬间的触发行为与即时反应可以同时表达。
    - 先做女性准入预判：本节点最终镜头里至少要有一名性别明确的女性实际可见；没有就换节点，不硬配纯男性图。
-   - 区分三类状态：角色库里的永久特征；本场景内要延续的临时状态（衣物穿脱、湿身、污渍、伤势、手持物）；只属于单帧的表情、视线、姿势。临时状态只随剧情渐变，没有明确解除或场景切换就不复原。
+   - 区分三类状态：角色库里的永久特征；本场景内要延续的临时状态（衣物穿脱、湿身、污渍、伤势、手持物、饰品）；只属于单帧的表情、视线、姿势。临时状态只随剧情渐变，没有明确解除或场景切换就不复原。
+   - 定一次视角口径：pov（观察者不入画，只有他的手/肩在接触时入画）还是第三人称；逐图可以不同，同一张图内不混用。
 
 B. 角色清点与建档（具体字段见任务协议）
-   - 列出目标正文里实际在场的**全部**角色，有名的和只有指称的都列。每人一行，先标类别：【已建档】名字实际列在【角色固定外貌库】里；【本次建档】库里没有、但有设定或持续参与剧情的正式角色，本次 field:"new"；【一次性】只有指称、不持续出场的角色，不建档、不写 changes，入画时在他自己的角色块里一次性补外貌，绝不编造人名。
-   - 清点名单不是入画名单；人群列一行「人群」，入镜时写进 Scene。
-   - 仅对【已建档】【本次建档】判定原创或同人；同人的身份 tag 写进档案 fandom，画图时拆成「角色名, 作品名」两个独立 tag 放在该角色 tag 首位，不照抄 name (series) 括号；原创写 name (original)。多人场景每人各自写外观。
-   - 缺发色、发型或瞳色时一次性补全，全楼不再变。年龄用面容成熟度定一次（youthful / mature / aged），家人共享面部特征。
-   - 对照角色库检查永久变化（染发、剪发、永久变身），写进 changes 并标出生效 P编号；假发、湿发、光照变色不写。
+   - 列出目标正文里实际在场的**全部**角色，有名的和只有指称的都列，不能只看最终入选图片里的人。清点的是「谁在场」，不是「谁有档案」。
+   - 每人一行，先标类别：【已建档】名字实际列在【角色固定外貌库】里（世界书、角色卡、柏宝书或正文里的详细设定只是建档来源，不代表已经在库）；【本次建档】库里没有、但有设定或持续参与剧情的正式角色，首次出场就建档，不论他是否入选本次图片，本次输出 field:"new"；【一次性】只有指称、不持续出场的角色，不建档、不写 changes，入画时在他自己的角色块里一次性补外貌，绝不编造人名。
+   - 清点名单不是入画名单：谁入镜由 E 段按主体和核心互动决定；【一次性】不因缺档被排除，已建档也不因在场就必须入画。人群列一行「人群」，入镜时作为一个整体写进 Scene，拿不准是个体还是一团时按一团处理。
+   - 仅对【已建档】【本次建档】判定原创或同人：证据不足按原创处理，不猜作品。判定为同人时同一行定出最终身份 tag 词——模型可识别的英文 Danbooru 角色名与作品名，实际形态为 character name \(copyright name\)（括号转义），JSON 里写成 "character name \\\\(copyright name\\\\)"；身份 tag 必须写进档案（field:"new" 写进 fields.fandom，缺的补一条 field:"fandom"）。原创角色写 name (original)，不写 fandom。
+   - 缺发色、发型或瞳色时一次性补全：hair 必须同时带发色和长度/发型，eyes 必须带瞳色；年龄用面容成熟度定一次（youthful / mature / aged），家人共享面部特征；同一楼同一角色只给一套外貌。【一次性】角色入画时同样要有发色与瞳色，只补在他的角色块里、不进档案。
+   - 对照角色库检查永久变化（染发、剪发、永久变身），写进 changes 并标出生效 P编号；假发、湿发、光照变色不写。即使 images 为空也不能跳过这一步。
 
-C. 服装时间线（【已建档】【本次建档】角色各一行：从 P 几起穿什么）
-   - 每件服装定下颜色、材质、款式、长度，从内到外列一次；全楼复用同一份，有穿脱或换装才从对应 P 起更新。【一次性】角色不占行。
+C. 服装与状态时间线（【已建档】【本次建档】角色各一行：从 P 几起穿什么）
+   - 每件服装定下颜色、材质、款式、长度，从内到外列一次；全楼复用同一份，有穿脱或换装才从对应 P 起更新。不写 school uniform、dress、pantyhose 这种模型会自行重新设计的孤立词。
    - 颜色、材质、厚薄、透明、湿润、破损、敞开、脱下、裸露互不推导；未知保持未知，破损不扩大范围，敞开不等于脱下，半透明不升级成全透明。
+   - 饰品单独冻结：耳钉/耳环/耳骨夹、发饰、眼镜、项链/颈带、手链、戒指、脚链、穿刺环一经确立逐字复用；脱到半裸或全裸时饰品照样保留。
+   - 表面状态（湿衣、水渍、体液、鞋印、红印、绳勒痕、掌印、压痕）只要正文没写清洗或消退就跨图继承。
+   - 【一次性】角色不占行：他没有跨图延续的账本，衣着在他入选那张图的角色块里一次写定即可。
 
-D. 时代与世界观
-   - 定一套具体自洽的视觉体系全楼沿用；它只决定「怎么画」，不把未知的场景事实具体化。
+D. 世界观与光源（一次判断，全楼通用）
+   - 定一套具体自洽的视觉体系全楼沿用：有明确设定就严格遵循，证据少也要主动选一个，不得退回中性服装或默认现代都市；它只决定「怎么画」，不把未知的场景事实具体化。
+   - 定主光：从哪来、什么色温、阴影落向哪、整体色调；夜景与室内至少两个光源。同一场景内多张图保持一致，剧情里点灯/天亮/云散才改。
+   - 场景细节按「固定物件 + 本拍临时细节」取：固定物件取 2–3 个，临时细节取 1–3 个，至少写出两层纵深。
 
-E. 选段
-   - 候选必须是可见的**完成态**瞬间；读完整段，因果场景同框画完整。
+E. 选拍与镜头
+   - 给本轮每个可见节拍打分：情绪峰值、肢体接触或动作高点、场景/时间/天气转换、服装或外观状态变化、新角色或关键物件登场、关系转折、位置明显改变；纯对话不加分。相邻两拍不同时入选。
+   - 候选必须是可见的**完成态**瞬间；读完整段，因果场景同框画完整。纯对话只有在伴随值得画的表情、肢体动作、人物关系或环境变化时才保留；只跳过没有视觉变化的对话、纯心理和过渡。
    - 每个入选节点都必须有至少一名性别明确的女性实际可见；纯男性节点直接跳过，改选其他合格节点。
-   - 同一轮多图必须是明显不同的瞬间；如果剧情确实跨越多个动作阶段，按因果链推进，动作相位只进不退，不为同一瞬间换镜头或返回相邻重复动作。
    - 优先突出玩家主角或主要角色与核心互动，先定主体与互动，再定谁入镜；无关在场者留在镜头外，核心互动需要的无名参与者照常保留。
-   - 按任务协议的数量范围写出 P 列表，先数一遍，多于上限当场砍掉。
+   - 每拍归入一个镜头类型，并让它决定景别、机位、焦点与背景预算：建立（wide shot / full body，交代地点与站位）、中景互动（cowboy shot / upper body）、反应（close-up / portrait，情绪与余韵）、局部（extreme close-up）、插入（close-up，无人，只拍关键道具）、过肩（from behind + looking at another）、主观（pov）。相邻两张不要用同一景别，全楼至少换两种视角。
+   - 读上一楼用过的景别与视角（历史 <bbi_image> 里能看出来），本轮第一张不要与上轮末张同景别。
+   - 按任务协议的数量范围写出 P 列表，先数一遍，多于上限当场砍掉；第二层只为最终入选的 P 写块。
 
-第二层｜逐张图槽位块（E 选定的每个 P 各写一块）
+第二层｜逐张图槽位块（E 选定的每个 P 各写一块，不得合并、不得跨图共用一份）
+
+一张图 = 一个 Scene 块 + 每个本图可见的个体一块，与最终 JSON 的 tag 和 characters[] 一一对应。先写 Scene 块，再按从左到右、从上到下的顺序逐个写角色块——这个顺序就是 characters[] 的顺序。镜头外的人不写块，也不补进 Scene；入画的人群作为整体留在 Scene。
 
 ■ P<编号>｜Scene
-  分级：<safe / sensitive / nsfw / explicit>
+  分级：<safe / sensitive / nsfw / explicit，按本图实际画面判定>
   人数：<只数取景框内可见的人；无人物写 no humans>
-  视角：<逐图判断 pov / 第三人称 / 过肩等特殊取景，不整轮固定>
-  景别与机位：<景别只选一个 + 垂直/水平角度；必须容纳核心互动>
-  场景：<室内外 + 地点 + 至少两个可见细节>
+  视角：<pov / 第三人称 / 过肩等特殊取景，逐图判断，不整轮固定>
+  景别与机位：<景别只选一个 + 垂直/水平角度 + 焦点（最多一个）>
+  场景：<室内外 + 地点（带风格与时代）+ 至少两个可见细节 + 至少两层纵深>
   光影：<光源位置 → 照亮什么 → 阴影方向 + 色调>
+  互动：<多人共同参与的动作，写明谁对谁做了什么；单人画面写 "-">
   内部透视：<仅适合节点：x-ray / cross-section / cutaway view 的全局表现方式；否则写「无」>
   size：<portrait / landscape / square>
 
-■ P<编号>｜<角色名或正文指称>（每个本图可见的个体各一块）
-  外貌：<同人「角色名, 作品名」两个 tag / 原创 name (original) + 发色发型 + 瞳色 + 体型 + 配饰；已建档照抄库字段>
+■ P<编号>｜<角色名或正文指称>（每个本图可见的个体各一块；【一次性】角色用正文的指称原词作块名）
+  外貌：<同人「角色名 \(作品\)」+ 作品名 / 原创 name (original) + 发色发型 + 瞳色 + 脸部特征 + 体型胸围 + 肤色 + 独占标志；已建档照抄库字段，逐字不改>
   着装：<本景别可见的部件，每件带颜色，裙袜外套带长度；不推导透明/湿润/破损/裸露>
-  表情：<克制自然的标准 tag>
-  视线：<必写一个视线 tag>
-  动作：<体位 + 支撑点 + 左右手分别在做什么，完成态；接触写清谁碰谁哪里>
-  结构：<只写本图可见的外部结构，按取景选必要项，逐人归属>
-  权重：<只给少数关键项标 (tag:1.1~1.5)；没有就写「无」>
+  饰品与状态：<本镜头可见的饰品逐件写全；湿/污/痕/勒痕等继承状态；都没有写 "-">
+  表情：<眼 + 嘴 + 脸色三项里可用的，克制自然的标准 tag>
+  视线：<必写一个视线 tag；closed eyes 时写 closed eyes>
+  姿态与承重：<体位 + 支撑点 + 左右手分别在做什么，完成态>
+  接触：<谁碰谁哪里：施动方写动作，受动方写承受位置与可见反应；没有接触写 "-">
+  可见结构：<只写本图可见的外部结构，按取景选必要项，逐人归属；没有写 "-">
+  相对位置：<画面左 / 中 / 右，供排序与站位用>
 
 槽位要求：
-   - 每个槽位只写最终决定；表情、视线、动作都用英文标准 tag，不写中文感受。
+   - 每个槽位只写最终决定；表情、视线、动作都用英文标准 tag，不写中文感受，也不自创词组（想写「温柔地笑」就填 smile）。
+   - Scene 块与角色块分工是硬边界：分级、人数、景别、机位、场景、光影、多人互动只进 Scene；某个角色的外貌、服装、饰品、个人动作、可见结构只进他自己那一块。
    - pov 且有肢体接触时，观众单独占一块（如 boy, pov hands, …）；不写「搂住看不见的脖子」这种指向画外对象的关系。
-   - Scene 块与角色块分工是硬边界：某个角色的外貌、服装、个人动作只进他自己那一块。
-{{#nl}}   - Description 不在槽位里预写，落笔时按规范写 6–12 句英文。
+   - 轴线：同一场景里两人的左右关系不换；正反打时画面左右不换；要换轴先插一张中立镜头。
+   - 确实不适用的槽位写 "-"，但 Scene 的景别、场景、光影、size 与每个角色块的表情、视线永远不得为 "-"。
+{{#nl}}   - Description 不在槽位里预写，落笔时按规范写 6–12 句英文短句，一句一个主语。
 {{/nl}}
 第三层｜落笔前自查（只核对，不改决定，不预写答案）
-   - 关键动作是完成态，不是 reaching / about to。
-   - 每个角色都有视线 tag；第三人称没有 looking at viewer。
-   - pov 有肢体接触时，观众的手或肩已入镜。
-   - 每个姿势都写了支撑点与重心；人物没撑满画面，环境看得见。
+
+这一层只逐张核对下面几条，每点写一句结论即可。<thinking> 里禁止出现任何最终答案的草稿——不写完整 tag 串、{{#nl}}不写完整 nl 句、{{/nl}}更不要写出 JSON 对象或 "JSON:" 之类的标题。答案只在 </thinking> 之后出现一次。核对完直接闭合 </thinking> 并输出 JSON：
+   - 分级与画面一致：日常穿衣写 safe，有裸露写 nsfw / sensitive，露骨性行为写 explicit。
+   - 人数标签与入镜人数一致，且只数取景框内可见的人；solo 不与 2girls 同现。
+   - 每个外观、服装、表情、视线、动作标签都有归属，没有散落的无主特征；每个角色都有表情与视线，没有谁只有动作没有表情。
+   - 身份串与档案逐字一致，顺序一致；同人写成「角色名 \(作品\)」+ 作品名，括号已转义；原创带 (original)，没有被误加作品名。
+   - 服装与账本一致；本拍有变化时只改了变化部件；同一场景内同一角色的服装与饰品逐字一致，没有多图换装或丢饰品。
+   - 景别、机位、焦点各只有一个，且互相不冲突；画外裁剪已执行（特写没写画外部位，cowboy shot 没写鞋袜）。
+   - 没有否定表达（no hat / without shoes 这类），需要表达「没有」时写对立状态或直接不提。
+   - 没有正文里没出现的人物、道具、地点；没有质量词、画师、年份、权重语法、分格标签。
+   - 关键动作是完成态，不是 reaching / about to；每个姿势都写了支撑点与重心；人物没撑满画面，环境看得见。
+   - 接触写清了「谁碰谁哪里」，施受没有反转；受惊方没有写发起词。
+   - 饰品与状态没有回弹：脱衣后饰品还在，湿身/污渍/勒痕没有被自动清干净。
+   - 可见结构只写看得见的项、归属正确；看不见的部位没有补；内部透视只用在真正插入的节点、只写在受插方。
+   - 器官归属正确、彼此可辨，没有多余的手或手指；画面保留了头部或上半身，没有走纯生殖器极端特写。
    - 本图至少有一名性别明确的女性实际可见，没有纯男性图。
-   - 同人写成「角色名, 作品名」两个独立 tag，原创带 (original)；没有照抄 name (series) 括号。
-   - 衣物属性没有互相推导；未知保持未知，敞开没有写成脱下。
-   - 结构只写可见项、归属正确；看不见的部位没有补。
-   - 权重只套在少数关键项上，没有 {tag}，没有整槽加权。
-   - 内部透视只用在已确立为成年人的角色、且正文确实涉及内部结构的节点；普通节点保持外观图。
-   - 单帧没有拼时刻、没有多镜头或分镜。
-   - 没有正文未写的夸大身材或暴露服装；看不见的部位、重复词、矛盾词都已去掉。
-   - 每个在场角色都能三选一：库中同名条目、changes 里的 field:"new"、或【一次性】；【一次性】没有被写进 changes。
+   - 轴线未被破坏，两人左右位置与账本一致；光源方向、色调与账本一致。
+   - 每个在场角色都能三选一：库中同名条目、changes 里的 field:"new"、或【一次性】；【一次性】没有被写进 changes，也没有被编造人名。
    - size 与景别一致；Scene + 全部 Char{{#nl}} + Description{{/nl}} 合计约 1800 token 以内。
-   - 张数在设定范围内；仅当下限为 0 且确实无可画时 images 才为空。`;
+   - 张数在设定范围内；仅当下限为 0 且确实无可画时 images 才为空，且无论如何都保留应有的建档与 changes。`;
 
 /**
  * 自动 tag 请求的可编辑提示词集。各条留空 = 回落内置默认(与柏宝书自定义提示词同口径)。
